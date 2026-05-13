@@ -308,13 +308,7 @@ impl App {
         match key.code {
             KeyCode::Esc => self.mode = Mode::Normal,
             KeyCode::Enter => {
-                let current_line = self.buffer.line(self.cursor.line);
-                let continuation =
-                    list_continuation_after_enter(&current_line, self.cursor.column);
-                self.buffer.insert_char(&mut self.cursor, '\n');
-                if let ListContinuation::Continue(prefix) = continuation {
-                    self.buffer.insert_str(&mut self.cursor, &prefix);
-                }
+                insert_newline_with_list_continuation(&mut self.buffer, &mut self.cursor)
             }
             KeyCode::Backspace => {
                 if key.modifiers.contains(KeyModifiers::SUPER) {
@@ -892,8 +886,33 @@ fn parse_numbered_list(text: &str) -> Option<(&str, &str)> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ListContinuation {
     None,
-    EndList,
+    EndList { delete_to_column: usize },
     Continue(String),
+}
+
+fn insert_newline_with_list_continuation(buffer: &mut DocumentBuffer, cursor: &mut Cursor) {
+    let current_line = buffer.line(cursor.line);
+    match list_continuation_after_enter(&current_line, cursor.column) {
+        ListContinuation::None => buffer.insert_char(cursor, '\n'),
+        ListContinuation::Continue(prefix) => {
+            buffer.insert_char(cursor, '\n');
+            buffer.insert_str(cursor, &prefix);
+        }
+        ListContinuation::EndList { delete_to_column } => {
+            let line = cursor.line;
+            let had_line_ending = current_line.ends_with('\n');
+            let start = buffer.char_index(Cursor { line, column: 0 });
+            let end = buffer.char_index(Cursor {
+                line,
+                column: delete_to_column,
+            });
+            buffer.delete_range(start, end, cursor);
+            *cursor = Cursor { line, column: 0 };
+            if !had_line_ending {
+                buffer.insert_char(cursor, '\n');
+            }
+        }
+    }
 }
 
 fn list_continuation_after_enter(line: &str, column: usize) -> ListContinuation {
@@ -914,7 +933,9 @@ fn list_continuation_after_enter(line: &str, column: usize) -> ListContinuation 
     }
 
     if item.content.is_empty() {
-        return ListContinuation::EndList;
+        return ListContinuation::EndList {
+            delete_to_column: leading_ws_len + item.marker_len,
+        };
     }
 
     let prefix = match item.kind {
@@ -1020,12 +1041,46 @@ mod tests {
     fn enter_exits_empty_checkbox_item() {
         assert_eq!(
             list_continuation_after_enter("- [ ] ", 6),
-            ListContinuation::EndList
+            ListContinuation::EndList {
+                delete_to_column: 6
+            }
         );
         assert_eq!(
             list_continuation_after_enter("- [ ]", 5),
-            ListContinuation::EndList
+            ListContinuation::EndList {
+                delete_to_column: 5
+            }
         );
+    }
+
+    #[test]
+    fn double_enter_exits_checkbox_list_at_document_end() {
+        let mut buffer = DocumentBuffer::empty();
+        let mut cursor = Cursor::default();
+        buffer.insert_str(&mut cursor, "- [ ] todo");
+
+        insert_newline_with_list_continuation(&mut buffer, &mut cursor);
+        assert_eq!(buffer.as_string(), "- [ ] todo\n- [ ] ");
+        assert_eq!(cursor, Cursor { line: 1, column: 6 });
+
+        insert_newline_with_list_continuation(&mut buffer, &mut cursor);
+        buffer.clamp_cursor(&mut cursor);
+
+        assert_eq!(buffer.as_string(), "- [ ] todo\n\n");
+        assert_eq!(cursor, Cursor { line: 1, column: 0 });
+    }
+
+    #[test]
+    fn enter_exits_empty_checkbox_list_without_adding_extra_middle_blank() {
+        let mut buffer = DocumentBuffer::empty();
+        let mut cursor = Cursor::default();
+        buffer.insert_str(&mut cursor, "- [ ] todo\n- [ ] \nafter");
+        cursor = Cursor { line: 1, column: 6 };
+
+        insert_newline_with_list_continuation(&mut buffer, &mut cursor);
+
+        assert_eq!(buffer.as_string(), "- [ ] todo\n\nafter");
+        assert_eq!(cursor, Cursor { line: 1, column: 0 });
     }
 
     #[test]

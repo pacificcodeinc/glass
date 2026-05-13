@@ -66,7 +66,7 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App, theme: Theme) {
         .map(|(i, row)| {
             let is_cursor_row =
                 row.line_number == app.cursor.line && row.wrap_index == wrap_index_of_cursor;
-            let active = is_cursor_row;
+            let active = row.line_number == app.cursor.line;
 
             // Prepend indentation for continuation lines of list items
             let display_text = if row.continuation_indent > 0 {
