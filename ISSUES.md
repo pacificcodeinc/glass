@@ -20,7 +20,7 @@ Bug & feature log for glass.
 - [ ] **Spell check**: add spell-checking support.
 - [ ] **Line breaking**: fix general line-breaking bugs.
 - [ ] **Search**: in Normal mode, pressing `/` opens a bottom popup to search for text in the current document.
-- [ ] **Command bar**: typing `:` in Normal mode opens the status bar for command input. Show a fuzzy-searchable suggestion popup above the status bar with all available commands; use Tab to cycle completions and Up/Down to navigate. Example: `:table` inserts a Markdown table at the cursor.
+- [ ] **Command bar**: typing `:` in Normal mode opens the status bar for command input. Show a fuzzy-searchable suggestion popup above the status bar with all available commands; use Tab to cycle completions and Up/Down to navigate. Example: `:table` inserts a Markdown table at the cursor. Or `:read` sets the view to read-only without expanding the markdwon when you're active on the line.
 
 ## File Management
 
