@@ -5,6 +5,7 @@ pub struct VisibleRow {
     pub line_number: usize,
     pub text: String,
     pub wrap_index: usize,
+    pub continuation_indent: usize,
 }
 
 pub fn visible_rows(buffer: &DocumentBuffer, top_line: usize, height: usize, width: usize) -> Vec<VisibleRow> {
@@ -21,12 +22,13 @@ pub fn visible_rows(buffer: &DocumentBuffer, top_line: usize, height: usize, wid
                 line_number: line,
                 text: String::new(),
                 wrap_index: 0,
+                continuation_indent: 0,
             });
             line += 1;
             continue;
         }
 
-        let segments = word_wrap_segments(trimmed, wrap_width);
+        let (segments, marker_len) = wrap_line(trimmed, wrap_width);
         for (wrap_index, &(start, end)) in segments.iter().enumerate() {
             if rows.len() >= height {
                 break;
@@ -37,6 +39,7 @@ pub fn visible_rows(buffer: &DocumentBuffer, top_line: usize, height: usize, wid
                 line_number: line,
                 text: chunk,
                 wrap_index,
+                continuation_indent: if wrap_index > 0 { marker_len } else { 0 },
             });
         }
 
@@ -53,7 +56,7 @@ pub fn wrap_index_for_column(line_text: &str, column: usize, width: usize) -> us
     if trimmed.is_empty() {
         return 0;
     }
-    let segments = word_wrap_segments(trimmed, width.max(1));
+    let (segments, _) = wrap_line(trimmed, width.max(1));
     for (i, &(start, end)) in segments.iter().enumerate() {
         if column >= start && column < end {
             return i;
@@ -69,7 +72,7 @@ pub fn column_in_wrap_segment(line_text: &str, column: usize, width: usize) -> u
     if trimmed.is_empty() {
         return column;
     }
-    let segments = word_wrap_segments(trimmed, width.max(1));
+    let (segments, _) = wrap_line(trimmed, width.max(1));
     for &(start, end) in &segments {
         if column >= start && column < end {
             return column.saturating_sub(start);
@@ -88,13 +91,65 @@ pub fn visual_line_bounds(line_text: &str, column: usize, width: usize) -> (usiz
     if trimmed.is_empty() {
         return (0, 0);
     }
-    let segments = word_wrap_segments(trimmed, width.max(1));
+    let (segments, _) = wrap_line(trimmed, width.max(1));
     for &(start, end) in &segments {
         if column >= start && column < end {
             return (start, end);
         }
     }
     segments.last().copied().unwrap_or((0, 0))
+}
+
+/// Detect list-item marker length in characters (including leading whitespace).
+/// Returns 0 if the line does not start with a recognised marker.
+pub fn detect_list_marker(text: &str) -> usize {
+    let trimmed = text.trim_start();
+    let ws = text.len() - trimmed.len();
+
+    if trimmed.starts_with("- [ ] ") || trimmed.starts_with("- [x] ") {
+        return ws + 6;
+    }
+    if trimmed.starts_with("- ") || trimmed.starts_with("* ") || trimmed.starts_with("+ ") {
+        return ws + 2;
+    }
+
+    let bytes = trimmed.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() && bytes[i].is_ascii_digit() {
+        i += 1;
+    }
+    if i > 0 && trimmed.get(i..i + 2) == Some(". ") {
+        return ws + i + 2;
+    }
+
+    0
+}
+
+/// Wrap a line into visual segments.
+/// For list items the first segment includes the marker and subsequent
+/// segments are wrapped with a reduced width so they can be indented.
+/// Returns the segments and the marker length (0 for non-list lines).
+pub fn wrap_line(text: &str, width: usize) -> (Vec<(usize, usize)>, usize) {
+    let marker_len = detect_list_marker(text);
+
+    if marker_len == 0 || marker_len >= width {
+        return (word_wrap_segments(text, width), 0);
+    }
+
+    let content = &text[marker_len..];
+    let content_width = width - marker_len;
+    let content_segments = word_wrap_segments(content, content_width);
+
+    let mut segments = Vec::new();
+    for (i, (start, end)) in content_segments.into_iter().enumerate() {
+        if i == 0 {
+            segments.push((0, marker_len + end));
+        } else {
+            segments.push((marker_len + start, marker_len + end));
+        }
+    }
+
+    (segments, marker_len)
 }
 
 pub fn word_wrap_segments(text: &str, width: usize) -> Vec<(usize, usize)> {

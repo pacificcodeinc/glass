@@ -9,7 +9,7 @@ use ratatui::{
 use crate::{
     app::{App, Mode},
     config::theme::Theme,
-    editor::render::{column_in_wrap_segment, visible_rows, wrap_index_for_column},
+    editor::render::{column_in_wrap_segment, detect_list_marker, visible_rows, wrap_index_for_column},
     markdown::highlight::render_markdown_line,
 };
 
@@ -59,7 +59,14 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App, theme: Theme) {
             let is_cursor_row = row.line_number == app.cursor.line
                 && row.wrap_index == wrap_index_of_cursor;
             let active = is_cursor_row;
-            let mut line = render_markdown_line(&row.text, theme, active);
+
+            // Prepend indentation for continuation lines of list items
+            let display_text = if row.continuation_indent > 0 {
+                " ".repeat(row.continuation_indent) + &row.text
+            } else {
+                row.text.clone()
+            };
+            let mut line = render_markdown_line(&display_text, theme, active);
 
             if visual_range.as_ref().is_some_and(|range| range.contains(&row.line_number)) {
                 line = selected_line(line, theme);
@@ -97,7 +104,14 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App, theme: Theme) {
     frame.render_widget(paragraph, page);
 
     if app.mode != Mode::CommandLine && app.overlay.is_none() {
-        let x = column_in_wrap_segment(&cursor_line_text, app.cursor.column, text_width) as u16 + gutter_width;
+        let cursor_indent = if wrap_index_of_cursor > 0 {
+            detect_list_marker(&cursor_line_text)
+        } else {
+            0
+        };
+        let x = column_in_wrap_segment(&cursor_line_text, app.cursor.column, text_width) as u16
+            + gutter_width
+            + cursor_indent as u16;
         let y = cursor_visual_y as u16;
         frame.set_cursor_position(Position::new(page.x + x, page.y + y));
     }

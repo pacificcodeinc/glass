@@ -10,7 +10,7 @@ use crate::{
         commands::{Command, parse_command},
         cursor::Cursor,
         motions,
-        render::{visual_line_bounds, word_wrap_segments, wrap_index_for_column},
+        render::{visual_line_bounds, wrap_index_for_column, wrap_line},
     },
     fs::tree::FileTree,
 };
@@ -784,7 +784,7 @@ impl App {
     fn visual_line_down(&mut self) {
         let line_text = self.buffer.line(self.cursor.line);
         let width = self.wrap_width();
-        let segments = word_wrap_segments(
+        let (segments, _) = wrap_line(
             line_text.trim_end_matches(['\r', '\n']),
             width,
         );
@@ -804,7 +804,7 @@ impl App {
     fn visual_line_up(&mut self) {
         let line_text = self.buffer.line(self.cursor.line);
         let width = self.wrap_width();
-        let segments = word_wrap_segments(
+        let (segments, _) = wrap_line(
             line_text.trim_end_matches(['\r', '\n']),
             width,
         );
@@ -818,7 +818,7 @@ impl App {
         } else if self.cursor.line > 0 {
             self.cursor.line -= 1;
             let prev_text = self.buffer.line(self.cursor.line);
-            let prev_segments = word_wrap_segments(
+            let (prev_segments, _) = wrap_line(
                 prev_text.trim_end_matches(['\r', '\n']),
                 width,
             );
