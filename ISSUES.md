@@ -8,3 +8,4 @@
 - [ ] Trailing ghost newline — `dd` and `vd` can't delete the last empty line
 - [ ] Table rendering
 - [ ] Wiki-links — `[[File.md]]` syntax that jumps to the file, with visual distinction
+- [ ] Hoards of interactivity bugs. Such as numbers flickering when pressing enter on numbered lists, and being unable to hit enter at the end of a checkbox list to get another checkbox below, or in the middle of the list. I imagine these issues are closely related.

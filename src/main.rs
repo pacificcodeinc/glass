@@ -12,6 +12,8 @@ use anyhow::{Context, Result, bail};
 
 use crate::{app::App, terminal::TerminalSession};
 
+const VERSION: &str = env!("CARGO_PKG_VERSION");
+
 fn main() -> Result<()> {
     let (notes_dir, initial_file) = parse_args()?;
     let app = App::new(notes_dir, initial_file)?;
@@ -31,6 +33,12 @@ fn parse_args() -> Result<(PathBuf, Option<PathBuf>)> {
 
     if args.next().is_some() {
         bail!("usage: {program} <path>");
+    }
+
+    let arg_str = arg.to_string_lossy();
+    if arg_str == "--version" || arg_str == "-v" {
+        println!("glass {VERSION}");
+        std::process::exit(0);
     }
 
     let path = PathBuf::from(arg);
