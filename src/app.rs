@@ -310,11 +310,14 @@ impl App {
             }
             KeyCode::Backspace => {
                 if key.modifiers.contains(KeyModifiers::SUPER) {
-                    // Command+Delete: delete to beginning of line
-                    let end = self.buffer.char_index(self.cursor);
-                    let mut target = self.cursor;
-                    motions::line_start(&mut target);
-                    let start = self.buffer.char_index(target);
+                    let start = self.buffer.char_index(Cursor {
+                        line: self.cursor.line,
+                        column: 0,
+                    });
+                    let end = self.buffer.char_index(Cursor {
+                        line: self.cursor.line,
+                        column: self.buffer.line_len_chars(self.cursor.line),
+                    });
                     self.buffer.delete_range(start, end, &mut self.cursor);
                 } else if key.modifiers.contains(KeyModifiers::ALT) {
                     // Option+Delete: delete word backward
