@@ -61,6 +61,7 @@ pub struct App {
     pub status_message: String,
     pub should_quit: bool,
     pub visual_line_anchor: Option<usize>,
+    preferred_column: Option<usize>,
     pending_g: bool,
     pending_delete: bool,
     pending_change: bool,
@@ -89,6 +90,7 @@ impl App {
             status_message: "Glass".to_string(),
             should_quit: false,
             visual_line_anchor: None,
+            preferred_column: None,
             pending_g: false,
             pending_delete: false,
             pending_change: false,
@@ -150,9 +152,15 @@ impl App {
         if self.pending_g {
             self.pending_g = false;
             match key.code {
-                KeyCode::Char('g') => motions::document_start(&mut self.cursor),
-                KeyCode::Char('e') => motions::word_end_backward(&self.buffer, &mut self.cursor),
-                KeyCode::Char('f') => self.follow_link_under_cursor()?,
+                KeyCode::Char('g') => self.document_start_preserving_column(),
+                KeyCode::Char('e') => {
+                    motions::word_end_backward(&self.buffer, &mut self.cursor);
+                    self.reset_preferred_column();
+                }
+                KeyCode::Char('f') => {
+                    self.follow_link_under_cursor()?;
+                    self.reset_preferred_column();
+                }
                 _ => {}
             }
             return Ok(());
@@ -174,42 +182,86 @@ impl App {
             KeyCode::Char('i') => self.mode = Mode::Insert,
             KeyCode::Char('I') => {
                 motions::first_non_blank(&self.buffer, &mut self.cursor);
+                self.reset_preferred_column();
                 self.mode = Mode::Insert;
             }
             KeyCode::Char('a') => {
                 motions::right(&self.buffer, &mut self.cursor);
+                self.reset_preferred_column();
                 self.mode = Mode::Insert;
             }
             KeyCode::Char('A') => {
                 motions::line_end(&self.buffer, &mut self.cursor);
+                self.reset_preferred_column();
                 self.mode = Mode::Insert;
             }
             KeyCode::Char('o') => {
                 motions::line_end(&self.buffer, &mut self.cursor);
                 self.buffer.insert_char(&mut self.cursor, '\n');
+                self.reset_preferred_column();
                 self.mode = Mode::Insert;
             }
             KeyCode::Char('O') => {
                 motions::line_start(&mut self.cursor);
                 self.buffer.insert_char(&mut self.cursor, '\n');
                 motions::up(&self.buffer, &mut self.cursor);
+                self.reset_preferred_column();
                 self.mode = Mode::Insert;
             }
-            KeyCode::Char('h') | KeyCode::Left => motions::left(&mut self.cursor),
+            KeyCode::Char('h') | KeyCode::Left => {
+                motions::left(&mut self.cursor);
+                self.reset_preferred_column();
+            }
             KeyCode::Char('j') | KeyCode::Down => self.visual_line_down(),
             KeyCode::Char('k') | KeyCode::Up => self.visual_line_up(),
-            KeyCode::Char('l') | KeyCode::Right => motions::right(&self.buffer, &mut self.cursor),
-            KeyCode::Char('w') => motions::word_forward(&self.buffer, &mut self.cursor),
-            KeyCode::Char('b') => motions::word_backward(&self.buffer, &mut self.cursor),
-            KeyCode::Char('e') => motions::word_end_forward(&self.buffer, &mut self.cursor),
-            KeyCode::Char('W') => motions::big_word_forward(&self.buffer, &mut self.cursor),
-            KeyCode::Char('B') => motions::big_word_backward(&self.buffer, &mut self.cursor),
-            KeyCode::Char('E') => motions::big_word_end_forward(&self.buffer, &mut self.cursor),
-            KeyCode::Char('0') => motions::line_start(&mut self.cursor),
-            KeyCode::Home => self.visual_line_start(),
-            KeyCode::Char('^') => motions::first_non_blank(&self.buffer, &mut self.cursor),
-            KeyCode::Char('$') => motions::line_end(&self.buffer, &mut self.cursor),
-            KeyCode::End => self.visual_line_end(),
+            KeyCode::Char('l') | KeyCode::Right => {
+                motions::right(&self.buffer, &mut self.cursor);
+                self.reset_preferred_column();
+            }
+            KeyCode::Char('w') => {
+                motions::word_forward(&self.buffer, &mut self.cursor);
+                self.reset_preferred_column();
+            }
+            KeyCode::Char('b') => {
+                motions::word_backward(&self.buffer, &mut self.cursor);
+                self.reset_preferred_column();
+            }
+            KeyCode::Char('e') => {
+                motions::word_end_forward(&self.buffer, &mut self.cursor);
+                self.reset_preferred_column();
+            }
+            KeyCode::Char('W') => {
+                motions::big_word_forward(&self.buffer, &mut self.cursor);
+                self.reset_preferred_column();
+            }
+            KeyCode::Char('B') => {
+                motions::big_word_backward(&self.buffer, &mut self.cursor);
+                self.reset_preferred_column();
+            }
+            KeyCode::Char('E') => {
+                motions::big_word_end_forward(&self.buffer, &mut self.cursor);
+                self.reset_preferred_column();
+            }
+            KeyCode::Char('0') => {
+                motions::line_start(&mut self.cursor);
+                self.reset_preferred_column();
+            }
+            KeyCode::Home => {
+                self.visual_line_start();
+                self.reset_preferred_column();
+            }
+            KeyCode::Char('^') => {
+                motions::first_non_blank(&self.buffer, &mut self.cursor);
+                self.reset_preferred_column();
+            }
+            KeyCode::Char('$') => {
+                motions::line_end(&self.buffer, &mut self.cursor);
+                self.reset_preferred_column();
+            }
+            KeyCode::End => {
+                self.visual_line_end();
+                self.reset_preferred_column();
+            }
             KeyCode::Char('C') => self.change_to_line_end(),
             KeyCode::Char('D') => self.delete_to_line_end(),
             KeyCode::Char('c') => {
@@ -220,10 +272,13 @@ impl App {
                 self.pending_delete = true;
                 self.status_message = "delete".to_string();
             }
-            KeyCode::Char('G') => motions::document_end(&self.buffer, &mut self.cursor),
+            KeyCode::Char('G') => self.document_end_preserving_column(),
             KeyCode::Char('g') => self.pending_g = true,
             KeyCode::Char('u') => self.undo(),
-            KeyCode::Char('x') | KeyCode::Delete => self.buffer.delete_char(&mut self.cursor),
+            KeyCode::Char('x') | KeyCode::Delete => {
+                self.buffer.delete_char(&mut self.cursor);
+                self.reset_preferred_column();
+            }
             _ => {}
         }
 
@@ -234,7 +289,8 @@ impl App {
         match key.code {
             KeyCode::Esc => self.mode = Mode::Normal,
             KeyCode::Enter => {
-                insert_newline_with_list_continuation(&mut self.buffer, &mut self.cursor)
+                insert_newline_with_list_continuation(&mut self.buffer, &mut self.cursor);
+                self.reset_preferred_column();
             }
             KeyCode::Backspace => {
                 if key.modifiers.contains(KeyModifiers::SUPER) {
@@ -244,6 +300,7 @@ impl App {
                 } else {
                     self.buffer.delete_previous_char(&mut self.cursor);
                 }
+                self.reset_preferred_column();
             }
             KeyCode::Delete => {
                 if key.modifiers.contains(KeyModifiers::SUPER) {
@@ -251,23 +308,42 @@ impl App {
                 } else {
                     self.buffer.delete_char(&mut self.cursor);
                 }
+                self.reset_preferred_column();
             }
-            KeyCode::Tab => self.buffer.insert_str(&mut self.cursor, "    "),
+            KeyCode::Tab => {
+                self.buffer.insert_str(&mut self.cursor, "    ");
+                self.reset_preferred_column();
+            }
             KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.delete_to_line_start();
+                self.reset_preferred_column();
             }
             KeyCode::Char('k') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.delete_to_line_end();
+                self.reset_preferred_column();
             }
             KeyCode::Char(ch) if is_text_input_key(key) => {
-                self.buffer.insert_char(&mut self.cursor, ch)
+                self.buffer.insert_char(&mut self.cursor, ch);
+                self.reset_preferred_column();
             }
-            KeyCode::Left => motions::left(&mut self.cursor),
-            KeyCode::Right => motions::right(&self.buffer, &mut self.cursor),
-            KeyCode::Up => motions::up(&self.buffer, &mut self.cursor),
-            KeyCode::Down => motions::down(&self.buffer, &mut self.cursor),
-            KeyCode::Home => self.visual_line_start(),
-            KeyCode::End => self.visual_line_end(),
+            KeyCode::Left => {
+                motions::left(&mut self.cursor);
+                self.reset_preferred_column();
+            }
+            KeyCode::Right => {
+                motions::right(&self.buffer, &mut self.cursor);
+                self.reset_preferred_column();
+            }
+            KeyCode::Up => self.move_line_up_preserving_column(),
+            KeyCode::Down => self.move_line_down_preserving_column(),
+            KeyCode::Home => {
+                self.visual_line_start();
+                self.reset_preferred_column();
+            }
+            KeyCode::End => {
+                self.visual_line_end();
+                self.reset_preferred_column();
+            }
             _ => {}
         }
     }
@@ -276,9 +352,15 @@ impl App {
         if self.pending_g {
             self.pending_g = false;
             match key.code {
-                KeyCode::Char('g') => motions::document_start(&mut self.cursor),
-                KeyCode::Char('e') => motions::word_end_backward(&self.buffer, &mut self.cursor),
-                KeyCode::Char('f') => self.follow_link_under_cursor()?,
+                KeyCode::Char('g') => self.document_start_preserving_column(),
+                KeyCode::Char('e') => {
+                    motions::word_end_backward(&self.buffer, &mut self.cursor);
+                    self.reset_preferred_column();
+                }
+                KeyCode::Char('f') => {
+                    self.follow_link_under_cursor()?;
+                    self.reset_preferred_column();
+                }
                 _ => {}
             }
             return Ok(());
@@ -299,22 +381,61 @@ impl App {
             KeyCode::Char('d') | KeyCode::Char('D') | KeyCode::Delete | KeyCode::Backspace => {
                 self.delete_visual_lines();
             }
-            KeyCode::Char('h') | KeyCode::Left => motions::left(&mut self.cursor),
+            KeyCode::Char('h') | KeyCode::Left => {
+                motions::left(&mut self.cursor);
+                self.reset_preferred_column();
+            }
             KeyCode::Char('j') | KeyCode::Down => self.visual_line_down(),
             KeyCode::Char('k') | KeyCode::Up => self.visual_line_up(),
-            KeyCode::Char('l') | KeyCode::Right => motions::right(&self.buffer, &mut self.cursor),
-            KeyCode::Char('w') => motions::word_forward(&self.buffer, &mut self.cursor),
-            KeyCode::Char('b') => motions::word_backward(&self.buffer, &mut self.cursor),
-            KeyCode::Char('e') => motions::word_end_forward(&self.buffer, &mut self.cursor),
-            KeyCode::Char('W') => motions::big_word_forward(&self.buffer, &mut self.cursor),
-            KeyCode::Char('B') => motions::big_word_backward(&self.buffer, &mut self.cursor),
-            KeyCode::Char('E') => motions::big_word_end_forward(&self.buffer, &mut self.cursor),
-            KeyCode::Char('0') => motions::line_start(&mut self.cursor),
-            KeyCode::Home => self.visual_line_start(),
-            KeyCode::Char('^') => motions::first_non_blank(&self.buffer, &mut self.cursor),
-            KeyCode::Char('$') => motions::line_end(&self.buffer, &mut self.cursor),
-            KeyCode::End => self.visual_line_end(),
-            KeyCode::Char('G') => motions::document_end(&self.buffer, &mut self.cursor),
+            KeyCode::Char('l') | KeyCode::Right => {
+                motions::right(&self.buffer, &mut self.cursor);
+                self.reset_preferred_column();
+            }
+            KeyCode::Char('w') => {
+                motions::word_forward(&self.buffer, &mut self.cursor);
+                self.reset_preferred_column();
+            }
+            KeyCode::Char('b') => {
+                motions::word_backward(&self.buffer, &mut self.cursor);
+                self.reset_preferred_column();
+            }
+            KeyCode::Char('e') => {
+                motions::word_end_forward(&self.buffer, &mut self.cursor);
+                self.reset_preferred_column();
+            }
+            KeyCode::Char('W') => {
+                motions::big_word_forward(&self.buffer, &mut self.cursor);
+                self.reset_preferred_column();
+            }
+            KeyCode::Char('B') => {
+                motions::big_word_backward(&self.buffer, &mut self.cursor);
+                self.reset_preferred_column();
+            }
+            KeyCode::Char('E') => {
+                motions::big_word_end_forward(&self.buffer, &mut self.cursor);
+                self.reset_preferred_column();
+            }
+            KeyCode::Char('0') => {
+                motions::line_start(&mut self.cursor);
+                self.reset_preferred_column();
+            }
+            KeyCode::Home => {
+                self.visual_line_start();
+                self.reset_preferred_column();
+            }
+            KeyCode::Char('^') => {
+                motions::first_non_blank(&self.buffer, &mut self.cursor);
+                self.reset_preferred_column();
+            }
+            KeyCode::Char('$') => {
+                motions::line_end(&self.buffer, &mut self.cursor);
+                self.reset_preferred_column();
+            }
+            KeyCode::End => {
+                self.visual_line_end();
+                self.reset_preferred_column();
+            }
+            KeyCode::Char('G') => self.document_end_preserving_column(),
             KeyCode::Char('g') => self.pending_g = true,
             _ => {}
         }
@@ -334,6 +455,7 @@ impl App {
                     start_cursor.line,
                     &mut self.cursor,
                 );
+                self.reset_preferred_column();
                 return;
             }
             KeyCode::Char('w') => motions::word_forward(&self.buffer, &mut target),
@@ -362,6 +484,7 @@ impl App {
 
         let end = self.buffer.char_index(target);
         self.buffer.delete_range(start, end, &mut self.cursor);
+        self.reset_preferred_column();
     }
 
     fn delete_to_line_end(&mut self) {
@@ -371,6 +494,7 @@ impl App {
             column: self.buffer.line_len_chars(self.cursor.line),
         });
         self.buffer.delete_range(start, end, &mut self.cursor);
+        self.reset_preferred_column();
     }
 
     fn delete_to_line_start(&mut self) {
@@ -380,6 +504,7 @@ impl App {
         });
         let end = self.buffer.char_index(self.cursor);
         self.buffer.delete_range(start, end, &mut self.cursor);
+        self.reset_preferred_column();
     }
 
     fn delete_word_backward(&mut self) {
@@ -388,6 +513,7 @@ impl App {
         motions::word_backward(&self.buffer, &mut target);
         let start = self.buffer.char_index(target);
         self.buffer.delete_range(start, end, &mut self.cursor);
+        self.reset_preferred_column();
     }
 
     fn undo(&mut self) {
@@ -411,6 +537,7 @@ impl App {
                     &mut self.cursor,
                 );
                 self.mode = Mode::Insert;
+                self.reset_preferred_column();
                 return;
             }
             KeyCode::Char('w') => motions::word_forward(&self.buffer, &mut target),
@@ -440,6 +567,7 @@ impl App {
         let end = self.buffer.char_index(target);
         self.buffer.delete_range(start, end, &mut self.cursor);
         self.mode = Mode::Insert;
+        self.reset_preferred_column();
     }
 
     fn change_to_line_end(&mut self) {
@@ -450,6 +578,7 @@ impl App {
         });
         self.buffer.delete_range(start, end, &mut self.cursor);
         self.mode = Mode::Insert;
+        self.reset_preferred_column();
     }
 
     fn delete_visual_lines(&mut self) {
@@ -459,6 +588,7 @@ impl App {
         self.buffer.delete_line_range(start, end, &mut self.cursor);
         self.mode = Mode::Normal;
         self.visual_line_anchor = None;
+        self.reset_preferred_column();
     }
 
     fn handle_command_key(&mut self, key: KeyEvent) -> Result<()> {
@@ -548,26 +678,28 @@ impl App {
             match key.code {
                 KeyCode::Left => {
                     motions::line_start(&mut self.cursor);
+                    self.reset_preferred_column();
                     true
                 }
                 KeyCode::Right => {
                     motions::line_end(&self.buffer, &mut self.cursor);
+                    self.reset_preferred_column();
                     true
                 }
                 KeyCode::Up => {
-                    motions::document_start(&mut self.cursor);
+                    self.document_start_preserving_column();
                     true
                 }
                 KeyCode::Down => {
-                    motions::document_end(&self.buffer, &mut self.cursor);
+                    self.document_end_preserving_column();
                     true
                 }
                 KeyCode::Home => {
-                    motions::document_start(&mut self.cursor);
+                    self.document_start_preserving_column();
                     true
                 }
                 KeyCode::End => {
-                    motions::document_end(&self.buffer, &mut self.cursor);
+                    self.document_end_preserving_column();
                     true
                 }
                 _ => false,
@@ -576,18 +708,22 @@ impl App {
             match key.code {
                 KeyCode::Left => {
                     motions::word_backward(&self.buffer, &mut self.cursor);
+                    self.reset_preferred_column();
                     true
                 }
                 KeyCode::Right => {
                     motions::word_forward(&self.buffer, &mut self.cursor);
+                    self.reset_preferred_column();
                     true
                 }
                 KeyCode::Char('b') | KeyCode::Char('B') => {
                     motions::word_backward(&self.buffer, &mut self.cursor);
+                    self.reset_preferred_column();
                     true
                 }
                 KeyCode::Char('f') | KeyCode::Char('F') => {
                     motions::word_forward(&self.buffer, &mut self.cursor);
+                    self.reset_preferred_column();
                     true
                 }
                 _ => false,
@@ -596,26 +732,30 @@ impl App {
             match key.code {
                 KeyCode::Char('a') | KeyCode::Char('A') => {
                     motions::line_start(&mut self.cursor);
+                    self.reset_preferred_column();
                     true
                 }
                 KeyCode::Char('e') | KeyCode::Char('E') => {
                     motions::line_end(&self.buffer, &mut self.cursor);
+                    self.reset_preferred_column();
                     true
                 }
                 KeyCode::Char('u') | KeyCode::Char('U') => {
                     self.delete_to_line_start();
+                    self.reset_preferred_column();
                     true
                 }
                 KeyCode::Char('k') | KeyCode::Char('K') => {
                     self.delete_to_line_end();
+                    self.reset_preferred_column();
                     true
                 }
                 KeyCode::Home => {
-                    motions::document_start(&mut self.cursor);
+                    self.document_start_preserving_column();
                     true
                 }
                 KeyCode::End => {
-                    motions::document_end(&self.buffer, &mut self.cursor);
+                    self.document_end_preserving_column();
                     true
                 }
                 _ => false,
@@ -623,6 +763,44 @@ impl App {
         } else {
             false
         }
+    }
+
+    fn preferred_column(&mut self) -> usize {
+        match self.preferred_column {
+            Some(column) => column,
+            None => {
+                self.preferred_column = Some(self.cursor.column);
+                self.cursor.column
+            }
+        }
+    }
+
+    fn reset_preferred_column(&mut self) {
+        self.preferred_column = None;
+    }
+
+    fn move_to_line_preserving_column(&mut self, line: usize) {
+        let column = self.preferred_column();
+        self.cursor.line = line.min(self.buffer.line_count().saturating_sub(1));
+        self.cursor.column = column.min(self.buffer.line_len_chars(self.cursor.line));
+    }
+
+    fn move_line_down_preserving_column(&mut self) {
+        let target = (self.cursor.line + 1).min(self.buffer.line_count().saturating_sub(1));
+        self.move_to_line_preserving_column(target);
+    }
+
+    fn move_line_up_preserving_column(&mut self) {
+        let target = self.cursor.line.saturating_sub(1);
+        self.move_to_line_preserving_column(target);
+    }
+
+    fn document_start_preserving_column(&mut self) {
+        self.move_to_line_preserving_column(0);
+    }
+
+    fn document_end_preserving_column(&mut self) {
+        self.move_to_line_preserving_column(self.buffer.line_count().saturating_sub(1));
     }
 
     fn visual_line_down(&mut self) {
@@ -640,8 +818,7 @@ impl App {
                 next_start + rel
             };
         } else if self.cursor.line + 1 < self.buffer.line_count() {
-            self.cursor.line += 1;
-            self.cursor.column = 0;
+            self.move_line_down_preserving_column();
         }
     }
 
@@ -660,12 +837,7 @@ impl App {
                 prev_start + rel
             };
         } else if self.cursor.line > 0 {
-            self.cursor.line -= 1;
-            let prev_text = self.buffer.line(self.cursor.line);
-            let (prev_segments, _) = wrap_line(prev_text.trim_end_matches(['\r', '\n']), width);
-            if let Some(&(start, _end)) = prev_segments.last() {
-                self.cursor.column = start;
-            }
+            self.move_line_up_preserving_column();
         }
     }
 
@@ -683,6 +855,7 @@ impl App {
 
         self.buffer = DocumentBuffer::from_path(&path)?;
         self.cursor = Cursor::default();
+        self.reset_preferred_column();
         self.viewport.top_line = 0;
         self.viewport.top_wrap_index = 0;
         self.viewport.horizontal_offset = 0;
@@ -1085,6 +1258,7 @@ mod tests {
             status_message: String::new(),
             should_quit: false,
             visual_line_anchor: None,
+            preferred_column: None,
             pending_g: false,
             pending_delete: false,
             pending_change: false,
@@ -1161,6 +1335,45 @@ mod tests {
     }
 
     #[test]
+    fn vertical_movement_restores_preferred_column_after_short_line() {
+        let mut app = test_app("abcdef\nx\nabcdef");
+        app.cursor = Cursor { line: 0, column: 5 };
+
+        press(&mut app, KeyCode::Char('j'));
+        assert_eq!(app.cursor, Cursor { line: 1, column: 1 });
+
+        press(&mut app, KeyCode::Char('j'));
+        assert_eq!(app.cursor, Cursor { line: 2, column: 5 });
+    }
+
+    #[test]
+    fn horizontal_movement_resets_preferred_column() {
+        let mut app = test_app("abcdef\nx\nabcdef");
+        app.cursor = Cursor { line: 0, column: 5 };
+
+        press(&mut app, KeyCode::Char('j'));
+        press(&mut app, KeyCode::Char('h'));
+        press(&mut app, KeyCode::Char('j'));
+
+        assert_eq!(app.cursor, Cursor { line: 2, column: 0 });
+    }
+
+    #[test]
+    fn document_jumps_preserve_cursor_column() {
+        let mut app = test_app("abcdef\nxy\nabcdef");
+        app.cursor = Cursor { line: 0, column: 4 };
+
+        press(&mut app, KeyCode::Char('G'));
+        assert_eq!(app.cursor, Cursor { line: 2, column: 4 });
+
+        let mut app = test_app("abcdef\nxy\nabcdef");
+        app.cursor = Cursor { line: 2, column: 5 };
+        press(&mut app, KeyCode::Char('g'));
+        press(&mut app, KeyCode::Char('g'));
+        assert_eq!(app.cursor, Cursor { line: 0, column: 5 });
+    }
+
+    #[test]
     fn command_arrows_navigate_line_and_document_bounds() {
         let mut app = test_app("first line\nsecond line");
         app.cursor = Cursor { line: 1, column: 3 };
@@ -1178,7 +1391,13 @@ mod tests {
         );
 
         press_modified(&mut app, KeyCode::Up, KeyModifiers::SUPER);
-        assert_eq!(app.cursor, Cursor { line: 0, column: 0 });
+        assert_eq!(
+            app.cursor,
+            Cursor {
+                line: 0,
+                column: "first line".chars().count(),
+            }
+        );
 
         press_modified(&mut app, KeyCode::Down, KeyModifiers::SUPER);
         assert_eq!(

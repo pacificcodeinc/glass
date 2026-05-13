@@ -13,11 +13,6 @@ pub fn up(buffer: &DocumentBuffer, cursor: &mut Cursor) {
     cursor.column = cursor.column.min(buffer.line_len_chars(cursor.line));
 }
 
-pub fn down(buffer: &DocumentBuffer, cursor: &mut Cursor) {
-    cursor.line = (cursor.line + 1).min(buffer.line_count().saturating_sub(1));
-    cursor.column = cursor.column.min(buffer.line_len_chars(cursor.line));
-}
-
 pub fn line_start(cursor: &mut Cursor) {
     cursor.column = 0;
 }
@@ -33,11 +28,6 @@ pub fn first_non_blank(buffer: &DocumentBuffer, cursor: &mut Cursor) {
 
 pub fn line_end(buffer: &DocumentBuffer, cursor: &mut Cursor) {
     cursor.column = buffer.line_len_chars(cursor.line);
-}
-
-pub fn document_start(cursor: &mut Cursor) {
-    cursor.line = 0;
-    cursor.column = 0;
 }
 
 pub fn document_end(buffer: &DocumentBuffer, cursor: &mut Cursor) {
