@@ -260,7 +260,25 @@ impl App {
         match key.code {
             KeyCode::Esc => self.mode = Mode::Normal,
             KeyCode::Enter => self.buffer.insert_char(&mut self.cursor, '\n'),
-            KeyCode::Backspace => self.buffer.delete_previous_char(&mut self.cursor),
+            KeyCode::Backspace => {
+                if key.modifiers.contains(KeyModifiers::SUPER) {
+                    // Command+Delete: delete to beginning of line
+                    let end = self.buffer.char_index(self.cursor);
+                    let mut target = self.cursor;
+                    motions::line_start(&mut target);
+                    let start = self.buffer.char_index(target);
+                    self.buffer.delete_range(start, end, &mut self.cursor);
+                } else if key.modifiers.contains(KeyModifiers::ALT) {
+                    // Option+Delete: delete word backward
+                    let end = self.buffer.char_index(self.cursor);
+                    let mut target = self.cursor;
+                    motions::word_backward(&self.buffer, &mut target);
+                    let start = self.buffer.char_index(target);
+                    self.buffer.delete_range(start, end, &mut self.cursor);
+                } else {
+                    self.buffer.delete_previous_char(&mut self.cursor);
+                }
+            }
             KeyCode::Delete => self.buffer.delete_char(&mut self.cursor),
             KeyCode::Tab => self.buffer.insert_str(&mut self.cursor, "    "),
             KeyCode::Char(ch) => self.buffer.insert_char(&mut self.cursor, ch),

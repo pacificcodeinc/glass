@@ -12,11 +12,11 @@ use crate::{
 };
 
 const RAINBOW: &[(char, Color)] = &[
-    ('█', Color::Red),
-    ('█', Color::Rgb(255, 165, 0)),
-    ('█', Color::Yellow),
-    ('█', Color::Green),
-    ('█', Color::Blue),
+    ('█', Color::Rgb(255, 50, 50)),
+    ('█', Color::Rgb(255, 140, 0)),
+    ('█', Color::Rgb(255, 220, 0)),
+    ('█', Color::Rgb(50, 220, 80)),
+    ('█', Color::Rgb(30, 120, 255)),
 ];
 
 pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App, theme: Theme) {
