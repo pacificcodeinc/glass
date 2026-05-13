@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.5] - 2026-05-13
+
+Full commit range: [`v0.1.4...v0.1.5`](https://github.com/pacificcodeinc/glass/compare/v0.1.4...v0.1.5)
+
+### Changed
+
+- Wrapped visual-row movement now preserves the intended on-screen cursor column through short wrapped rows and across physical lines.
+- New note paths opened with `glass <new-file>.md` stay in memory until the first `:w`.
+- Dirty files now show a dedicated status-bar indicator instead of tinting the status message.
+
+### Fixed
+
+- Active list rows no longer render past the current wrap segment, preventing duplicated text at wrapped line boundaries.
+- Concealed inline formatting, shortened bare URLs, and covered links now wrap from their rendered text instead of raw Markdown source width.
+- Vertical document jumps such as `G`, `gg`, and translated command-arrow jumps preserve the target cursor column.
+- Saving a new note creates missing parent directories as part of the write.
+
 ## [0.1.4] - 2026-05-13
 
 Full commit range: [`v0.1.3...v0.1.4`](https://github.com/pacificcodeinc/glass/compare/v0.1.3...v0.1.4)
@@ -93,7 +110,8 @@ Full commit range: [`v0.1.0...v0.1.1`](https://github.com/pacificcodeinc/glass/c
 - Live Markdown rendering with concealed syntax markers.
 - Checkbox (`- [ ]` / `- [x]`) rendering.
 
-[Unreleased]: https://github.com/pacificcodeinc/glass/compare/v0.1.4...HEAD
+[Unreleased]: https://github.com/pacificcodeinc/glass/compare/v0.1.5...HEAD
+[0.1.5]: https://github.com/pacificcodeinc/glass/compare/v0.1.4...v0.1.5
 [0.1.4]: https://github.com/pacificcodeinc/glass/compare/v0.1.3...v0.1.4
 [0.1.3]: https://github.com/pacificcodeinc/glass/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/pacificcodeinc/glass/compare/v0.1.1...v0.1.2
