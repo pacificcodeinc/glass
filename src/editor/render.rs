@@ -8,7 +8,12 @@ pub struct VisibleRow {
     pub continuation_indent: usize,
 }
 
-pub fn visible_rows(buffer: &DocumentBuffer, top_line: usize, height: usize, width: usize) -> Vec<VisibleRow> {
+pub fn visible_rows(
+    buffer: &DocumentBuffer,
+    top_line: usize,
+    height: usize,
+    width: usize,
+) -> Vec<VisibleRow> {
     let mut rows = Vec::new();
     let mut line = top_line;
     let wrap_width = width.max(1);
@@ -137,6 +142,10 @@ pub fn wrap_line(text: &str, width: usize) -> (Vec<(usize, usize)>, usize) {
     }
 
     let content = &text[marker_len..];
+    if content.is_empty() {
+        return (vec![(0, text.chars().count())], marker_len);
+    }
+
     let content_width = width - marker_len;
     let content_segments = word_wrap_segments(content, content_width);
 
@@ -176,4 +185,36 @@ pub fn word_wrap_segments(text: &str, width: usize) -> Vec<(usize, usize)> {
     }
 
     segments
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{editor::buffer::DocumentBuffer, editor::cursor::Cursor};
+
+    fn buffer_with(text: &str) -> DocumentBuffer {
+        let mut buffer = DocumentBuffer::empty();
+        let mut cursor = Cursor::default();
+        buffer.insert_str(&mut cursor, text);
+        buffer
+    }
+
+    #[test]
+    fn marker_only_checkbox_renders_as_visible_row() {
+        let buffer = buffer_with("before\n- [ ] ");
+
+        let rows = visible_rows(&buffer, 0, 10, 80);
+
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[1].line_number, 1);
+        assert_eq!(rows[1].text, "- [ ] ");
+        assert_eq!(rows[1].wrap_index, 0);
+    }
+
+    #[test]
+    fn marker_only_checkbox_has_wrap_segment_for_end_cursor() {
+        assert_eq!(wrap_index_for_column("- [ ] ", 6, 80), 0);
+        assert_eq!(column_in_wrap_segment("- [ ] ", 6, 80), 6);
+        assert_eq!(visual_line_bounds("- [ ] ", 6, 80), (0, 6));
+    }
 }

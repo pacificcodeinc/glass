@@ -308,45 +308,11 @@ impl App {
             KeyCode::Esc => self.mode = Mode::Normal,
             KeyCode::Enter => {
                 let current_line = self.buffer.line(self.cursor.line);
-                let trimmed = current_line.trim_end_matches(['\r', '\n']);
-                let leading_ws_len = trimmed.len() - trimmed.trim_start().len();
-                let trimmed_content = &trimmed[leading_ws_len..];
-                let leading_ws = &trimmed[..leading_ws_len];
-
-                if let Some(content_after) = trimmed_content
-                    .strip_prefix("- [ ] ")
-                    .or_else(|| trimmed_content.strip_prefix("- [x] "))
-                {
-                    if content_after.is_empty() {
-                        self.buffer.insert_char(&mut self.cursor, '\n');
-                    } else {
-                        let prefix = format!("{}- [ ] ", leading_ws);
-                        self.buffer.insert_char(&mut self.cursor, '\n');
-                        self.buffer.insert_str(&mut self.cursor, &prefix);
-                    }
-                } else if let Some((num_str, content_after)) = parse_numbered_list(trimmed_content) {
-                    if content_after.is_empty() {
-                        self.buffer.insert_char(&mut self.cursor, '\n');
-                    } else {
-                        let next_num: usize = num_str.parse().unwrap_or(1) + 1;
-                        let prefix = format!("{}{}. ", leading_ws, next_num);
-                        self.buffer.insert_char(&mut self.cursor, '\n');
-                        self.buffer.insert_str(&mut self.cursor, &prefix);
-                    }
-                } else if let Some(content_after) = trimmed_content
-                    .strip_prefix("- ")
-                    .or_else(|| trimmed_content.strip_prefix("* "))
-                    .or_else(|| trimmed_content.strip_prefix("+ "))
-                {
-                    if content_after.is_empty() {
-                        self.buffer.insert_char(&mut self.cursor, '\n');
-                    } else {
-                        let prefix = format!("{}- ", leading_ws);
-                        self.buffer.insert_char(&mut self.cursor, '\n');
-                        self.buffer.insert_str(&mut self.cursor, &prefix);
-                    }
-                } else {
-                    self.buffer.insert_char(&mut self.cursor, '\n');
+                let continuation =
+                    list_continuation_after_enter(&current_line, self.cursor.column);
+                self.buffer.insert_char(&mut self.cursor, '\n');
+                if let ListContinuation::Continue(prefix) = continuation {
+                    self.buffer.insert_str(&mut self.cursor, &prefix);
                 }
             }
             KeyCode::Backspace => {
@@ -922,6 +888,95 @@ fn parse_numbered_list(text: &str) -> Option<(&str, &str)> {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ListContinuation {
+    None,
+    EndList,
+    Continue(String),
+}
+
+fn list_continuation_after_enter(line: &str, column: usize) -> ListContinuation {
+    let line = line.trim_end_matches(['\r', '\n']);
+    let leading_ws_len = line.len() - line.trim_start().len();
+    if column < leading_ws_len {
+        return ListContinuation::None;
+    }
+
+    let leading_ws = &line[..leading_ws_len];
+    let content = &line[leading_ws_len..];
+    let Some(item) = parse_list_item(content) else {
+        return ListContinuation::None;
+    };
+
+    if column < leading_ws_len + item.marker_len {
+        return ListContinuation::None;
+    }
+
+    if item.content.is_empty() {
+        return ListContinuation::EndList;
+    }
+
+    let prefix = match item.kind {
+        ListItemKind::Checkbox => format!("{leading_ws}- [ ] "),
+        ListItemKind::Bullet(marker) => format!("{leading_ws}{marker} "),
+        ListItemKind::Numbered(number) => format!("{leading_ws}{}. ", number + 1),
+    };
+    ListContinuation::Continue(prefix)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ListItemKind {
+    Checkbox,
+    Bullet(char),
+    Numbered(usize),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ListItem<'a> {
+    kind: ListItemKind,
+    marker_len: usize,
+    content: &'a str,
+}
+
+fn parse_list_item(content: &str) -> Option<ListItem<'_>> {
+    if let Some(rest) = content
+        .strip_prefix("- [ ]")
+        .or_else(|| content.strip_prefix("- [x]"))
+    {
+        if let Some(item_content) = rest
+            .strip_prefix(' ')
+            .or_else(|| rest.is_empty().then_some(""))
+        {
+            return Some(ListItem {
+                kind: ListItemKind::Checkbox,
+                marker_len: content.len() - item_content.len(),
+                content: item_content,
+            });
+        }
+    }
+
+    if let Some((number, item_content)) = parse_numbered_list(content) {
+        return Some(ListItem {
+            kind: ListItemKind::Numbered(number.parse().unwrap_or(1)),
+            marker_len: content.len() - item_content.len(),
+            content: item_content,
+        });
+    }
+
+    for marker in ['-', '*', '+'] {
+        let prefix = [marker, ' '].iter().collect::<String>();
+        if let Some(item_content) = content.strip_prefix(&prefix) {
+            return Some(ListItem {
+                kind: ListItemKind::Bullet(marker),
+                marker_len: prefix.len(),
+                content: item_content,
+            });
+        }
+    }
+
+    None
+}
+
 fn fuzzy_match(candidate: &str, query: &str) -> bool {
     if query.is_empty() {
         return true;
@@ -942,4 +997,57 @@ fn fuzzy_match(candidate: &str, query: &str) -> bool {
     }
 
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn enter_continues_checkbox_items_at_end_and_middle() {
+        assert_eq!(
+            list_continuation_after_enter("- [ ] todo", 10),
+            ListContinuation::Continue("- [ ] ".to_string())
+        );
+        assert_eq!(
+            list_continuation_after_enter("- [x] todo", 6),
+            ListContinuation::Continue("- [ ] ".to_string())
+        );
+    }
+
+    #[test]
+    fn enter_exits_empty_checkbox_item() {
+        assert_eq!(
+            list_continuation_after_enter("- [ ] ", 6),
+            ListContinuation::EndList
+        );
+        assert_eq!(
+            list_continuation_after_enter("- [ ]", 5),
+            ListContinuation::EndList
+        );
+    }
+
+    #[test]
+    fn checkbox_marker_requires_separator_or_end() {
+        assert_eq!(
+            list_continuation_after_enter("- [ ]not a checkbox", 6),
+            ListContinuation::Continue("- ".to_string())
+        );
+    }
+
+    #[test]
+    fn enter_continues_numbered_items_with_next_number() {
+        assert_eq!(
+            list_continuation_after_enter("9. todo", 7),
+            ListContinuation::Continue("10. ".to_string())
+        );
+    }
+
+    #[test]
+    fn enter_continues_bullet_items_with_existing_marker() {
+        assert_eq!(
+            list_continuation_after_enter("  * todo", 8),
+            ListContinuation::Continue("  * ".to_string())
+        );
+    }
 }

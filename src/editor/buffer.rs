@@ -61,7 +61,7 @@ impl DocumentBuffer {
     }
 
     pub fn line_count(&self) -> usize {
-        self.text.len_lines().max(1)
+        self.visible_len_lines()
     }
 
     pub fn line(&self, line: usize) -> String {
@@ -202,6 +202,20 @@ impl DocumentBuffer {
     pub fn as_string(&self) -> String {
         self.text.to_string()
     }
+
+    fn visible_len_lines(&self) -> usize {
+        let len_chars = self.text.len_chars();
+        if len_chars == 0 {
+            return 1;
+        }
+
+        let len_lines = self.text.len_lines();
+        if self.text.char(len_chars - 1) == '\n' {
+            len_lines.saturating_sub(1).max(1)
+        } else {
+            len_lines.max(1)
+        }
+    }
 }
 
 fn trim_line_ending_len(line: &str) -> usize {
@@ -260,6 +274,36 @@ mod tests {
         buffer.delete_line_range(1, 2, &mut cursor);
 
         assert_eq!(buffer.as_string(), "a\n");
-        assert_eq!(cursor, Cursor { line: 1, column: 0 });
+        assert_eq!(cursor, Cursor { line: 0, column: 0 });
+    }
+
+    #[test]
+    fn trailing_file_newline_is_not_a_visible_ghost_line() {
+        let mut buffer = DocumentBuffer::empty();
+        let mut cursor = Cursor::default();
+        buffer.insert_str(&mut cursor, "a\n");
+
+        assert_eq!(buffer.line_count(), 1);
+
+        buffer.delete_line_range(0, 0, &mut cursor);
+
+        assert_eq!(buffer.as_string(), "");
+        assert_eq!(buffer.line_count(), 1);
+        assert_eq!(cursor, Cursor { line: 0, column: 0 });
+    }
+
+    #[test]
+    fn final_blank_line_can_be_deleted() {
+        let mut buffer = DocumentBuffer::empty();
+        let mut cursor = Cursor::default();
+        buffer.insert_str(&mut cursor, "a\n\n");
+
+        assert_eq!(buffer.line_count(), 2);
+
+        buffer.delete_line_range(1, 1, &mut cursor);
+
+        assert_eq!(buffer.as_string(), "a\n");
+        assert_eq!(buffer.line_count(), 1);
+        assert_eq!(cursor, Cursor { line: 0, column: 0 });
     }
 }
