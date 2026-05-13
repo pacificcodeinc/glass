@@ -11,8 +11,9 @@ use crate::{
     config::theme::Theme,
     editor::render::{
         column_in_wrap_segment, detect_list_marker, visible_rows, wrap_index_for_column,
+        wrap_line,
     },
-    markdown::highlight::render_markdown_segment_with_completion,
+    markdown::highlight::{concealed_wrap_line, render_markdown_segment_with_completion},
 };
 
 const ARTICLE_WIDTH: u16 = 82;
@@ -48,6 +49,13 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App, theme: Theme) {
         app.viewport.top_wrap_index,
         page.height as usize,
         text_width,
+        |line_num, text, w| {
+            if line_num == app.cursor.line {
+                wrap_line(text, w)
+            } else {
+                concealed_wrap_line(text, w)
+            }
+        },
     );
     let visual_range = app.visual_line_anchor.map(|anchor| {
         let start = anchor.min(app.cursor.line);
@@ -69,36 +77,20 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App, theme: Theme) {
                 row.line_number == app.cursor.line && row.wrap_index == wrap_index_of_cursor;
             let active = row.line_number == app.cursor.line;
 
-            // Prepend indentation for continuation lines of list items
-            let display_text = if row.continuation_indent > 0 {
-                " ".repeat(row.continuation_indent) + &row.text
-            } else {
-                row.text.clone()
-            };
-            let render_source = if row.continuation_indent > 0 {
-                display_text.as_str()
-            } else {
-                &row.full_text
-            };
-            let segment_start = if row.continuation_indent > 0 {
-                0
-            } else {
-                row.source_start
-            };
-            let segment_end = if row.continuation_indent > 0 {
-                display_text.chars().count()
-            } else {
-                row.source_end
-            };
             let mut line = render_markdown_segment_with_completion(
-                render_source,
-                segment_start,
-                segment_end,
+                &row.full_text,
+                row.source_start,
+                row.source_end,
                 theme,
                 active,
                 row.wrap_index,
                 row.completed && row.wrap_index > 0,
             );
+
+            if row.continuation_indent > 0 {
+                let indent = Span::raw(" ".repeat(row.continuation_indent));
+                line.spans.insert(0, indent);
+            }
 
             if visual_range
                 .as_ref()

@@ -16,6 +16,7 @@ use crate::{
         render::{visual_line_bounds, wrap_index_for_column, wrap_line},
     },
     fs::tree::FileTree,
+    markdown::highlight::concealed_wrap_line,
     markdown::inline::{LinkKind, link_at_column},
 };
 
@@ -856,7 +857,12 @@ impl App {
     fn line_wrap_count(&self, line: usize, width: usize) -> usize {
         let line_text = self.buffer.line(line);
         let trimmed = line_text.trim_end_matches(['\r', '\n']);
-        wrap_line(trimmed, width).0.len().max(1)
+        let (segments, _) = if line == self.cursor.line {
+            wrap_line(trimmed, width)
+        } else {
+            concealed_wrap_line(trimmed, width)
+        };
+        segments.len().max(1)
     }
 
     fn toggle_checkbox(&mut self) -> bool {

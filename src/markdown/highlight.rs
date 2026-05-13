@@ -5,6 +5,7 @@ use ratatui::{
 
 use crate::{
     config::theme::Theme,
+    editor::render::{detect_list_marker, word_wrap_segments},
     markdown::inline::{InlineLink, LinkKind, links},
 };
 
@@ -145,10 +146,16 @@ pub fn render_markdown_segment_with_completion(
         return highlight_source_segment(source, segment_start, segment_end, theme, wrap_index);
     }
 
-    if let Some(concealed) = conceal_split_covered_links(source, segment_start, segment_end) {
-        return render_markdown_line_with_completion(
-            &concealed, theme, false, wrap_index, completed,
-        );
+    let parsed_links = links(source);
+    let has_split_covered_link = parsed_links.iter().any(|link| {
+        matches!(link.kind, LinkKind::Markdown | LinkKind::Wiki)
+            && ranges_overlap(segment_start, segment_end, link.source_start, link.source_end)
+            && (link.source_start < segment_start || link.source_end > segment_end)
+    });
+
+    if has_split_covered_link {
+        let spans = render_concealed_segment(source, segment_start, segment_end, theme, completed);
+        return Line::from(spans);
     }
 
     render_markdown_line_with_completion(&segment, theme, false, wrap_index, completed)
@@ -302,68 +309,149 @@ fn slice_chars(source: &str, start: usize, end: usize) -> String {
         .collect()
 }
 
-fn conceal_split_covered_links(
+fn concealed_text_with_mapping(source: &str) -> (String, Vec<usize>) {
+    let chars: Vec<char> = source.chars().collect();
+    let parsed_links = links(source);
+    let mut concealed = String::new();
+    let mut mapping = Vec::new();
+    let mut index = 0;
+
+    while index < chars.len() {
+        if let Some(link) = parsed_links.iter().find(|l| {
+            matches!(l.kind, LinkKind::Markdown | LinkKind::Wiki) && l.source_start == index
+        }) {
+            if let (Some(ls), Some(le)) = (link.label_start, link.label_end) {
+                for i in ls..le {
+                    if chars[i] != '`' {
+                        concealed.push(chars[i]);
+                        mapping.push(i);
+                    }
+                }
+            }
+            index = link.source_end;
+            continue;
+        }
+
+        concealed.push(chars[index]);
+        mapping.push(index);
+        index += 1;
+    }
+
+    (concealed, mapping)
+}
+
+pub fn concealed_wrap_segments(source: &str, width: usize) -> Vec<(usize, usize)> {
+    let (concealed, mapping) = concealed_text_with_mapping(source);
+    if concealed.is_empty() {
+        return vec![(0, source.chars().count())];
+    }
+    let visual_segments = word_wrap_segments(&concealed, width);
+
+    visual_segments
+        .into_iter()
+        .map(|(v_start, v_end)| {
+            let s_start = mapping.get(v_start).copied().unwrap_or(0);
+            let s_end = mapping.get(v_end).copied().unwrap_or(source.chars().count());
+            (s_start, s_end)
+        })
+        .collect()
+}
+
+pub fn concealed_wrap_line(text: &str, width: usize) -> (Vec<(usize, usize)>, usize) {
+    let marker_len = detect_list_marker(text);
+
+    if marker_len == 0 || marker_len >= width {
+        return (concealed_wrap_segments(text, width), 0);
+    }
+
+    let content = &text[marker_len..];
+    if content.is_empty() {
+        return (vec![(0, text.chars().count())], marker_len);
+    }
+
+    let content_width = width - marker_len;
+    let content_segments = concealed_wrap_segments(content, content_width);
+
+    let mut segments = Vec::new();
+    for (i, (start, end)) in content_segments.into_iter().enumerate() {
+        if i == 0 {
+            segments.push((0, marker_len + end));
+        } else {
+            segments.push((marker_len + start, marker_len + end));
+        }
+    }
+
+    (segments, marker_len)
+}
+
+fn render_concealed_segment(
     source: &str,
     segment_start: usize,
     segment_end: usize,
-) -> Option<String> {
-    let parsed_links = links(source);
-    let has_split_covered_link = parsed_links.iter().any(|link| {
-        matches!(link.kind, LinkKind::Markdown | LinkKind::Wiki)
-            && ranges_overlap(
-                segment_start,
-                segment_end,
-                link.source_start,
-                link.source_end,
-            )
-            && (link.source_start < segment_start || link.source_end > segment_end)
-    });
-    if !has_split_covered_link {
-        return None;
-    }
-
+    theme: Theme,
+    completed: bool,
+) -> Vec<Span<'static>> {
     let chars: Vec<char> = source.chars().collect();
-    let mut output = String::new();
+    let parsed_links = links(source);
+    let mut spans = Vec::new();
     let mut index = segment_start;
+    let base_style = if completed {
+        completed_style(Style::default().fg(theme.muted))
+    } else {
+        Style::default().fg(theme.text)
+    };
 
     while index < segment_end {
-        let covered_link = parsed_links.iter().find(|link| {
-            matches!(link.kind, LinkKind::Markdown | LinkKind::Wiki)
-                && index >= link.source_start
-                && index < link.source_end
-        });
+        if let Some(link) = parsed_links.iter().find(|l| {
+            matches!(l.kind, LinkKind::Markdown | LinkKind::Wiki)
+                && index >= l.source_start
+                && index < l.source_end
+        }) {
+            let label_start = link.label_start.unwrap_or(link.source_start);
+            let label_end = link.label_end.unwrap_or(label_start);
 
-        let Some(link) = covered_link else {
-            output.push(chars[index]);
-            index += 1;
-            continue;
-        };
+            if index < label_start {
+                index = label_start.min(segment_end);
+                continue;
+            }
 
-        let Some(label_start) = link.label_start else {
+            if index < label_end {
+                let end = label_end.min(segment_end);
+                let text: String = chars[index..end].iter().filter(|ch| **ch != '`').collect();
+                if !text.is_empty() {
+                    spans.push(Span::styled(text, link_text_style(theme, base_style)));
+                }
+                index = end;
+                continue;
+            }
+
             index = link.source_end.min(segment_end);
-            continue;
-        };
-        let Some(label_end) = link.label_end else {
-            index = link.source_end.min(segment_end);
-            continue;
-        };
-
-        if index < label_start {
-            index = label_start.min(segment_end);
             continue;
         }
 
-        if index < label_end {
-            let copy_end = label_end.min(segment_end);
-            output.extend(chars[index..copy_end].iter().filter(|ch| **ch != '`'));
-            index = copy_end;
-            continue;
-        }
+        let next_link_start = parsed_links
+            .iter()
+            .filter_map(|l| {
+                if matches!(l.kind, LinkKind::Markdown | LinkKind::Wiki)
+                    && l.source_start > index
+                    && l.source_start < segment_end
+                {
+                    Some(l.source_start)
+                } else {
+                    None
+                }
+            })
+            .min()
+            .unwrap_or(segment_end);
 
-        index = link.source_end.min(segment_end);
+        if index < next_link_start {
+            let text = slice_chars(source, index, next_link_start);
+            spans.extend(conceal_inline(&text, theme, base_style));
+            index = next_link_start;
+        }
     }
 
-    Some(output)
+    spans
 }
 
 fn ranges_overlap(a_start: usize, a_end: usize, b_start: usize, b_end: usize) -> bool {
@@ -984,6 +1072,49 @@ mod tests {
     fn inactive_numbered_list_multi_digit() {
         let line = render_markdown_line("10. tenth item", Theme::monochrome_for_tests(), false, 0);
         assert_eq!(line_text(&line), "10. tenth item");
+    }
+
+    #[test]
+    fn wrapped_markdown_link_first_segment_keeps_link_style() {
+        let source =
+            "[`v0.1.2...v0.1.3`](https://github.com/pacificcodeinc/glass/compare/v0.1.2...v0.1.3)";
+        let segment_end = source.chars().position(|ch| ch == '/').unwrap();
+
+        let line = render_markdown_segment_with_completion(
+            source,
+            0,
+            segment_end,
+            Theme::monochrome_for_tests(),
+            false,
+            0,
+            false,
+        );
+
+        assert_eq!(line_text(&line), "v0.1.2...v0.1.3");
+        assert!(
+            line.spans.iter().any(|span| {
+                span.style.add_modifier.contains(Modifier::UNDERLINED)
+                    && span.style.fg == Theme::monochrome_for_tests().link.fg
+            }),
+            "split link label should be underlined and blue"
+        );
+    }
+
+    #[test]
+    fn concealed_wrap_shortens_segments_for_hidden_urls() {
+        let source = "[Keep a Changelog](https://keepachangelog.com/en/1.1.0/)";
+        // Raw text is 56 chars; visible text is only 16 chars.
+        let raw_segments = word_wrap_segments(source, 20);
+        let concealed_segments = concealed_wrap_segments(source, 20);
+
+        assert!(
+            concealed_segments.len() < raw_segments.len(),
+            "concealed wrapping should produce fewer segments"
+        );
+        assert_eq!(concealed_segments.len(), 1);
+        // The single concealed segment should cover the whole link,
+        // possibly starting at the first visible character.
+        assert_eq!(concealed_segments[0].1, source.chars().count());
     }
 
     fn line_text(line: &Line<'static>) -> String {
