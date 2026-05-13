@@ -1,6 +1,5 @@
 pub mod editor;
 pub mod layout;
-pub mod picker;
 pub mod status;
 
 use ratatui::Frame;
@@ -15,5 +14,4 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
 
     editor::render(frame, areas.editor, app, theme);
     status::render(frame, areas.status, app, theme);
-    picker::render(frame, frame.area(), app, theme);
 }

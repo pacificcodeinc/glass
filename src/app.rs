@@ -48,39 +48,6 @@ impl Default for Viewport {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum OverlayKind {
-    CommandPalette,
-    FilePicker,
-}
-
-#[derive(Debug, Clone)]
-pub struct OverlayState {
-    pub kind: OverlayKind,
-    pub query: String,
-    pub selected: usize,
-}
-
-#[derive(Debug, Clone)]
-pub struct PickerItem {
-    pub label: String,
-    pub detail: String,
-}
-
-#[derive(Debug, Clone, Copy)]
-enum PaletteAction {
-    Write,
-    Quit,
-    WriteQuit,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct PaletteCommand {
-    label: &'static str,
-    detail: &'static str,
-    action: PaletteAction,
-}
-
 #[derive(Debug)]
 pub struct App {
     pub notes_dir: PathBuf,
@@ -92,33 +59,11 @@ pub struct App {
     pub command_line: String,
     pub status_message: String,
     pub should_quit: bool,
-    pub overlay: Option<OverlayState>,
     pub visual_line_anchor: Option<usize>,
-    pub file_tree: FileTree,
     pending_g: bool,
     pending_delete: bool,
     pending_change: bool,
-    pending_leader: bool,
-    pending_leader_p: bool,
 }
-
-const PALETTE_COMMANDS: &[PaletteCommand] = &[
-    PaletteCommand {
-        label: "Save",
-        detail: ":w",
-        action: PaletteAction::Write,
-    },
-    PaletteCommand {
-        label: "Quit",
-        detail: ":q",
-        action: PaletteAction::Quit,
-    },
-    PaletteCommand {
-        label: "Save and Quit",
-        detail: ":wq",
-        action: PaletteAction::WriteQuit,
-    },
-];
 
 impl App {
     pub fn new(notes_dir: PathBuf, initial_file: Option<PathBuf>) -> Result<Self> {
@@ -142,14 +87,10 @@ impl App {
             command_line: String::new(),
             status_message: "Glass".to_string(),
             should_quit: false,
-            overlay: None,
             visual_line_anchor: None,
-            file_tree,
             pending_g: false,
             pending_delete: false,
             pending_change: false,
-            pending_leader: false,
-            pending_leader_p: false,
         })
     }
 
@@ -169,16 +110,6 @@ impl App {
 
         if key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Char('c') {
             self.request_quit(false)?;
-            return Ok(());
-        }
-
-        if is_command_palette_key(key) {
-            self.open_overlay(OverlayKind::CommandPalette);
-            return Ok(());
-        }
-
-        if self.overlay.is_some() {
-            self.handle_overlay_key(key)?;
             return Ok(());
         }
 
@@ -226,22 +157,6 @@ impl App {
             return Ok(());
         }
 
-        if self.pending_leader_p {
-            self.pending_leader_p = false;
-            if let KeyCode::Char('v') = key.code {
-                self.open_file_picker();
-            }
-            return Ok(());
-        }
-
-        if self.pending_leader {
-            self.pending_leader = false;
-            if let KeyCode::Char('p') = key.code {
-                self.pending_leader_p = true;
-            }
-            return Ok(());
-        }
-
         match key.code {
             KeyCode::Char(':') => {
                 self.enter_command_line();
@@ -254,9 +169,6 @@ impl App {
                 if !self.toggle_checkbox() {
                     self.follow_link_under_cursor()?;
                 }
-            }
-            KeyCode::Char(' ') => {
-                self.pending_leader = true;
             }
             KeyCode::Char('i') => self.mode = Mode::Insert,
             KeyCode::Char('I') => {
@@ -578,37 +490,6 @@ impl App {
         self.command_line.clear();
     }
 
-    fn handle_overlay_key(&mut self, key: KeyEvent) -> Result<()> {
-        let max_index = self.overlay_items().len().saturating_sub(1);
-        let Some(overlay) = self.overlay.as_mut() else {
-            return Ok(());
-        };
-
-        match key.code {
-            KeyCode::Esc => self.overlay = None,
-            KeyCode::Enter => self.execute_overlay_selection()?,
-            KeyCode::Backspace => {
-                overlay.query.pop();
-                overlay.selected = 0;
-            }
-            KeyCode::Up => overlay.selected = overlay.selected.saturating_sub(1),
-            KeyCode::Down => overlay.selected = (overlay.selected + 1).min(max_index),
-            KeyCode::Char('k') if key.modifiers.is_empty() => {
-                overlay.selected = overlay.selected.saturating_sub(1);
-            }
-            KeyCode::Char('j') if key.modifiers.is_empty() => {
-                overlay.selected = (overlay.selected + 1).min(max_index);
-            }
-            KeyCode::Char(ch) => {
-                overlay.query.push(ch);
-                overlay.selected = 0;
-            }
-            _ => {}
-        }
-
-        Ok(())
-    }
-
     fn execute_command(&mut self, command: Command) -> Result<()> {
         match command {
             Command::Write => self.save_current_file()?,
@@ -640,135 +521,6 @@ impl App {
 
         self.should_quit = true;
         Ok(())
-    }
-
-    fn open_overlay(&mut self, kind: OverlayKind) {
-        self.overlay = Some(OverlayState {
-            kind,
-            query: String::new(),
-            selected: 0,
-        });
-        self.status_message = match kind {
-            OverlayKind::CommandPalette => "Command palette".to_string(),
-            OverlayKind::FilePicker => "File picker".to_string(),
-        };
-    }
-
-    fn open_file_picker(&mut self) {
-        self.open_overlay(OverlayKind::FilePicker);
-    }
-
-    fn execute_overlay_selection(&mut self) -> Result<()> {
-        let Some(overlay) = self.overlay.clone() else {
-            return Ok(());
-        };
-
-        match overlay.kind {
-            OverlayKind::CommandPalette => {
-                let matches = self.command_palette_matches();
-                let Some(command) = matches.get(overlay.selected).copied() else {
-                    return Ok(());
-                };
-                self.overlay = None;
-                self.execute_palette_action(command.action)?;
-            }
-            OverlayKind::FilePicker => {
-                let matches = self.file_picker_matches();
-                if let Some(entry) = matches.get(overlay.selected) {
-                    let path = entry.path.clone();
-                    if path.is_file() {
-                        self.overlay = None;
-                        self.open_path(&path)?;
-                        self.file_tree = FileTree::load(&self.notes_dir).with_context(|| {
-                            format!(
-                                "failed to scan notes directory: {}",
-                                self.notes_dir.display()
-                            )
-                        })?;
-                        return Ok(());
-                    }
-                }
-            }
-        }
-
-        Ok(())
-    }
-
-    fn execute_palette_action(&mut self, action: PaletteAction) -> Result<()> {
-        match action {
-            PaletteAction::Write => self.save_current_file()?,
-            PaletteAction::Quit => self.request_quit(false)?,
-            PaletteAction::WriteQuit => {
-                self.save_current_file()?;
-                self.should_quit = true;
-            }
-        }
-
-        Ok(())
-    }
-
-    pub fn overlay_title(&self) -> Option<&'static str> {
-        self.overlay.as_ref().map(|overlay| match overlay.kind {
-            OverlayKind::CommandPalette => "Command Palette",
-            OverlayKind::FilePicker => "File Picker",
-        })
-    }
-
-    pub fn overlay_items(&self) -> Vec<PickerItem> {
-        let Some(overlay) = &self.overlay else {
-            return Vec::new();
-        };
-
-        match overlay.kind {
-            OverlayKind::CommandPalette => self
-                .command_palette_matches()
-                .into_iter()
-                .map(|command| PickerItem {
-                    label: command.label.to_string(),
-                    detail: command.detail.to_string(),
-                })
-                .collect(),
-            OverlayKind::FilePicker => self
-                .file_picker_matches()
-                .into_iter()
-                .map(|entry| PickerItem {
-                    label: entry.display_name.clone(),
-                    detail: entry.path.to_string_lossy().to_string(),
-                })
-                .collect(),
-        }
-    }
-
-    fn command_palette_matches(&self) -> Vec<PaletteCommand> {
-        let query = self
-            .overlay
-            .as_ref()
-            .map(|overlay| overlay.query.as_str())
-            .unwrap_or_default();
-
-        PALETTE_COMMANDS
-            .iter()
-            .copied()
-            .filter(|command| {
-                fuzzy_match(command.label, query) || fuzzy_match(command.detail, query)
-            })
-            .collect()
-    }
-
-    fn file_picker_matches(&self) -> Vec<crate::fs::tree::TreeEntry> {
-        let query = self
-            .overlay
-            .as_ref()
-            .map(|overlay| overlay.query.as_str())
-            .unwrap_or_default();
-
-        self.file_tree
-            .entries
-            .iter()
-            .filter(|entry| !entry.is_dir)
-            .filter(|entry| fuzzy_match(&entry.display_name, query))
-            .cloned()
-            .collect()
     }
 
     fn wrap_width(&self) -> usize {
@@ -1142,18 +894,6 @@ fn visual_position_before(
     line < other_line || (line == other_line && wrap_index < other_wrap_index)
 }
 
-fn is_command_palette_key(key: KeyEvent) -> bool {
-    key_char_is_p(key) && has_primary_modifier(key.modifiers)
-}
-
-fn key_char_is_p(key: KeyEvent) -> bool {
-    matches!(key.code, KeyCode::Char('p') | KeyCode::Char('P'))
-}
-
-fn has_primary_modifier(modifiers: KeyModifiers) -> bool {
-    modifiers.intersects(KeyModifiers::SUPER | KeyModifiers::CONTROL)
-}
-
 fn is_text_input_key(key: KeyEvent) -> bool {
     !key.modifiers
         .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER)
@@ -1285,28 +1025,6 @@ fn parse_list_item(content: &str) -> Option<ListItem<'_>> {
     None
 }
 
-fn fuzzy_match(candidate: &str, query: &str) -> bool {
-    if query.is_empty() {
-        return true;
-    }
-
-    let mut query_chars = query.chars().map(|ch| ch.to_ascii_lowercase());
-    let Some(mut needle) = query_chars.next() else {
-        return true;
-    };
-
-    for ch in candidate.chars().map(|ch| ch.to_ascii_lowercase()) {
-        if ch == needle {
-            let Some(next) = query_chars.next() else {
-                return true;
-            };
-            needle = next;
-        }
-    }
-
-    false
-}
-
 fn is_external_link(target: &str) -> bool {
     target.starts_with("https://") || target.starts_with("http://") || target.starts_with("www.")
 }
@@ -1360,17 +1078,10 @@ mod tests {
             command_line: String::new(),
             status_message: String::new(),
             should_quit: false,
-            overlay: None,
             visual_line_anchor: None,
-            file_tree: FileTree {
-                entries: Vec::new(),
-                selected: 0,
-            },
             pending_g: false,
             pending_delete: false,
             pending_change: false,
-            pending_leader: false,
-            pending_leader_p: false,
         }
     }
 
@@ -1584,6 +1295,18 @@ mod tests {
         press_modified(&mut app, KeyCode::Char('b'), KeyModifiers::ALT);
 
         assert_eq!(app.command_line, "q");
+    }
+
+    #[test]
+    fn primary_p_no_longer_opens_picker_or_palette() {
+        let mut app = test_app("text");
+        app.status_message = "ready".to_string();
+
+        press_modified(&mut app, KeyCode::Char('p'), KeyModifiers::SUPER);
+
+        assert_eq!(app.mode, Mode::Normal);
+        assert_eq!(app.status_message, "ready");
+        assert_eq!(app.command_line, "");
     }
 
     #[test]

@@ -138,7 +138,7 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App, theme: Theme) {
         .style(Style::default().bg(theme.background).fg(theme.text));
     frame.render_widget(paragraph, page);
 
-    if app.mode != Mode::CommandLine && app.overlay.is_none() {
+    if app.mode != Mode::CommandLine {
         let cursor_indent = if wrap_index_of_cursor > 0 {
             detect_list_marker(&cursor_line_text)
         } else {

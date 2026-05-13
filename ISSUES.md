@@ -4,6 +4,7 @@
 - [x] Numbered lists: muted markers, aligned continuation lines, and Enter auto-increments.
 - [x] Numbered lists: remove any remaining marker flicker while editing or pressing Enter.
 - [ ] File picker: rewrite the fuzzy-find / Command+P picker from scratch.
+- [x] Old picker: remove the fuzzy finder, command palette overlay, and Command+P binding before the rewrite.
 - [ ] Mouse support: click anywhere in the editor to move the cursor.
 - [x] Checkboxes: render `- [ ]` / `- [x]` and toggle them with Space in normal mode.
 - [x] Checkboxes: Enter at the end or middle of an item creates the next checkbox.

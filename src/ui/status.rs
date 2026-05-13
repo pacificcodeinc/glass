@@ -34,13 +34,7 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App, theme: Theme) {
         .map(|path| path.display().to_string())
         .unwrap_or_else(|| "[No note]".to_string());
     let dirty = if app.buffer.dirty { " +" } else { "" };
-    let left = if let Some(overlay) = &app.overlay {
-        format!(
-            " {} > {}",
-            app.overlay_title().unwrap_or("Palette"),
-            overlay.query
-        )
-    } else if app.mode == Mode::CommandLine {
+    let left = if app.mode == Mode::CommandLine {
         format!(":{}", app.command_line)
     } else {
         format!(
@@ -53,7 +47,7 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App, theme: Theme) {
     let dirty_style = Style::default()
         .fg(theme.dirty)
         .bg(theme.status.bg.unwrap_or(theme.background));
-    let show_message = app.mode != Mode::CommandLine && app.overlay.is_none();
+    let show_message = app.mode != Mode::CommandLine;
     let mut spans = vec![Span::styled(left, theme.status)];
     if show_message {
         spans.push(Span::styled("  ", theme.status));

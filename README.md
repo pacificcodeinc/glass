@@ -4,16 +4,14 @@ A fast terminal markdown editor.
 
 ## What it is
 
-Glass is a markdown editor for people who live in the terminal. Vim inspired keybindings, fuzzy file picker, split view with live rendered preview, and syntax highlighting via Tree Sitter. Built with Rust and Ratatui.
+Glass is a markdown editor for people who live in the terminal. Vim inspired keybindings, centered article-style editing, live Markdown rendering, and syntax highlighting via Tree Sitter. Built with Rust and Ratatui.
 
 ## Features
 
 - **Vim inspired editing** — Normal, Insert, Visual, and Command line modes
-- **Fuzzy file picker** — Open files instantly with fuzzy search
-- **Live preview** — Split view showing rendered markdown alongside the source
+- **Live Markdown rendering** — Readable headings, lists, checkboxes, inline code, and links
 - **Syntax highlighting** — Powered by Tree Sitter markdown grammar
-- **Command palette** — Quick access to save, quit, and other actions
-- **File tree** — Sidebar view of your notes directory
+- **Link navigation** — Follow Markdown, wiki, and URL links from normal mode
 - **Themes** — Configurable color schemes
 
 ## Install
@@ -45,9 +43,10 @@ glass <notes-directory>
 | `dd` | Delete line |
 | `d` + motion | Delete motion |
 | `x` | Delete character |
+| `u` | Undo last edit |
+| `gf` / `Enter` on link | Follow link under cursor |
+| `Enter` on checkbox | Toggle checkbox |
 | `Ctrl+C` | Quit |
-| `Ctrl+P` | Command palette |
-| `Space p v` | File picker |
 
 ### Insert mode
 
