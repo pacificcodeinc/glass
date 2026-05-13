@@ -57,7 +57,7 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App, theme: Theme) {
         .map(|(i, row)| {
             let is_cursor_row = row.line_number == app.cursor.line
                 && row.wrap_index == wrap_index_of_cursor;
-            let active = is_cursor_row || app.mode == Mode::Visual;
+            let active = is_cursor_row;
             let mut line = render_markdown_line(&row.text, theme, active);
 
             if visual_range.as_ref().is_some_and(|range| range.contains(&row.line_number)) {
