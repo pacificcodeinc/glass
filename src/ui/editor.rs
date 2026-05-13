@@ -9,7 +9,7 @@ use ratatui::{
 use crate::{
     app::{App, Mode},
     config::theme::Theme,
-    editor::render::visible_rows,
+    editor::render::{column_in_wrap_segment, visible_rows, wrap_index_for_column},
     markdown::highlight::render_markdown_line,
 };
 
@@ -47,7 +47,8 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App, theme: Theme) {
         start..=end
     });
 
-    let wrap_index_of_cursor = app.cursor.column / text_width.max(1);
+    let cursor_line_text = app.buffer.line(app.cursor.line);
+    let wrap_index_of_cursor = wrap_index_for_column(&cursor_line_text, app.cursor.column, text_width);
     let mut cursor_visual_y: usize = 0;
     let mut cursor_found = false;
 
@@ -96,7 +97,7 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App, theme: Theme) {
     frame.render_widget(paragraph, page);
 
     if app.mode != Mode::CommandLine && app.overlay.is_none() {
-        let x = (app.cursor.column % text_width.max(1)) as u16 + gutter_width;
+        let x = column_in_wrap_segment(&cursor_line_text, app.cursor.column, text_width) as u16 + gutter_width;
         let y = cursor_visual_y as u16;
         frame.set_cursor_position(Position::new(page.x + x, page.y + y));
     }

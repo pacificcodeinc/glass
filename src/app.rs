@@ -285,7 +285,29 @@ impl App {
     fn handle_insert_key(&mut self, key: KeyEvent) {
         match key.code {
             KeyCode::Esc => self.mode = Mode::Normal,
-            KeyCode::Enter => self.buffer.insert_char(&mut self.cursor, '\n'),
+            KeyCode::Enter => {
+                let current_line = self.buffer.line(self.cursor.line);
+                let trimmed = current_line.trim_end_matches(['\r', '\n']);
+                let leading_ws_len = trimmed.len() - trimmed.trim_start().len();
+                let trimmed_content = &trimmed[leading_ws_len..];
+
+                let list_prefix = trimmed_content
+                    .strip_prefix("- ")
+                    .or_else(|| trimmed_content.strip_prefix("* "))
+                    .or_else(|| trimmed_content.strip_prefix("+ "));
+
+                if let Some(content_after) = list_prefix {
+                    if content_after.is_empty() {
+                        self.buffer.insert_char(&mut self.cursor, '\n');
+                    } else {
+                        let prefix = format!("{}- ", &trimmed[..leading_ws_len]);
+                        self.buffer.insert_char(&mut self.cursor, '\n');
+                        self.buffer.insert_str(&mut self.cursor, &prefix);
+                    }
+                } else {
+                    self.buffer.insert_char(&mut self.cursor, '\n');
+                }
+            }
             KeyCode::Backspace => {
                 if key.modifiers.contains(KeyModifiers::SUPER) {
                     // Command+Delete: delete to beginning of line
