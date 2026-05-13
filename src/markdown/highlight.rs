@@ -146,14 +146,7 @@ pub fn render_markdown_segment_with_completion(
         return highlight_source_segment(source, segment_start, segment_end, theme, wrap_index);
     }
 
-    let parsed_links = links(source);
-    let has_split_covered_link = parsed_links.iter().any(|link| {
-        matches!(link.kind, LinkKind::Markdown | LinkKind::Wiki)
-            && ranges_overlap(segment_start, segment_end, link.source_start, link.source_end)
-            && (link.source_start < segment_start || link.source_end > segment_end)
-    });
-
-    if has_split_covered_link {
+    if has_split_concealed_inline(source, segment_start, segment_end) {
         let spans = render_concealed_segment(source, segment_start, segment_end, theme, completed);
         return Line::from(spans);
     }
@@ -309,35 +302,19 @@ fn slice_chars(source: &str, start: usize, end: usize) -> String {
         .collect()
 }
 
+#[derive(Debug, Clone, Copy)]
+struct VisualChar {
+    ch: char,
+    source_index: usize,
+    style: Style,
+}
+
 fn concealed_text_with_mapping(source: &str) -> (String, Vec<usize>) {
-    let chars: Vec<char> = source.chars().collect();
-    let parsed_links = links(source);
-    let mut concealed = String::new();
-    let mut mapping = Vec::new();
-    let mut index = 0;
-
-    while index < chars.len() {
-        if let Some(link) = parsed_links.iter().find(|l| {
-            matches!(l.kind, LinkKind::Markdown | LinkKind::Wiki) && l.source_start == index
-        }) {
-            if let (Some(ls), Some(le)) = (link.label_start, link.label_end) {
-                for i in ls..le {
-                    if chars[i] != '`' {
-                        concealed.push(chars[i]);
-                        mapping.push(i);
-                    }
-                }
-            }
-            index = link.source_end;
-            continue;
-        }
-
-        concealed.push(chars[index]);
-        mapping.push(index);
-        index += 1;
-    }
-
-    (concealed, mapping)
+    let chars = concealed_chars(source, Theme::system(), Style::default());
+    (
+        chars.iter().map(|ch| ch.ch).collect(),
+        chars.iter().map(|ch| ch.source_index).collect(),
+    )
 }
 
 pub fn concealed_wrap_segments(source: &str, width: usize) -> Vec<(usize, usize)> {
@@ -351,7 +328,10 @@ pub fn concealed_wrap_segments(source: &str, width: usize) -> Vec<(usize, usize)
         .into_iter()
         .map(|(v_start, v_end)| {
             let s_start = mapping.get(v_start).copied().unwrap_or(0);
-            let s_end = mapping.get(v_end).copied().unwrap_or(source.chars().count());
+            let s_end = mapping
+                .get(v_end)
+                .copied()
+                .unwrap_or(source.chars().count());
             (s_start, s_end)
         })
         .collect()
@@ -391,67 +371,209 @@ fn render_concealed_segment(
     theme: Theme,
     completed: bool,
 ) -> Vec<Span<'static>> {
-    let chars: Vec<char> = source.chars().collect();
-    let parsed_links = links(source);
-    let mut spans = Vec::new();
-    let mut index = segment_start;
     let base_style = if completed {
         completed_style(Style::default().fg(theme.muted))
     } else {
         Style::default().fg(theme.text)
     };
+    let mut spans = Vec::new();
+    let mut current_text = String::new();
+    let mut current_style: Option<Style> = None;
 
-    while index < segment_end {
-        if let Some(link) = parsed_links.iter().find(|l| {
-            matches!(l.kind, LinkKind::Markdown | LinkKind::Wiki)
-                && index >= l.source_start
-                && index < l.source_end
-        }) {
-            let label_start = link.label_start.unwrap_or(link.source_start);
-            let label_end = link.label_end.unwrap_or(label_start);
-
-            if index < label_start {
-                index = label_start.min(segment_end);
-                continue;
-            }
-
-            if index < label_end {
-                let end = label_end.min(segment_end);
-                let text: String = chars[index..end].iter().filter(|ch| **ch != '`').collect();
-                if !text.is_empty() {
-                    spans.push(Span::styled(text, link_text_style(theme, base_style)));
-                }
-                index = end;
-                continue;
-            }
-
-            index = link.source_end.min(segment_end);
+    for visual in concealed_chars(source, theme, base_style) {
+        if visual.source_index < segment_start || visual.source_index >= segment_end {
             continue;
         }
 
-        let next_link_start = parsed_links
-            .iter()
-            .filter_map(|l| {
-                if matches!(l.kind, LinkKind::Markdown | LinkKind::Wiki)
-                    && l.source_start > index
-                    && l.source_start < segment_end
-                {
-                    Some(l.source_start)
-                } else {
-                    None
-                }
-            })
-            .min()
-            .unwrap_or(segment_end);
-
-        if index < next_link_start {
-            let text = slice_chars(source, index, next_link_start);
-            spans.extend(conceal_inline(&text, theme, base_style));
-            index = next_link_start;
+        if current_style == Some(visual.style) {
+            current_text.push(visual.ch);
+            continue;
         }
+
+        if let Some(style) = current_style.take() {
+            spans.push(Span::styled(std::mem::take(&mut current_text), style));
+        }
+        current_style = Some(visual.style);
+        current_text.push(visual.ch);
+    }
+
+    if let Some(style) = current_style {
+        spans.push(Span::styled(current_text, style));
     }
 
     spans
+}
+
+fn concealed_chars(source: &str, theme: Theme, base_style: Style) -> Vec<VisualChar> {
+    let chars: Vec<char> = source.chars().collect();
+    let parsed_links = links(source);
+    let mut visual = Vec::new();
+    let mut index = 0;
+
+    while index < chars.len() {
+        if chars[index] == '`' {
+            if let Some(end) = find_next(&chars, index + 1, '`') {
+                push_visual_slice(&mut visual, &chars, index, end + 1, theme.inline_code);
+                index = end + 1;
+                continue;
+            }
+        }
+
+        if starts_with(&chars, index, "**") {
+            if let Some(end) = find_token(&chars, index + 2, "**") {
+                push_visual_slice(
+                    &mut visual,
+                    &chars,
+                    index + 2,
+                    end,
+                    base_style.add_modifier(Modifier::BOLD),
+                );
+                index = end + 2;
+                continue;
+            }
+        }
+
+        if chars[index] == '*' || chars[index] == '_' {
+            if let Some(end) = find_next(&chars, index + 1, chars[index]) {
+                push_visual_slice(
+                    &mut visual,
+                    &chars,
+                    index + 1,
+                    end,
+                    base_style.add_modifier(Modifier::ITALIC),
+                );
+                index = end + 1;
+                continue;
+            }
+        }
+
+        if let Some(link) = link_starting_at(&parsed_links, index) {
+            push_visual_link(&mut visual, &link, &chars, theme, base_style);
+            index = link.source_end;
+            continue;
+        }
+
+        visual.push(VisualChar {
+            ch: chars[index],
+            source_index: index,
+            style: base_style,
+        });
+        index += 1;
+    }
+
+    visual
+}
+
+fn push_visual_slice(
+    visual: &mut Vec<VisualChar>,
+    chars: &[char],
+    start: usize,
+    end: usize,
+    style: Style,
+) {
+    for (offset, ch) in chars[start..end].iter().enumerate() {
+        visual.push(VisualChar {
+            ch: *ch,
+            source_index: start + offset,
+            style,
+        });
+    }
+}
+
+fn push_visual_link(
+    visual: &mut Vec<VisualChar>,
+    link: &InlineLink,
+    chars: &[char],
+    theme: Theme,
+    base_style: Style,
+) {
+    match link.kind {
+        LinkKind::Markdown | LinkKind::Wiki => {
+            if let (Some(start), Some(end)) = (link.label_start, link.label_end) {
+                for index in start..end {
+                    if chars[index] == '`' {
+                        continue;
+                    }
+                    visual.push(VisualChar {
+                        ch: chars[index],
+                        source_index: index,
+                        style: link_text_style(theme, base_style),
+                    });
+                }
+            }
+        }
+        LinkKind::Url => {
+            let shortened = short_link_target(&link.target);
+            let target_len = link.target_end.saturating_sub(link.target_start).max(1);
+            let display_len = shortened.chars().count().max(1);
+            for (offset, ch) in shortened.chars().enumerate() {
+                let source_index = link.target_start + (offset * target_len / display_len);
+                visual.push(VisualChar {
+                    ch,
+                    source_index: source_index.min(link.target_end.saturating_sub(1)),
+                    style: link_text_style(theme, base_style),
+                });
+            }
+        }
+    }
+}
+
+fn has_split_concealed_inline(source: &str, segment_start: usize, segment_end: usize) -> bool {
+    let chars: Vec<char> = source.chars().collect();
+    let parsed_links = links(source);
+
+    for link in parsed_links {
+        if ranges_overlap(
+            segment_start,
+            segment_end,
+            link.source_start,
+            link.source_end,
+        ) && (link.source_start < segment_start
+            || link.source_end > segment_end
+            || matches!(link.kind, LinkKind::Url))
+        {
+            return true;
+        }
+    }
+
+    let mut index = 0;
+    while index < chars.len() {
+        let token = if starts_with(&chars, index, "**") {
+            Some("**")
+        } else if chars[index] == '`' {
+            Some("`")
+        } else if chars[index] == '*' || chars[index] == '_' {
+            Some(if chars[index] == '*' { "*" } else { "_" })
+        } else {
+            None
+        };
+
+        let Some(token) = token else {
+            index += 1;
+            continue;
+        };
+
+        let end = if token == "`" || token == "*" || token == "_" {
+            find_next(&chars, index + 1, chars[index]).map(|end| end + 1)
+        } else {
+            find_token(&chars, index + token.chars().count(), token)
+                .map(|end| end + token.chars().count())
+        };
+
+        let Some(end) = end else {
+            index += token.chars().count();
+            continue;
+        };
+
+        if ranges_overlap(segment_start, segment_end, index, end)
+            && (index < segment_start || end > segment_end)
+        {
+            return true;
+        }
+        index = end;
+    }
+
+    false
 }
 
 fn ranges_overlap(a_start: usize, a_end: usize, b_start: usize, b_end: usize) -> bool {
@@ -1115,6 +1237,45 @@ mod tests {
         // The single concealed segment should cover the whole link,
         // possibly starting at the first visible character.
         assert_eq!(concealed_segments[0].1, source.chars().count());
+    }
+
+    #[test]
+    fn concealed_wrap_shortens_segments_for_bare_urls() {
+        let source = "visit https://github.com/pacificcodeinc/glass/issues/123.";
+        let raw_segments = word_wrap_segments(source, 20);
+        let concealed_segments = concealed_wrap_segments(source, 20);
+
+        assert!(
+            concealed_segments.len() < raw_segments.len(),
+            "bare URL wrapping should use the shortened visible target"
+        );
+    }
+
+    #[test]
+    fn wrapped_bold_text_keeps_delimiters_hidden_across_segments() {
+        let source = "**alpha beta gamma**";
+        let segments = concealed_wrap_segments(source, 8);
+
+        assert!(segments.len() > 1);
+        for (index, (start, end)) in segments.into_iter().enumerate() {
+            let line = render_markdown_segment_with_completion(
+                source,
+                start,
+                end,
+                Theme::monochrome_for_tests(),
+                false,
+                index,
+                false,
+            );
+            let text = line_text(&line);
+
+            assert!(!text.contains('*'));
+            assert!(
+                line.spans
+                    .iter()
+                    .any(|span| span.style.add_modifier.contains(Modifier::BOLD))
+            );
+        }
     }
 
     fn line_text(line: &Line<'static>) -> String {

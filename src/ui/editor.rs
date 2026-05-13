@@ -10,8 +10,7 @@ use crate::{
     app::{App, Mode},
     config::theme::Theme,
     editor::render::{
-        column_in_wrap_segment, detect_list_marker, visible_rows, wrap_index_for_column,
-        wrap_line,
+        column_in_wrap_segment, detect_list_marker, visible_rows, wrap_index_for_column, wrap_line,
     },
     markdown::highlight::{concealed_wrap_line, render_markdown_segment_with_completion},
 };

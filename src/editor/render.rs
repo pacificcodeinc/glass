@@ -196,7 +196,9 @@ pub fn word_wrap_segments(text: &str, width: usize) -> Vec<(usize, usize)> {
         }
 
         let slice = &chars[pos..end];
-        if let Some(rel_pos) = slice.iter().rposition(|c| *c == ' ') {
+        if let Some(rel_pos) = slice.iter().rposition(|c| *c == ' ')
+            && rel_pos > 0
+        {
             let break_at = pos + rel_pos;
             segments.push((pos, break_at));
             pos = break_at + 1;
@@ -239,6 +241,13 @@ mod tests {
         assert_eq!(wrap_index_for_column("- [ ] ", 6, 80), 0);
         assert_eq!(column_in_wrap_segment("- [ ] ", 6, 80), 6);
         assert_eq!(visual_line_bounds("- [ ] ", 6, 80), (0, 6));
+    }
+
+    #[test]
+    fn word_wrap_does_not_emit_empty_segment_when_break_starts_with_space() {
+        let segments = word_wrap_segments("one two", 4);
+
+        assert_eq!(segments, vec![(0, 3), (4, 7)]);
     }
 
     #[test]
