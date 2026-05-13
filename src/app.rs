@@ -91,6 +91,7 @@ pub struct App {
     pub file_tree: FileTree,
     pending_g: bool,
     pending_delete: bool,
+    pending_change: bool,
     pending_leader: bool,
     pending_leader_p: bool,
 }
@@ -114,12 +115,15 @@ const PALETTE_COMMANDS: &[PaletteCommand] = &[
 ];
 
 impl App {
-    pub fn new(notes_dir: PathBuf) -> Result<Self> {
+    pub fn new(notes_dir: PathBuf, initial_file: Option<PathBuf>) -> Result<Self> {
         let file_tree = FileTree::load(&notes_dir)
             .with_context(|| format!("failed to scan notes directory: {}", notes_dir.display()))?;
-        let buffer = match file_tree.selected_file() {
-            Some(path) => DocumentBuffer::from_path(path)?,
-            None => DocumentBuffer::empty(),
+        let buffer = match initial_file {
+            Some(path) => DocumentBuffer::from_path_or_empty(&path)?,
+            None => match file_tree.selected_file() {
+                Some(path) => DocumentBuffer::from_path(path)?,
+                None => DocumentBuffer::empty(),
+            },
         };
 
         Ok(Self {
@@ -137,6 +141,7 @@ impl App {
             file_tree,
             pending_g: false,
             pending_delete: false,
+            pending_change: false,
             pending_leader: false,
             pending_leader_p: false,
         })
@@ -194,6 +199,12 @@ impl App {
             return Ok(());
         }
 
+        if self.pending_change {
+            self.pending_change = false;
+            self.change_motion(key);
+            return Ok(());
+        }
+
         if self.pending_g {
             self.pending_g = false;
             match key.code {
@@ -225,7 +236,7 @@ impl App {
                 self.mode = Mode::CommandLine;
                 self.command_line.clear();
             }
-            KeyCode::Char('V') => {
+            KeyCode::Char('v') | KeyCode::Char('V') => {
                 self.mode = Mode::Visual;
                 self.visual_line_anchor = Some(self.cursor.line);
             }
@@ -271,7 +282,12 @@ impl App {
             KeyCode::Char('^') => motions::first_non_blank(&self.buffer, &mut self.cursor),
             KeyCode::Char('$') => motions::line_end(&self.buffer, &mut self.cursor),
             KeyCode::End => self.visual_line_end(),
+            KeyCode::Char('C') => self.change_to_line_end(),
             KeyCode::Char('D') => self.delete_to_line_end(),
+            KeyCode::Char('c') => {
+                self.pending_change = true;
+                self.status_message = "change".to_string();
+            }
             KeyCode::Char('d') => {
                 self.pending_delete = true;
                 self.status_message = "delete".to_string();
@@ -442,6 +458,60 @@ impl App {
             column: self.buffer.line_len_chars(self.cursor.line),
         });
         self.buffer.delete_range(start, end, &mut self.cursor);
+    }
+
+    fn change_motion(&mut self, key: KeyEvent) {
+        let start_cursor = self.cursor;
+        let start = self.buffer.char_index(start_cursor);
+        let mut target = start_cursor;
+
+        match key.code {
+            KeyCode::Char('c') => {
+                self.buffer.delete_line_range(
+                    start_cursor.line,
+                    start_cursor.line,
+                    &mut self.cursor,
+                );
+                self.mode = Mode::Insert;
+                return;
+            }
+            KeyCode::Char('w') => motions::word_forward(&self.buffer, &mut target),
+            KeyCode::Char('W') => motions::big_word_forward(&self.buffer, &mut target),
+            KeyCode::Char('b') => motions::word_backward(&self.buffer, &mut target),
+            KeyCode::Char('B') => motions::big_word_backward(&self.buffer, &mut target),
+            KeyCode::Char('e') => {
+                motions::word_end_forward(&self.buffer, &mut target);
+                motions::right(&self.buffer, &mut target);
+            }
+            KeyCode::Char('E') => {
+                motions::big_word_end_forward(&self.buffer, &mut target);
+                motions::right(&self.buffer, &mut target);
+            }
+            KeyCode::Char('$') | KeyCode::End | KeyCode::Char('D') => {
+                target.column = self.buffer.line_len_chars(target.line);
+            }
+            KeyCode::Char('0') | KeyCode::Home => target.column = 0,
+            KeyCode::Char('^') => motions::first_non_blank(&self.buffer, &mut target),
+            KeyCode::Char('G') => {
+                motions::document_end(&self.buffer, &mut target);
+                motions::right(&self.buffer, &mut target);
+            }
+            _ => return,
+        }
+
+        let end = self.buffer.char_index(target);
+        self.buffer.delete_range(start, end, &mut self.cursor);
+        self.mode = Mode::Insert;
+    }
+
+    fn change_to_line_end(&mut self) {
+        let start = self.buffer.char_index(self.cursor);
+        let end = self.buffer.char_index(Cursor {
+            line: self.cursor.line,
+            column: self.buffer.line_len_chars(self.cursor.line),
+        });
+        self.buffer.delete_range(start, end, &mut self.cursor);
+        self.mode = Mode::Insert;
     }
 
     fn delete_visual_lines(&mut self) {

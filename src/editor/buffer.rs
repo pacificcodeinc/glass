@@ -36,6 +36,19 @@ impl DocumentBuffer {
         })
     }
 
+    pub fn from_path_or_empty(path: &Path) -> Result<Self> {
+        if path.exists() {
+            Self::from_path(path)
+        } else {
+            Ok(Self {
+                path: Some(path.to_path_buf()),
+                saved_text: Rope::new(),
+                text: Rope::new(),
+                dirty: false,
+            })
+        }
+    }
+
     pub fn save(&mut self) -> Result<()> {
         let Some(path) = &self.path else {
             return Ok(());

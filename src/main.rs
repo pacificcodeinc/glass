@@ -13,34 +13,49 @@ use anyhow::{Context, Result, bail};
 use crate::{app::App, terminal::TerminalSession};
 
 fn main() -> Result<()> {
-    let notes_dir = parse_notes_dir()?;
-    let app = App::new(notes_dir)?;
+    let (notes_dir, initial_file) = parse_args()?;
+    let app = App::new(notes_dir, initial_file)?;
     TerminalSession::run(app)
 }
 
-fn parse_notes_dir() -> Result<PathBuf> {
+fn parse_args() -> Result<(PathBuf, Option<PathBuf>)> {
     let mut args = env::args_os();
     let program = args
         .next()
         .and_then(|arg| arg.into_string().ok())
-        .unwrap_or_else(|| "glassnotes".to_string());
+        .unwrap_or_else(|| "glass".to_string());
 
-    let Some(notes_dir) = args.next() else {
-        bail!("usage: {program} <notes-dir>");
+    let Some(arg) = args.next() else {
+        bail!("usage: {program} <path>");
     };
 
     if args.next().is_some() {
-        bail!("usage: {program} <notes-dir>");
+        bail!("usage: {program} <path>");
     }
 
-    let path = PathBuf::from(notes_dir);
+    let path = PathBuf::from(arg);
     let canonical = path
         .canonicalize()
-        .with_context(|| format!("failed to open notes directory: {}", path.display()))?;
+        .unwrap_or_else(|_| path.clone());
 
-    if !canonical.is_dir() {
-        bail!("notes path is not a directory: {}", canonical.display());
+    if canonical.is_dir() {
+        Ok((canonical, None))
+    } else {
+        let parent = canonical
+            .parent()
+            .and_then(|p| p.canonicalize().ok())
+            .unwrap_or_else(|| PathBuf::from("."));
+
+        if !parent.is_dir() {
+            std::fs::create_dir_all(&parent)
+                .with_context(|| format!("failed to create directory: {}", parent.display()))?;
+        }
+
+        if !canonical.exists() {
+            std::fs::File::create(&canonical)
+                .with_context(|| format!("failed to create file: {}", canonical.display()))?;
+        }
+
+        Ok((parent, Some(canonical)))
     }
-
-    Ok(canonical)
 }

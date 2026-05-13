@@ -30,7 +30,7 @@ fn temp_path_for(path: &Path) -> PathBuf {
     let mut name = path
         .file_name()
         .and_then(|value| value.to_str())
-        .unwrap_or("glassnotes")
+        .unwrap_or("glass")
         .to_string();
     name.push_str(".tmp");
     path.with_file_name(name)
