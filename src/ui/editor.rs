@@ -2,7 +2,7 @@ use ratatui::{
     Frame,
     layout::{Position, Rect},
     style::Style,
-    text::{Line, Text},
+    text::{Line, Span, Text},
     widgets::Paragraph,
 };
 
@@ -27,6 +27,14 @@ pub fn page_area(area: Rect) -> Rect {
 
 pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App, theme: Theme) {
     let page = page_area(area);
+    let line_count = app.buffer.line_count();
+    let gutter_width: u16 = if app.mode == Mode::Visual {
+        (line_count.to_string().len() + 1) as u16
+    } else {
+        0
+    };
+    let text_width = page.width.saturating_sub(gutter_width).max(1) as usize;
+
     frame.render_widget(
         ratatui::widgets::Clear,
         Rect {
@@ -36,26 +44,53 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App, theme: Theme) {
             height: area.height,
         },
     );
-    let rows = visible_rows(&app.buffer, app.viewport.top_line, page.height as usize);
+    let rows = visible_rows(&app.buffer, app.viewport.top_line, page.height as usize, text_width);
     let visual_range = app.visual_line_anchor.map(|anchor| {
         let start = anchor.min(app.cursor.line);
         let end = anchor.max(app.cursor.line);
         start..=end
     });
+
+    let wrap_index_of_cursor = app.cursor.column / text_width.max(1);
+    let mut cursor_visual_y: usize = 0;
+    let mut cursor_found = false;
+
     let lines = rows
-        .into_iter()
-        .map(|row| {
-            let active = row.line_number == app.cursor.line || app.mode == Mode::VisualLine;
+        .iter()
+        .enumerate()
+        .map(|(i, row)| {
+            let is_cursor_row = row.line_number == app.cursor.line
+                && row.wrap_index == wrap_index_of_cursor;
+            let active = is_cursor_row || app.mode == Mode::Visual;
             let mut line = render_markdown_line(&row.text, theme, active);
-            if visual_range
-                .as_ref()
-                .is_some_and(|range| range.contains(&row.line_number))
-            {
+
+            if visual_range.as_ref().is_some_and(|range| range.contains(&row.line_number)) {
                 line = selected_line(line, theme);
             }
-            if row.line_number == app.cursor.line && app.mode != Mode::VisualLine {
+            if is_cursor_row && app.mode != Mode::Visual {
                 line.style = line.style.bg(theme.background);
             }
+
+            if app.mode == Mode::Visual && gutter_width > 0 {
+                let gutter = if row.wrap_index == 0 {
+                    format!(
+                        "{:>w$} ",
+                        row.line_number + 1,
+                        w = gutter_width as usize - 1
+                    )
+                } else {
+                    " ".repeat(gutter_width as usize)
+                };
+                let mut spans = vec![Span::styled(gutter, Style::default().fg(theme.muted))];
+                spans.extend(line.spans);
+                line = Line::from(spans);
+            }
+
+            if is_cursor_row && !cursor_found {
+                cursor_visual_y = i;
+                cursor_found = true;
+            }
+
             line
         })
         .collect::<Vec<_>>();
@@ -65,17 +100,8 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App, theme: Theme) {
     frame.render_widget(paragraph, page);
 
     if app.mode != Mode::CommandLine && app.overlay.is_none() {
-        let x = app
-            .cursor
-            .column
-            .saturating_sub(app.viewport.horizontal_offset)
-            .min(page.width.saturating_sub(1) as usize) as u16;
-        let y = app
-            .cursor
-            .line
-            .saturating_sub(app.viewport.top_line)
-            .min(page.height.saturating_sub(1) as usize) as u16;
-
+        let x = (app.cursor.column % text_width.max(1)) as u16 + gutter_width;
+        let y = cursor_visual_y as u16;
         frame.set_cursor_position(Position::new(page.x + x, page.y + y));
     }
 }

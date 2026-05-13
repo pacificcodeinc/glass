@@ -73,6 +73,6 @@ fn cursor_style(mode: Mode) -> SetCursorStyle {
         Mode::Normal => SetCursorStyle::SteadyBlock,
         Mode::Insert => SetCursorStyle::BlinkingBar,
         Mode::CommandLine => SetCursorStyle::BlinkingUnderScore,
-        Mode::VisualLine => SetCursorStyle::SteadyUnderScore,
+        Mode::Visual => SetCursorStyle::SteadyUnderScore,
     }
 }

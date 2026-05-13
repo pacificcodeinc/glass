@@ -19,7 +19,7 @@ pub enum Mode {
     Normal,
     Insert,
     CommandLine,
-    VisualLine,
+    Visual,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -44,6 +44,7 @@ impl Default for Viewport {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OverlayKind {
     CommandPalette,
+    FilePicker,
 }
 
 #[derive(Debug, Clone)]
@@ -86,8 +87,11 @@ pub struct App {
     pub should_quit: bool,
     pub overlay: Option<OverlayState>,
     pub visual_line_anchor: Option<usize>,
+    pub file_tree: FileTree,
     pending_g: bool,
     pending_delete: bool,
+    pending_leader: bool,
+    pending_leader_p: bool,
 }
 
 const PALETTE_COMMANDS: &[PaletteCommand] = &[
@@ -129,8 +133,11 @@ impl App {
             should_quit: false,
             overlay: None,
             visual_line_anchor: None,
+            file_tree,
             pending_g: false,
             pending_delete: false,
+            pending_leader: false,
+            pending_leader_p: false,
         })
     }
 
@@ -167,7 +174,7 @@ impl App {
             Mode::Normal => self.handle_normal_key(key)?,
             Mode::Insert => self.handle_insert_key(key),
             Mode::CommandLine => self.handle_command_key(key)?,
-            Mode::VisualLine => self.handle_visual_line_key(key)?,
+            Mode::Visual => self.handle_visual_key(key)?,
         }
 
         Ok(())
@@ -196,14 +203,33 @@ impl App {
             return Ok(());
         }
 
+        if self.pending_leader_p {
+            self.pending_leader_p = false;
+            if let KeyCode::Char('v') = key.code {
+                self.open_file_picker();
+            }
+            return Ok(());
+        }
+
+        if self.pending_leader {
+            self.pending_leader = false;
+            if let KeyCode::Char('p') = key.code {
+                self.pending_leader_p = true;
+            }
+            return Ok(());
+        }
+
         match key.code {
             KeyCode::Char(':') => {
                 self.mode = Mode::CommandLine;
                 self.command_line.clear();
             }
             KeyCode::Char('V') => {
-                self.mode = Mode::VisualLine;
+                self.mode = Mode::Visual;
                 self.visual_line_anchor = Some(self.cursor.line);
+            }
+            KeyCode::Char(' ') => {
+                self.pending_leader = true;
             }
             KeyCode::Char('i') => self.mode = Mode::Insert,
             KeyCode::Char('I') => {
@@ -290,7 +316,7 @@ impl App {
         }
     }
 
-    fn handle_visual_line_key(&mut self, key: KeyEvent) -> Result<()> {
+    fn handle_visual_key(&mut self, key: KeyEvent) -> Result<()> {
         if self.pending_g {
             self.pending_g = false;
             match key.code {
@@ -488,7 +514,12 @@ impl App {
         });
         self.status_message = match kind {
             OverlayKind::CommandPalette => "Command palette".to_string(),
+            OverlayKind::FilePicker => "File picker".to_string(),
         };
+    }
+
+    fn open_file_picker(&mut self) {
+        self.open_overlay(OverlayKind::FilePicker);
     }
 
     fn execute_overlay_selection(&mut self) -> Result<()> {
@@ -504,6 +535,24 @@ impl App {
                 };
                 self.overlay = None;
                 self.execute_palette_action(command.action)?;
+            }
+            OverlayKind::FilePicker => {
+                let matches = self.file_picker_matches();
+                if let Some(entry) = matches.get(overlay.selected) {
+                    let path = entry.path.clone();
+                    if path.is_file() {
+                        self.overlay = None;
+                        self.open_path(&path)?;
+                        self.file_tree = FileTree::load(&self.notes_dir)
+                            .with_context(|| {
+                                format!(
+                                    "failed to scan notes directory: {}",
+                                    self.notes_dir.display()
+                                )
+                            })?;
+                        return Ok(());
+                    }
+                }
             }
         }
 
@@ -526,6 +575,7 @@ impl App {
     pub fn overlay_title(&self) -> Option<&'static str> {
         self.overlay.as_ref().map(|overlay| match overlay.kind {
             OverlayKind::CommandPalette => "Command Palette",
+            OverlayKind::FilePicker => "File Picker",
         })
     }
 
@@ -543,6 +593,15 @@ impl App {
                     detail: command.detail.to_string(),
                 })
                 .collect(),
+            OverlayKind::FilePicker => {
+                self.file_picker_matches()
+                    .into_iter()
+                    .map(|entry| PickerItem {
+                        label: entry.display_name.clone(),
+                        detail: entry.path.to_string_lossy().to_string(),
+                    })
+                    .collect()
+            }
         }
     }
 
@@ -559,6 +618,22 @@ impl App {
             .filter(|command| {
                 fuzzy_match(command.label, query) || fuzzy_match(command.detail, query)
             })
+            .collect()
+    }
+
+    fn file_picker_matches(&self) -> Vec<crate::fs::tree::TreeEntry> {
+        let query = self
+            .overlay
+            .as_ref()
+            .map(|overlay| overlay.query.as_str())
+            .unwrap_or_default();
+
+        self.file_tree
+            .entries
+            .iter()
+            .filter(|entry| !entry.is_dir)
+            .filter(|entry| fuzzy_match(&entry.display_name, query))
+            .cloned()
             .collect()
     }
 
@@ -598,21 +673,6 @@ impl App {
                 .cursor
                 .line
                 .saturating_sub(self.viewport.visible_height.saturating_sub(1));
-        }
-
-        if self.cursor.column < self.viewport.horizontal_offset {
-            self.viewport.horizontal_offset = self.cursor.column;
-        }
-
-        let right = self
-            .viewport
-            .horizontal_offset
-            .saturating_add(self.viewport.visible_width.saturating_sub(1));
-        if self.cursor.column > right {
-            self.viewport.horizontal_offset = self
-                .cursor
-                .column
-                .saturating_sub(self.viewport.visible_width.saturating_sub(1));
         }
     }
 }

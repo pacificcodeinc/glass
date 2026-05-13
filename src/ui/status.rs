@@ -24,7 +24,7 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App, theme: Theme) {
         Mode::Normal => "NORMAL",
         Mode::Insert => "INSERT",
         Mode::CommandLine => "COMMAND",
-        Mode::VisualLine => "VISUAL LINE",
+        Mode::Visual => "VISUAL",
     };
     let file = app
         .buffer
