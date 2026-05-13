@@ -28,11 +28,7 @@ pub fn page_area(area: Rect) -> Rect {
 pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App, theme: Theme) {
     let page = page_area(area);
     let line_count = app.buffer.line_count();
-    let gutter_width: u16 = if app.mode == Mode::Visual {
-        (line_count.to_string().len() + 1) as u16
-    } else {
-        0
-    };
+    let gutter_width: u16 = (line_count.to_string().len() + 1) as u16;
     let text_width = page.width.saturating_sub(gutter_width).max(1) as usize;
 
     frame.render_widget(
@@ -71,7 +67,12 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App, theme: Theme) {
                 line.style = line.style.bg(theme.background);
             }
 
-            if app.mode == Mode::Visual && gutter_width > 0 {
+            if gutter_width > 0 {
+                let gutter_fg = if app.mode == Mode::Visual {
+                    theme.muted
+                } else {
+                    theme.background
+                };
                 let gutter = if row.wrap_index == 0 {
                     format!(
                         "{:>w$} ",
@@ -81,7 +82,7 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App, theme: Theme) {
                 } else {
                     " ".repeat(gutter_width as usize)
                 };
-                let mut spans = vec![Span::styled(gutter, Style::default().fg(theme.muted))];
+                let mut spans = vec![Span::styled(gutter, Style::default().fg(gutter_fg))];
                 spans.extend(line.spans);
                 line = Line::from(spans);
             }
