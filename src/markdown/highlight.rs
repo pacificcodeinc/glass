@@ -9,6 +9,7 @@ use crate::{
     markdown::inline::{InlineLink, LinkKind, links},
 };
 
+#[cfg(test)]
 pub fn render_markdown_line(
     source: &str,
     theme: Theme,

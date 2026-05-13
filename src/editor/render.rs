@@ -4,7 +4,6 @@ use crate::editor::buffer::DocumentBuffer;
 pub struct VisibleRow {
     pub line_number: usize,
     pub full_text: String,
-    pub text: String,
     pub source_start: usize,
     pub source_end: usize,
     pub wrap_index: usize,
@@ -32,7 +31,6 @@ pub fn visible_rows(
             rows.push(VisibleRow {
                 line_number: line,
                 full_text: String::new(),
-                text: String::new(),
                 source_start: 0,
                 source_end: 0,
                 wrap_index: 0,
@@ -52,12 +50,9 @@ pub fn visible_rows(
             if rows.len() >= height {
                 break;
             }
-            let chars: Vec<char> = trimmed.chars().collect();
-            let chunk: String = chars[start..end].iter().collect();
             rows.push(VisibleRow {
                 line_number: line,
                 full_text: trimmed.to_string(),
-                text: chunk,
                 source_start: start,
                 source_end: end,
                 wrap_index,
@@ -231,7 +226,7 @@ mod tests {
 
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[1].line_number, 1);
-        assert_eq!(rows[1].text, "- [ ] ");
+        assert_eq!(rows[1].full_text, "- [ ] ");
         assert_eq!(rows[1].wrap_index, 0);
         assert!(!rows[1].completed);
     }
@@ -268,6 +263,6 @@ mod tests {
 
         assert_eq!(rows[0].line_number, 0);
         assert_eq!(rows[0].wrap_index, 1);
-        assert_eq!(rows[0].text, "three");
+        assert_eq!(&rows[0].full_text[rows[0].source_start..rows[0].source_end], "three");
     }
 }
