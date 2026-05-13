@@ -10,6 +10,7 @@ use crate::{
         commands::{Command, parse_command},
         cursor::Cursor,
         motions,
+        render::visual_line_bounds,
     },
     fs::tree::FileTree,
 };
@@ -255,10 +256,30 @@ impl App {
                 motions::up(&self.buffer, &mut self.cursor);
                 self.mode = Mode::Insert;
             }
-            KeyCode::Char('h') | KeyCode::Left => motions::left(&mut self.cursor),
+            KeyCode::Char('h') | KeyCode::Left => {
+                if key.modifiers.contains(KeyModifiers::SUPER) {
+                    let line_text = self.buffer.line(self.cursor.line);
+                    let width = self.wrap_width();
+                    let (seg_start, _) =
+                        visual_line_bounds(&line_text, self.cursor.column, width);
+                    self.cursor.column = seg_start;
+                } else {
+                    motions::left(&mut self.cursor);
+                }
+            }
             KeyCode::Char('j') | KeyCode::Down => motions::down(&self.buffer, &mut self.cursor),
             KeyCode::Char('k') | KeyCode::Up => motions::up(&self.buffer, &mut self.cursor),
-            KeyCode::Char('l') | KeyCode::Right => motions::right(&self.buffer, &mut self.cursor),
+            KeyCode::Char('l') | KeyCode::Right => {
+                if key.modifiers.contains(KeyModifiers::SUPER) {
+                    let line_text = self.buffer.line(self.cursor.line);
+                    let width = self.wrap_width();
+                    let (_, seg_end) =
+                        visual_line_bounds(&line_text, self.cursor.column, width);
+                    self.cursor.column = seg_end.min(self.buffer.line_len_chars(self.cursor.line));
+                } else {
+                    motions::right(&self.buffer, &mut self.cursor);
+                }
+            }
             KeyCode::Char('w') => motions::word_forward(&self.buffer, &mut self.cursor),
             KeyCode::Char('b') => motions::word_backward(&self.buffer, &mut self.cursor),
             KeyCode::Char('e') => motions::word_end_forward(&self.buffer, &mut self.cursor),
@@ -310,14 +331,15 @@ impl App {
             }
             KeyCode::Backspace => {
                 if key.modifiers.contains(KeyModifiers::SUPER) {
+                    let line_text = self.buffer.line(self.cursor.line);
+                    let width = self.wrap_width();
+                    let (seg_start, _) =
+                        visual_line_bounds(&line_text, self.cursor.column, width);
                     let start = self.buffer.char_index(Cursor {
                         line: self.cursor.line,
-                        column: 0,
+                        column: seg_start,
                     });
-                    let end = self.buffer.char_index(Cursor {
-                        line: self.cursor.line,
-                        column: self.buffer.line_len_chars(self.cursor.line),
-                    });
+                    let end = self.buffer.char_index(self.cursor);
                     self.buffer.delete_range(start, end, &mut self.cursor);
                 } else if key.modifiers.contains(KeyModifiers::ALT) {
                     // Option+Delete: delete word backward
@@ -364,10 +386,30 @@ impl App {
             KeyCode::Char('d') | KeyCode::Char('D') | KeyCode::Delete | KeyCode::Backspace => {
                 self.delete_visual_lines();
             }
-            KeyCode::Char('h') | KeyCode::Left => motions::left(&mut self.cursor),
+            KeyCode::Char('h') | KeyCode::Left => {
+                if key.modifiers.contains(KeyModifiers::SUPER) {
+                    let line_text = self.buffer.line(self.cursor.line);
+                    let width = self.wrap_width();
+                    let (seg_start, _) =
+                        visual_line_bounds(&line_text, self.cursor.column, width);
+                    self.cursor.column = seg_start;
+                } else {
+                    motions::left(&mut self.cursor);
+                }
+            }
             KeyCode::Char('j') | KeyCode::Down => motions::down(&self.buffer, &mut self.cursor),
             KeyCode::Char('k') | KeyCode::Up => motions::up(&self.buffer, &mut self.cursor),
-            KeyCode::Char('l') | KeyCode::Right => motions::right(&self.buffer, &mut self.cursor),
+            KeyCode::Char('l') | KeyCode::Right => {
+                if key.modifiers.contains(KeyModifiers::SUPER) {
+                    let line_text = self.buffer.line(self.cursor.line);
+                    let width = self.wrap_width();
+                    let (_, seg_end) =
+                        visual_line_bounds(&line_text, self.cursor.column, width);
+                    self.cursor.column = seg_end.min(self.buffer.line_len_chars(self.cursor.line));
+                } else {
+                    motions::right(&self.buffer, &mut self.cursor);
+                }
+            }
             KeyCode::Char('w') => motions::word_forward(&self.buffer, &mut self.cursor),
             KeyCode::Char('b') => motions::word_backward(&self.buffer, &mut self.cursor),
             KeyCode::Char('e') => motions::word_end_forward(&self.buffer, &mut self.cursor),
@@ -392,11 +434,19 @@ impl App {
 
         match key.code {
             KeyCode::Char('d') => {
-                self.buffer.delete_line_range(
-                    start_cursor.line,
-                    start_cursor.line,
-                    &mut self.cursor,
-                );
+                let line_text = self.buffer.line(self.cursor.line);
+                let width = self.wrap_width();
+                let (seg_start, seg_end) =
+                    visual_line_bounds(&line_text, self.cursor.column, width);
+                let start = self.buffer.char_index(Cursor {
+                    line: self.cursor.line,
+                    column: seg_start,
+                });
+                let end = self.buffer.char_index(Cursor {
+                    line: self.cursor.line,
+                    column: seg_end,
+                });
+                self.buffer.delete_range(start, end, &mut self.cursor);
                 return;
             }
             KeyCode::Char('w') => motions::word_forward(&self.buffer, &mut target),
@@ -660,6 +710,11 @@ impl App {
             .filter(|entry| fuzzy_match(&entry.display_name, query))
             .cloned()
             .collect()
+    }
+
+    fn wrap_width(&self) -> usize {
+        let gutter = (self.buffer.line_count().to_string().len() + 1) as usize;
+        self.viewport.visible_width.saturating_sub(gutter).max(1)
     }
 
     fn open_path(&mut self, path: &Path) -> Result<()> {

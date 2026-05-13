@@ -82,6 +82,21 @@ pub fn column_in_wrap_segment(line_text: &str, column: usize, width: usize) -> u
     0
 }
 
+/// Returns (start, end) character bounds of the wrap segment that contains `column`.
+pub fn visual_line_bounds(line_text: &str, column: usize, width: usize) -> (usize, usize) {
+    let trimmed = line_text.trim_end_matches(['\r', '\n']);
+    if trimmed.is_empty() {
+        return (0, 0);
+    }
+    let segments = word_wrap_segments(trimmed, width.max(1));
+    for &(start, end) in &segments {
+        if column >= start && column < end {
+            return (start, end);
+        }
+    }
+    segments.last().copied().unwrap_or((0, 0))
+}
+
 fn word_wrap_segments(text: &str, width: usize) -> Vec<(usize, usize)> {
     let chars: Vec<char> = text.chars().collect();
     let mut segments = Vec::new();
