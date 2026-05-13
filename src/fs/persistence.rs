@@ -11,6 +11,13 @@ pub fn load_utf8(path: &Path) -> Result<String> {
 }
 
 pub fn save_atomic(path: &Path, contents: &str) -> Result<()> {
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create directory: {}", parent.display()))?;
+    }
+
     let temp_path = temp_path_for(path);
     {
         let mut file = fs::File::create(&temp_path)
@@ -51,6 +58,21 @@ mod tests {
 
         fs::remove_file(path)?;
         fs::remove_dir(dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn save_creates_missing_parent_directories() -> Result<()> {
+        let dir = std::env::temp_dir().join(format!(
+            "glassnotes-nested-save-test-{}",
+            std::process::id()
+        ));
+        let path = dir.join("nested").join("note.md");
+
+        save_atomic(&path, "# Test\n")?;
+        assert_eq!(load_utf8(&path)?, "# Test\n");
+
+        fs::remove_dir_all(dir)?;
         Ok(())
     }
 }

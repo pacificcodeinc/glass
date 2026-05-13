@@ -41,7 +41,10 @@ fn parse_args() -> Result<(PathBuf, Option<PathBuf>)> {
         std::process::exit(0);
     }
 
-    let path = PathBuf::from(arg);
+    parse_path_arg(PathBuf::from(arg))
+}
+
+fn parse_path_arg(path: PathBuf) -> Result<(PathBuf, Option<PathBuf>)> {
     let canonical = path.canonicalize().unwrap_or_else(|_| path.clone());
 
     if canonical.is_dir() {
@@ -50,18 +53,28 @@ fn parse_args() -> Result<(PathBuf, Option<PathBuf>)> {
         let parent = canonical
             .parent()
             .and_then(|p| p.canonicalize().ok())
-            .unwrap_or_else(|| PathBuf::from("."));
-
-        if !parent.is_dir() {
-            std::fs::create_dir_all(&parent)
-                .with_context(|| format!("failed to create directory: {}", parent.display()))?;
-        }
-
-        if !canonical.exists() {
-            std::fs::File::create(&canonical)
-                .with_context(|| format!("failed to create file: {}", canonical.display()))?;
-        }
+            .unwrap_or(env::current_dir().context("failed to resolve current directory")?);
 
         Ok((parent, Some(canonical)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn missing_file_arg_does_not_create_file() -> Result<()> {
+        let dir = env::temp_dir().join(format!("glass-arg-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir)?;
+        let file = dir.join("new-note.md");
+
+        let (_notes_dir, initial_file) = parse_path_arg(file.clone())?;
+
+        assert_eq!(initial_file.as_deref(), Some(file.as_path()));
+        assert!(!file.exists());
+
+        std::fs::remove_dir(dir)?;
+        Ok(())
     }
 }

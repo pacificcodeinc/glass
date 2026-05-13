@@ -18,6 +18,7 @@ const RAINBOW: &[(char, Color)] = &[
     ('█', Color::Rgb(50, 220, 80)),
     ('█', Color::Rgb(30, 120, 255)),
 ];
+const DIRTY_ICON: &str = " ●";
 
 pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App, theme: Theme) {
     let mode = match app.mode {
@@ -33,34 +34,11 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App, theme: Theme) {
         .and_then(|path| path.strip_prefix(&app.notes_dir).ok())
         .map(|path| path.display().to_string())
         .unwrap_or_else(|| "[No note]".to_string());
-    let dirty = if app.buffer.dirty { " +" } else { "" };
-    let left = if app.mode == Mode::CommandLine {
-        format!(":{}", app.command_line)
+    let line = if app.mode == Mode::CommandLine {
+        Line::from(Span::styled(format!(":{}", app.command_line), theme.status))
     } else {
-        format!(
-            " {mode}  {file}{dirty}  {}:{}",
-            app.cursor.line + 1,
-            app.cursor.column + 1
-        )
+        status_line(app, theme, mode, &file)
     };
-
-    let dirty_style = Style::default()
-        .fg(theme.dirty)
-        .bg(theme.status.bg.unwrap_or(theme.background));
-    let show_message = app.mode != Mode::CommandLine;
-    let mut spans = vec![Span::styled(left, theme.status)];
-    if show_message {
-        spans.push(Span::styled("  ", theme.status));
-        spans.push(Span::styled(
-            app.status_message.clone(),
-            if app.buffer.dirty {
-                dirty_style
-            } else {
-                theme.status
-            },
-        ));
-    }
-    let line = Line::from(spans);
 
     // Split status bar: left for status text, right for rainbow logo
     let [left_area, right_area] =
@@ -80,4 +58,49 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App, theme: Theme) {
         Paragraph::new(Line::from(rainbow_spans)).bg(theme.status.bg.unwrap_or(theme.background)),
         right_area,
     );
+}
+
+fn status_line(app: &App, theme: Theme, mode: &str, file: &str) -> Line<'static> {
+    let mut spans = vec![Span::styled(format!(" {mode}  {file}"), theme.status)];
+    if app.buffer.dirty {
+        spans.push(Span::styled(
+            DIRTY_ICON,
+            Style::default()
+                .fg(theme.dirty)
+                .bg(theme.status.bg.unwrap_or(theme.background)),
+        ));
+    }
+    spans.push(Span::styled(
+        format!("  {}:{}", app.cursor.line + 1, app.cursor.column + 1),
+        theme.status,
+    ));
+    spans.push(Span::styled("  ", theme.status));
+    spans.push(Span::styled(app.status_message.clone(), theme.status));
+    Line::from(spans)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use anyhow::Result;
+
+    #[test]
+    fn dirty_indicator_is_separate_from_status_message() -> Result<()> {
+        let dir = std::env::temp_dir().join(format!("glass-status-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir)?;
+        let mut app = App::new(dir.clone(), None)?;
+        app.buffer.insert_str(&mut app.cursor, "dirty");
+        app.status_message = "Glass".to_string();
+
+        let theme = Theme::monochrome_for_tests();
+        let line = status_line(&app, theme, "NORMAL", "[No note]");
+
+        assert_eq!(line.spans[1].content.as_ref(), DIRTY_ICON);
+        assert_eq!(line.spans[1].style.fg, Some(theme.dirty));
+        assert_eq!(line.spans.last().unwrap().content.as_ref(), "Glass");
+        assert_eq!(line.spans.last().unwrap().style, theme.status);
+
+        std::fs::remove_dir(dir)?;
+        Ok(())
+    }
 }
