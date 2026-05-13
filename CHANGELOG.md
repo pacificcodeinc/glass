@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.4] - 2026-05-13
+
+Full commit range: [`v0.1.3...v0.1.4`](https://github.com/pacificcodeinc/glass/compare/v0.1.3...v0.1.4)
+
+### Added
+
+- Structured inline link parsing for bare URLs, Markdown links, autolinks, and wiki links.
+- Link following with `gf`, plus Enter activation when the cursor is on a link and not on a checkbox.
+- Normal-mode `u` undo that restores text and cursor position for recent edits.
+
+### Changed
+
+- Links now use a subtle Pacific Code blue accent with underlines.
+- Covered Markdown links render only their display text while inactive; revealed source keeps display text blue and URL syntax muted.
+- The old fuzzy finder, command palette overlay, and Command+P binding have been removed ahead of a future picker rewrite.
+
+### Fixed
+
+- Covered link hrefs no longer leak URL fragments across wrapped visual rows.
+- Link labels hide visible backticks while preserving spacing in active source rendering.
+- Terminal-translated Command+Delete (`Ctrl+U`) deletes to line start before normal-mode undo can handle `u`.
+
 ## [0.1.3] - 2026-05-13
 
 Full commit range: [`v0.1.2...v0.1.3`](https://github.com/pacificcodeinc/glass/compare/v0.1.2...v0.1.3)
@@ -71,7 +93,8 @@ Full commit range: [`v0.1.0...v0.1.1`](https://github.com/pacificcodeinc/glass/c
 - Live Markdown rendering with concealed syntax markers.
 - Checkbox (`- [ ]` / `- [x]`) rendering.
 
-[Unreleased]: https://github.com/pacificcodeinc/glass/compare/v0.1.3...HEAD
+[Unreleased]: https://github.com/pacificcodeinc/glass/compare/v0.1.4...HEAD
+[0.1.4]: https://github.com/pacificcodeinc/glass/compare/v0.1.3...v0.1.4
 [0.1.3]: https://github.com/pacificcodeinc/glass/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/pacificcodeinc/glass/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/pacificcodeinc/glass/compare/v0.1.0...v0.1.1

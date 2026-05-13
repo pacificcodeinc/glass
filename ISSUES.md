@@ -22,6 +22,6 @@
 - [x] Line deletion: `dd` preserves the cursor column when the next line is long enough.
 - [x] URLs and links: render bare URLs, Markdown links, and wiki links nicely, and follow links with `gf`.
 - [x] Undo `u` action: normal-mode `u` restores text and cursor for recent edits.
-- [ ] hrefs: covered Markdown links do not leak URL fragments across wrapped visual rows.
+- [x] hrefs: covered Markdown links do not leak URL fragments across wrapped visual rows.
 - [x] Cmd+Delete: terminal-translated `Ctrl+U` deletes to line start before normal-mode undo handling.
 - [ ] When using glass to create a new file e.g., `glass <new-file>.md` only actually create the file when `:w`
