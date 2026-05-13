@@ -97,7 +97,7 @@ pub fn visual_line_bounds(line_text: &str, column: usize, width: usize) -> (usiz
     segments.last().copied().unwrap_or((0, 0))
 }
 
-fn word_wrap_segments(text: &str, width: usize) -> Vec<(usize, usize)> {
+pub fn word_wrap_segments(text: &str, width: usize) -> Vec<(usize, usize)> {
     let chars: Vec<char> = text.chars().collect();
     let mut segments = Vec::new();
     let mut pos = 0;

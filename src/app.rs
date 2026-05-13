@@ -10,7 +10,7 @@ use crate::{
         commands::{Command, parse_command},
         cursor::Cursor,
         motions,
-        render::visual_line_bounds,
+        render::{visual_line_bounds, word_wrap_segments, wrap_index_for_column},
     },
     fs::tree::FileTree,
 };
@@ -258,24 +258,16 @@ impl App {
             }
             KeyCode::Char('h') | KeyCode::Left => {
                 if key.modifiers.contains(KeyModifiers::SUPER) {
-                    let line_text = self.buffer.line(self.cursor.line);
-                    let width = self.wrap_width();
-                    let (seg_start, _) =
-                        visual_line_bounds(&line_text, self.cursor.column, width);
-                    self.cursor.column = seg_start;
+                    self.visual_line_start();
                 } else {
                     motions::left(&mut self.cursor);
                 }
             }
-            KeyCode::Char('j') | KeyCode::Down => motions::down(&self.buffer, &mut self.cursor),
-            KeyCode::Char('k') | KeyCode::Up => motions::up(&self.buffer, &mut self.cursor),
+            KeyCode::Char('j') | KeyCode::Down => self.visual_line_down(),
+            KeyCode::Char('k') | KeyCode::Up => self.visual_line_up(),
             KeyCode::Char('l') | KeyCode::Right => {
                 if key.modifiers.contains(KeyModifiers::SUPER) {
-                    let line_text = self.buffer.line(self.cursor.line);
-                    let width = self.wrap_width();
-                    let (_, seg_end) =
-                        visual_line_bounds(&line_text, self.cursor.column, width);
-                    self.cursor.column = seg_end.min(self.buffer.line_len_chars(self.cursor.line));
+                    self.visual_line_end();
                 } else {
                     motions::right(&self.buffer, &mut self.cursor);
                 }
@@ -286,9 +278,11 @@ impl App {
             KeyCode::Char('W') => motions::big_word_forward(&self.buffer, &mut self.cursor),
             KeyCode::Char('B') => motions::big_word_backward(&self.buffer, &mut self.cursor),
             KeyCode::Char('E') => motions::big_word_end_forward(&self.buffer, &mut self.cursor),
-            KeyCode::Char('0') | KeyCode::Home => motions::line_start(&mut self.cursor),
+            KeyCode::Char('0') => motions::line_start(&mut self.cursor),
+            KeyCode::Home => self.visual_line_start(),
             KeyCode::Char('^') => motions::first_non_blank(&self.buffer, &mut self.cursor),
-            KeyCode::Char('$') | KeyCode::End => motions::line_end(&self.buffer, &mut self.cursor),
+            KeyCode::Char('$') => motions::line_end(&self.buffer, &mut self.cursor),
+            KeyCode::End => self.visual_line_end(),
             KeyCode::Char('D') => self.delete_to_line_end(),
             KeyCode::Char('d') => {
                 self.pending_delete = true;
@@ -359,6 +353,8 @@ impl App {
             KeyCode::Right => motions::right(&self.buffer, &mut self.cursor),
             KeyCode::Up => motions::up(&self.buffer, &mut self.cursor),
             KeyCode::Down => motions::down(&self.buffer, &mut self.cursor),
+            KeyCode::Home => self.visual_line_start(),
+            KeyCode::End => self.visual_line_end(),
             _ => {}
         }
     }
@@ -388,24 +384,16 @@ impl App {
             }
             KeyCode::Char('h') | KeyCode::Left => {
                 if key.modifiers.contains(KeyModifiers::SUPER) {
-                    let line_text = self.buffer.line(self.cursor.line);
-                    let width = self.wrap_width();
-                    let (seg_start, _) =
-                        visual_line_bounds(&line_text, self.cursor.column, width);
-                    self.cursor.column = seg_start;
+                    self.visual_line_start();
                 } else {
                     motions::left(&mut self.cursor);
                 }
             }
-            KeyCode::Char('j') | KeyCode::Down => motions::down(&self.buffer, &mut self.cursor),
-            KeyCode::Char('k') | KeyCode::Up => motions::up(&self.buffer, &mut self.cursor),
+            KeyCode::Char('j') | KeyCode::Down => self.visual_line_down(),
+            KeyCode::Char('k') | KeyCode::Up => self.visual_line_up(),
             KeyCode::Char('l') | KeyCode::Right => {
                 if key.modifiers.contains(KeyModifiers::SUPER) {
-                    let line_text = self.buffer.line(self.cursor.line);
-                    let width = self.wrap_width();
-                    let (_, seg_end) =
-                        visual_line_bounds(&line_text, self.cursor.column, width);
-                    self.cursor.column = seg_end.min(self.buffer.line_len_chars(self.cursor.line));
+                    self.visual_line_end();
                 } else {
                     motions::right(&self.buffer, &mut self.cursor);
                 }
@@ -416,9 +404,11 @@ impl App {
             KeyCode::Char('W') => motions::big_word_forward(&self.buffer, &mut self.cursor),
             KeyCode::Char('B') => motions::big_word_backward(&self.buffer, &mut self.cursor),
             KeyCode::Char('E') => motions::big_word_end_forward(&self.buffer, &mut self.cursor),
-            KeyCode::Char('0') | KeyCode::Home => motions::line_start(&mut self.cursor),
+            KeyCode::Char('0') => motions::line_start(&mut self.cursor),
+            KeyCode::Home => self.visual_line_start(),
             KeyCode::Char('^') => motions::first_non_blank(&self.buffer, &mut self.cursor),
-            KeyCode::Char('$') | KeyCode::End => motions::line_end(&self.buffer, &mut self.cursor),
+            KeyCode::Char('$') => motions::line_end(&self.buffer, &mut self.cursor),
+            KeyCode::End => self.visual_line_end(),
             KeyCode::Char('G') => motions::document_end(&self.buffer, &mut self.cursor),
             KeyCode::Char('g') => self.pending_g = true,
             _ => {}
@@ -715,6 +705,67 @@ impl App {
     fn wrap_width(&self) -> usize {
         let gutter = (self.buffer.line_count().to_string().len() + 1) as usize;
         self.viewport.visible_width.saturating_sub(gutter).max(1)
+    }
+
+    fn visual_line_start(&mut self) {
+        let line_text = self.buffer.line(self.cursor.line);
+        let width = self.wrap_width();
+        let (seg_start, _) = visual_line_bounds(&line_text, self.cursor.column, width);
+        self.cursor.column = seg_start;
+    }
+
+    fn visual_line_end(&mut self) {
+        let line_text = self.buffer.line(self.cursor.line);
+        let width = self.wrap_width();
+        let (_, seg_end) = visual_line_bounds(&line_text, self.cursor.column, width);
+        self.cursor.column = seg_end.min(self.buffer.line_len_chars(self.cursor.line));
+    }
+
+    fn visual_line_down(&mut self) {
+        let line_text = self.buffer.line(self.cursor.line);
+        let width = self.wrap_width();
+        let segments = word_wrap_segments(
+            line_text.trim_end_matches(['\r', '\n']),
+            width,
+        );
+        let current_seg =
+            wrap_index_for_column(&line_text, self.cursor.column, width);
+        if current_seg + 1 < segments.len() {
+            let rel = self.cursor.column.saturating_sub(segments[current_seg].0);
+            let (next_start, next_end) = segments[current_seg + 1];
+            let max_col = next_end.saturating_sub(1);
+            self.cursor.column = if next_start + rel > max_col { max_col } else { next_start + rel };
+        } else if self.cursor.line + 1 < self.buffer.line_count() {
+            self.cursor.line += 1;
+            self.cursor.column = 0;
+        }
+    }
+
+    fn visual_line_up(&mut self) {
+        let line_text = self.buffer.line(self.cursor.line);
+        let width = self.wrap_width();
+        let segments = word_wrap_segments(
+            line_text.trim_end_matches(['\r', '\n']),
+            width,
+        );
+        let current_seg =
+            wrap_index_for_column(&line_text, self.cursor.column, width);
+        if current_seg > 0 {
+            let rel = self.cursor.column.saturating_sub(segments[current_seg].0);
+            let (prev_start, prev_end) = segments[current_seg - 1];
+            let max_col = prev_end.saturating_sub(1);
+            self.cursor.column = if prev_start + rel > max_col { max_col } else { prev_start + rel };
+        } else if self.cursor.line > 0 {
+            self.cursor.line -= 1;
+            let prev_text = self.buffer.line(self.cursor.line);
+            let prev_segments = word_wrap_segments(
+                prev_text.trim_end_matches(['\r', '\n']),
+                width,
+            );
+            if let Some(&(start, _end)) = prev_segments.last() {
+                self.cursor.column = start;
+            }
+        }
     }
 
     fn open_path(&mut self, path: &Path) -> Result<()> {
