@@ -27,3 +27,4 @@
 - [ ] When using glass to create a new file e.g., `glass <new-file>.md` only actually create the file when `:w`
 - [ ] "Glass" text in sidebar randomly turning red
 - [ ] Unsaved icon next to filename in status bar
+- [ ] `G` motion should preserve cursor position like `dd` does
