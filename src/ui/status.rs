@@ -53,18 +53,20 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App, theme: Theme) {
     let dirty_style = Style::default()
         .fg(theme.dirty)
         .bg(theme.status.bg.unwrap_or(theme.background));
-    let line = Line::from(vec![
-        Span::styled(left, theme.status),
-        Span::styled("  ", theme.status),
-        Span::styled(
+    let show_message = app.mode != Mode::CommandLine && app.overlay.is_none();
+    let mut spans = vec![Span::styled(left, theme.status)];
+    if show_message {
+        spans.push(Span::styled("  ", theme.status));
+        spans.push(Span::styled(
             app.status_message.clone(),
             if app.buffer.dirty {
                 dirty_style
             } else {
                 theme.status
             },
-        ),
-    ]);
+        ));
+    }
+    let line = Line::from(spans);
 
     // Split status bar: left for status text, right for rainbow logo
     let [left_area, right_area] =

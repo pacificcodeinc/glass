@@ -68,12 +68,7 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App, theme: Theme) {
             }
 
             if gutter_width > 0 {
-                let gutter_fg = if app.mode == Mode::Visual {
-                    theme.muted
-                } else {
-                    theme.background
-                };
-                let gutter = if row.wrap_index == 0 {
+                let gutter = if row.wrap_index == 0 && app.mode == Mode::Visual {
                     format!(
                         "{:>w$} ",
                         row.line_number + 1,
@@ -82,7 +77,7 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App, theme: Theme) {
                 } else {
                     " ".repeat(gutter_width as usize)
                 };
-                let mut spans = vec![Span::styled(gutter, Style::default().fg(gutter_fg))];
+                let mut spans = vec![Span::styled(gutter, Style::default().fg(theme.muted))];
                 spans.extend(line.spans);
                 line = Line::from(spans);
             }
