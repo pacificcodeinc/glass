@@ -6,6 +6,7 @@ pub struct VisibleRow {
     pub text: String,
     pub wrap_index: usize,
     pub continuation_indent: usize,
+    pub completed: bool,
 }
 
 pub fn visible_rows(
@@ -28,12 +29,14 @@ pub fn visible_rows(
                 text: String::new(),
                 wrap_index: 0,
                 continuation_indent: 0,
+                completed: false,
             });
             line += 1;
             continue;
         }
 
         let (segments, marker_len) = wrap_line(trimmed, wrap_width);
+        let completed = is_checked_checkbox(trimmed);
         for (wrap_index, &(start, end)) in segments.iter().enumerate() {
             if rows.len() >= height {
                 break;
@@ -45,6 +48,7 @@ pub fn visible_rows(
                 text: chunk,
                 wrap_index,
                 continuation_indent: if wrap_index > 0 { marker_len } else { 0 },
+                completed,
             });
         }
 
@@ -52,6 +56,10 @@ pub fn visible_rows(
     }
 
     rows
+}
+
+fn is_checked_checkbox(text: &str) -> bool {
+    text.trim_start().starts_with("- [x] ")
 }
 
 /// Returns the wrap segment index (0-based) that contains the given column.
@@ -209,6 +217,7 @@ mod tests {
         assert_eq!(rows[1].line_number, 1);
         assert_eq!(rows[1].text, "- [ ] ");
         assert_eq!(rows[1].wrap_index, 0);
+        assert!(!rows[1].completed);
     }
 
     #[test]
@@ -216,5 +225,15 @@ mod tests {
         assert_eq!(wrap_index_for_column("- [ ] ", 6, 80), 0);
         assert_eq!(column_in_wrap_segment("- [ ] ", 6, 80), 6);
         assert_eq!(visual_line_bounds("- [ ] ", 6, 80), (0, 6));
+    }
+
+    #[test]
+    fn checked_checkbox_completion_state_survives_wrapping() {
+        let buffer = buffer_with("- [x] one two three four five");
+
+        let rows = visible_rows(&buffer, 0, 10, 14);
+
+        assert!(rows.len() > 1);
+        assert!(rows.iter().all(|row| row.completed));
     }
 }

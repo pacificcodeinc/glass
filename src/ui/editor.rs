@@ -1,16 +1,18 @@
 use ratatui::{
-    Frame,
     layout::{Position, Rect},
     style::Style,
     text::{Line, Span, Text},
     widgets::Paragraph,
+    Frame,
 };
 
 use crate::{
     app::{App, Mode},
     config::theme::Theme,
-    editor::render::{column_in_wrap_segment, detect_list_marker, visible_rows, wrap_index_for_column},
-    markdown::highlight::render_markdown_line,
+    editor::render::{
+        column_in_wrap_segment, detect_list_marker, visible_rows, wrap_index_for_column,
+    },
+    markdown::highlight::render_markdown_line_with_completion,
 };
 
 const ARTICLE_WIDTH: u16 = 82;
@@ -40,7 +42,12 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App, theme: Theme) {
             height: area.height,
         },
     );
-    let rows = visible_rows(&app.buffer, app.viewport.top_line, page.height as usize, text_width);
+    let rows = visible_rows(
+        &app.buffer,
+        app.viewport.top_line,
+        page.height as usize,
+        text_width,
+    );
     let visual_range = app.visual_line_anchor.map(|anchor| {
         let start = anchor.min(app.cursor.line);
         let end = anchor.max(app.cursor.line);
@@ -48,7 +55,8 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App, theme: Theme) {
     });
 
     let cursor_line_text = app.buffer.line(app.cursor.line);
-    let wrap_index_of_cursor = wrap_index_for_column(&cursor_line_text, app.cursor.column, text_width);
+    let wrap_index_of_cursor =
+        wrap_index_for_column(&cursor_line_text, app.cursor.column, text_width);
     let mut cursor_visual_y: usize = 0;
     let mut cursor_found = false;
 
@@ -56,8 +64,8 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App, theme: Theme) {
         .iter()
         .enumerate()
         .map(|(i, row)| {
-            let is_cursor_row = row.line_number == app.cursor.line
-                && row.wrap_index == wrap_index_of_cursor;
+            let is_cursor_row =
+                row.line_number == app.cursor.line && row.wrap_index == wrap_index_of_cursor;
             let active = is_cursor_row;
 
             // Prepend indentation for continuation lines of list items
@@ -66,9 +74,18 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App, theme: Theme) {
             } else {
                 row.text.clone()
             };
-            let mut line = render_markdown_line(&display_text, theme, active, row.wrap_index);
+            let mut line = render_markdown_line_with_completion(
+                &display_text,
+                theme,
+                active,
+                row.wrap_index,
+                row.completed && row.wrap_index > 0,
+            );
 
-            if visual_range.as_ref().is_some_and(|range| range.contains(&row.line_number)) {
+            if visual_range
+                .as_ref()
+                .is_some_and(|range| range.contains(&row.line_number))
+            {
                 line = selected_line(line, theme);
             }
             if is_cursor_row && app.mode != Mode::Visual {

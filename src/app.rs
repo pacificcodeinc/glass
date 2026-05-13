@@ -240,10 +240,11 @@ impl App {
                 self.mode = Mode::Visual;
                 self.visual_line_anchor = Some(self.cursor.line);
             }
+            KeyCode::Enter => {
+                self.toggle_checkbox();
+            }
             KeyCode::Char(' ') => {
-                if !self.toggle_checkbox() {
-                    self.pending_leader = true;
-                }
+                self.pending_leader = true;
             }
             KeyCode::Char('i') => self.mode = Mode::Insert,
             KeyCode::Char('I') => {

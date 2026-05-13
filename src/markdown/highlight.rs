@@ -5,7 +5,22 @@ use ratatui::{
 
 use crate::config::theme::Theme;
 
-pub fn render_markdown_line(source: &str, theme: Theme, active: bool, wrap_index: usize) -> Line<'static> {
+pub fn render_markdown_line(
+    source: &str,
+    theme: Theme,
+    active: bool,
+    wrap_index: usize,
+) -> Line<'static> {
+    render_markdown_line_with_completion(source, theme, active, wrap_index, false)
+}
+
+pub fn render_markdown_line_with_completion(
+    source: &str,
+    theme: Theme,
+    active: bool,
+    wrap_index: usize,
+    completed: bool,
+) -> Line<'static> {
     if active {
         return highlight_source_line(source, theme, wrap_index);
     }
@@ -49,13 +64,31 @@ pub fn render_markdown_line(source: &str, theme: Theme, active: bool, wrap_index
         return Line::from(spans);
     }
 
+    if completed {
+        let mut spans = vec![Span::raw(leading.to_string())];
+        spans.extend(conceal_inline(
+            trimmed,
+            theme,
+            completed_style(Style::default().fg(theme.muted)),
+        ));
+        return Line::from(spans);
+    }
+
     if wrap_index == 0 {
-        if let Some((marker, rest)) = checkbox_prefix(trimmed) {
+        if let Some((state, marker, rest)) = checkbox_prefix(trimmed) {
+            let text_style = match state {
+                CheckboxState::Checked => completed_style(Style::default().fg(theme.muted)),
+                CheckboxState::Unchecked => Style::default().fg(theme.text),
+            };
+            let marker_style = match state {
+                CheckboxState::Checked => theme.list_marker.add_modifier(Modifier::BOLD),
+                CheckboxState::Unchecked => theme.list_marker,
+            };
             let mut spans = vec![
                 Span::raw(leading.to_string()),
-                Span::styled(marker.to_string(), theme.list_marker),
+                Span::styled(marker.to_string(), marker_style),
             ];
-            spans.extend(conceal_inline(rest, theme, Style::default().fg(theme.text)));
+            spans.extend(conceal_inline(rest, theme, text_style));
             return Line::from(spans);
         }
 
@@ -231,16 +264,25 @@ fn is_list_marker_at(chars: &[char], index: usize) -> bool {
     at_line_start && matches!((marker, next), (Some('-' | '*' | '+'), Some(' ')))
 }
 
-fn checkbox_prefix(trimmed: &str) -> Option<(&str, &str)> {
-    if let Some(rest) = trimmed
-        .strip_prefix("- [ ] ")
-        .or_else(|| trimmed.strip_prefix("- [x] "))
-    {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CheckboxState {
+    Checked,
+    Unchecked,
+}
+
+fn checkbox_prefix(trimmed: &str) -> Option<(CheckboxState, &str, &str)> {
+    if let Some(rest) = trimmed.strip_prefix("- [ ] ") {
         let marker_len = trimmed.len() - rest.len();
-        Some((&trimmed[..marker_len], rest))
-    } else {
-        None
+        return Some((CheckboxState::Unchecked, &trimmed[..marker_len], rest));
     }
+
+    let rest = trimmed.strip_prefix("- [x] ")?;
+    let marker_len = trimmed.len() - rest.len();
+    Some((CheckboxState::Checked, &trimmed[..marker_len], rest))
+}
+
+fn completed_style(style: Style) -> Style {
+    style.add_modifier(Modifier::DIM)
 }
 
 fn numbered_list_prefix(trimmed: &str) -> Option<(&str, &str)> {
@@ -393,7 +435,8 @@ mod tests {
 
     #[test]
     fn inactive_inline_markers_are_concealed() {
-        let line = render_markdown_line("a **bold** `code`", Theme::monochrome_for_tests(), false, 0);
+        let line =
+            render_markdown_line("a **bold** `code`", Theme::monochrome_for_tests(), false, 0);
         assert_eq!(line_text(&line), "a bold code");
     }
 
@@ -407,6 +450,63 @@ mod tests {
     fn inactive_checked_checkbox_renders_full_marker() {
         let line = render_markdown_line("- [x] done", Theme::monochrome_for_tests(), false, 0);
         assert_eq!(line_text(&line), "- [x] done");
+    }
+
+    #[test]
+    fn inactive_checked_checkbox_looks_completed() {
+        let line = render_markdown_line("- [x] done", Theme::monochrome_for_tests(), false, 0);
+
+        assert!(line.spans[1].style.add_modifier.contains(Modifier::BOLD));
+        assert!(line.spans[2].style.add_modifier.contains(Modifier::DIM));
+        assert!(!line.spans[2]
+            .style
+            .add_modifier
+            .contains(Modifier::CROSSED_OUT));
+    }
+
+    #[test]
+    fn inactive_unchecked_checkbox_keeps_body_normal() {
+        let line = render_markdown_line("- [ ] todo", Theme::monochrome_for_tests(), false, 0);
+
+        assert!(!line.spans[2]
+            .style
+            .add_modifier
+            .contains(Modifier::CROSSED_OUT));
+    }
+
+    #[test]
+    fn checked_checkbox_continuation_line_looks_completed() {
+        let line = render_markdown_line_with_completion(
+            "      wrapped text",
+            Theme::monochrome_for_tests(),
+            false,
+            1,
+            true,
+        );
+
+        assert_eq!(line_text(&line), "      wrapped text");
+        assert!(line.spans[1].style.add_modifier.contains(Modifier::DIM));
+        assert!(!line.spans[1]
+            .style
+            .add_modifier
+            .contains(Modifier::CROSSED_OUT));
+    }
+
+    #[test]
+    fn active_checked_checkbox_continuation_line_keeps_source_style() {
+        let line = render_markdown_line_with_completion(
+            "      wrapped text",
+            Theme::monochrome_for_tests(),
+            true,
+            1,
+            true,
+        );
+
+        assert_eq!(line_text(&line), "      wrapped text");
+        assert!(!line.spans[0]
+            .style
+            .add_modifier
+            .contains(Modifier::CROSSED_OUT));
     }
 
     #[test]
