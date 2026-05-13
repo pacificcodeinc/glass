@@ -849,6 +849,14 @@ impl App {
                     motions::line_end(&self.buffer, &mut self.cursor);
                     true
                 }
+                KeyCode::Char('u') | KeyCode::Char('U') => {
+                    self.delete_to_line_start();
+                    true
+                }
+                KeyCode::Char('k') | KeyCode::Char('K') => {
+                    self.delete_to_line_end();
+                    true
+                }
                 KeyCode::Home => {
                     motions::document_start(&mut self.cursor);
                     true
@@ -1552,6 +1560,18 @@ mod tests {
 
         assert_eq!(app.buffer.as_string(), "content");
         assert_eq!(app.cursor, Cursor { line: 0, column: 0 });
+    }
+
+    #[test]
+    fn terminal_translated_command_delete_wins_over_normal_mode_undo() {
+        let mut app = test_app("prefix content");
+        app.cursor = Cursor { line: 0, column: 7 };
+
+        press_modified(&mut app, KeyCode::Char('u'), KeyModifiers::CONTROL);
+
+        assert_eq!(app.buffer.as_string(), "content");
+        assert_eq!(app.cursor, Cursor { line: 0, column: 0 });
+        assert_eq!(app.mode, Mode::Normal);
     }
 
     #[test]
