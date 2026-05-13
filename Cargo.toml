@@ -1,0 +1,13 @@
+[package]
+name = "glassnotes"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.102"
+crossterm = "0.29.0"
+ignore = "0.4.25"
+ratatui = "0.30.0"
+ropey = "1.6.1"
+tree-sitter = "0.19.5"
+tree-sitter-markdown = "0.7.1"
