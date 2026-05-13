@@ -66,7 +66,7 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App, theme: Theme) {
             } else {
                 row.text.clone()
             };
-            let mut line = render_markdown_line(&display_text, theme, active);
+            let mut line = render_markdown_line(&display_text, theme, active, row.wrap_index);
 
             if visual_range.as_ref().is_some_and(|range| range.contains(&row.line_number)) {
                 line = selected_line(line, theme);

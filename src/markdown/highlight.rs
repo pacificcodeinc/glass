@@ -5,9 +5,9 @@ use ratatui::{
 
 use crate::config::theme::Theme;
 
-pub fn render_markdown_line(source: &str, theme: Theme, active: bool) -> Line<'static> {
+pub fn render_markdown_line(source: &str, theme: Theme, active: bool, wrap_index: usize) -> Line<'static> {
     if active {
-        return highlight_source_line(source, theme);
+        return highlight_source_line(source, theme, wrap_index);
     }
 
     let source = source.trim_end_matches(['\r', '\n']);
@@ -49,36 +49,38 @@ pub fn render_markdown_line(source: &str, theme: Theme, active: bool) -> Line<'s
         return Line::from(spans);
     }
 
-    if let Some((marker, rest)) = checkbox_prefix(trimmed) {
-        let mut spans = vec![
-            Span::raw(leading.to_string()),
-            Span::styled(marker.to_string(), theme.list_marker),
-        ];
-        spans.extend(conceal_inline(rest, theme, Style::default().fg(theme.text)));
-        return Line::from(spans);
-    }
+    if wrap_index == 0 {
+        if let Some((marker, rest)) = checkbox_prefix(trimmed) {
+            let mut spans = vec![
+                Span::raw(leading.to_string()),
+                Span::styled(marker.to_string(), theme.list_marker),
+            ];
+            spans.extend(conceal_inline(rest, theme, Style::default().fg(theme.text)));
+            return Line::from(spans);
+        }
 
-    if let Some((marker, rest)) = numbered_list_prefix(trimmed) {
-        let mut spans = vec![
-            Span::raw(leading.to_string()),
-            Span::styled(marker.to_string(), theme.list_marker),
-        ];
-        spans.extend(conceal_inline(rest, theme, Style::default().fg(theme.text)));
-        return Line::from(spans);
-    }
+        if let Some((marker, rest)) = numbered_list_prefix(trimmed) {
+            let mut spans = vec![
+                Span::raw(leading.to_string()),
+                Span::styled(marker.to_string(), theme.list_marker),
+            ];
+            spans.extend(conceal_inline(rest, theme, Style::default().fg(theme.text)));
+            return Line::from(spans);
+        }
 
-    if let Some(item_text) = list_item_text(trimmed) {
-        let marker_len = trimmed.len() - item_text.len();
-        let mut spans = vec![
-            Span::raw(leading.to_string()),
-            Span::styled("• ".to_string(), theme.list_marker),
-        ];
-        spans.extend(conceal_inline(
-            &trimmed[marker_len..],
-            theme,
-            Style::default().fg(theme.text),
-        ));
-        return Line::from(spans);
+        if let Some(item_text) = list_item_text(trimmed) {
+            let marker_len = trimmed.len() - item_text.len();
+            let mut spans = vec![
+                Span::raw(leading.to_string()),
+                Span::styled("• ".to_string(), theme.list_marker),
+            ];
+            spans.extend(conceal_inline(
+                &trimmed[marker_len..],
+                theme,
+                Style::default().fg(theme.text),
+            ));
+            return Line::from(spans);
+        }
     }
 
     Line::from(conceal_inline(
@@ -88,7 +90,7 @@ pub fn render_markdown_line(source: &str, theme: Theme, active: bool) -> Line<'s
     ))
 }
 
-pub fn highlight_source_line(source: &str, theme: Theme) -> Line<'static> {
+pub fn highlight_source_line(source: &str, theme: Theme, wrap_index: usize) -> Line<'static> {
     let trimmed = source.trim_start();
     if trimmed.starts_with('#') {
         return Line::from(Span::styled(source.to_string(), theme.heading));
@@ -102,17 +104,19 @@ pub fn highlight_source_line(source: &str, theme: Theme) -> Line<'static> {
         return Line::from(Span::styled(source.to_string(), theme.code_fence));
     }
 
-    if let Some((ws_end, marker_end)) = split_list_marker(source) {
-        let mut spans = vec![
-            Span::raw(source[..ws_end].to_string()),
-            Span::styled(source[ws_end..marker_end].to_string(), theme.list_marker),
-        ];
-        spans.extend(conceal_inline(
-            &source[marker_end..],
-            theme,
-            Style::default().fg(theme.text),
-        ));
-        return Line::from(spans);
+    if wrap_index == 0 {
+        if let Some((ws_end, marker_end)) = split_list_marker(source) {
+            let mut spans = vec![
+                Span::raw(source[..ws_end].to_string()),
+                Span::styled(source[ws_end..marker_end].to_string(), theme.list_marker),
+            ];
+            spans.extend(conceal_inline(
+                &source[marker_end..],
+                theme,
+                Style::default().fg(theme.text),
+            ));
+            return Line::from(spans);
+        }
     }
 
     let mut spans = Vec::new();
@@ -377,43 +381,43 @@ mod tests {
 
     #[test]
     fn inactive_heading_conceals_marker() {
-        let line = render_markdown_line("# Heading", Theme::monochrome_for_tests(), false);
+        let line = render_markdown_line("# Heading", Theme::monochrome_for_tests(), false, 0);
         assert_eq!(line_text(&line), "Heading");
     }
 
     #[test]
     fn active_heading_keeps_marker_for_editing() {
-        let line = render_markdown_line("# Heading", Theme::monochrome_for_tests(), true);
+        let line = render_markdown_line("# Heading", Theme::monochrome_for_tests(), true, 0);
         assert_eq!(line.spans[0].content.as_ref(), "# Heading");
     }
 
     #[test]
     fn inactive_inline_markers_are_concealed() {
-        let line = render_markdown_line("a **bold** `code`", Theme::monochrome_for_tests(), false);
+        let line = render_markdown_line("a **bold** `code`", Theme::monochrome_for_tests(), false, 0);
         assert_eq!(line_text(&line), "a bold code");
     }
 
     #[test]
     fn inactive_checkbox_renders_full_marker() {
-        let line = render_markdown_line("- [ ] todo", Theme::monochrome_for_tests(), false);
+        let line = render_markdown_line("- [ ] todo", Theme::monochrome_for_tests(), false, 0);
         assert_eq!(line_text(&line), "- [ ] todo");
     }
 
     #[test]
     fn inactive_checked_checkbox_renders_full_marker() {
-        let line = render_markdown_line("- [x] done", Theme::monochrome_for_tests(), false);
+        let line = render_markdown_line("- [x] done", Theme::monochrome_for_tests(), false, 0);
         assert_eq!(line_text(&line), "- [x] done");
     }
 
     #[test]
     fn inactive_numbered_list_renders_full_marker() {
-        let line = render_markdown_line("1. first item", Theme::monochrome_for_tests(), false);
+        let line = render_markdown_line("1. first item", Theme::monochrome_for_tests(), false, 0);
         assert_eq!(line_text(&line), "1. first item");
     }
 
     #[test]
     fn inactive_numbered_list_multi_digit() {
-        let line = render_markdown_line("10. tenth item", Theme::monochrome_for_tests(), false);
+        let line = render_markdown_line("10. tenth item", Theme::monochrome_for_tests(), false, 0);
         assert_eq!(line_text(&line), "10. tenth item");
     }
 
