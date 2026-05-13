@@ -2,7 +2,7 @@
 
 - [ ] Fenced code blocks: highlight the language marker in fences like ```rust.
 - [x] Numbered lists: muted markers, aligned continuation lines, and Enter auto-increments.
-- [ ] Numbered lists: remove any remaining marker flicker while editing or pressing Enter.
+- [x] Numbered lists: remove any remaining marker flicker while editing or pressing Enter.
 - [ ] File picker: rewrite the fuzzy-find / Command+P picker from scratch.
 - [ ] Mouse support: click anywhere in the editor to move the cursor.
 - [x] Checkboxes: render `- [ ]` / `- [x]` and toggle them with Space in normal mode.
@@ -13,4 +13,11 @@
 - [ ] Tables: render Markdown tables.
 - [ ] Wiki-links: render `[[File.md]]` distinctly and jump to the linked file.
 - [ ] Strikethrough: render `~~text~~`, including inside list items.
-- [ ] Visual mode: make command handling work consistently.
+- [x] Visual mode: make command handling work consistently.
+- [x] Scrolling: `j` and `k` keep wrapped cursor rows visible.
+- [x] Inline code: backtick-delimited code keeps stable spacing and cursor alignment.
+- [x] Lists: nested content only renders sublists or inline formatting, not headings or other block elements.
+- [x] Vim motions: normal-mode `A` enters insert mode at the end of the line.
+- [x] Line deletion: `dd` preserves the cursor column when the next line is long enough.
+- [ ] Render URLS and links nicely
+- [ ] Undo `u` action

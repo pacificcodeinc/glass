@@ -1,9 +1,9 @@
 use ratatui::{
+    Frame,
     layout::{Position, Rect},
     style::Style,
     text::{Line, Span, Text},
     widgets::Paragraph,
-    Frame,
 };
 
 use crate::{
@@ -45,6 +45,7 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App, theme: Theme) {
     let rows = visible_rows(
         &app.buffer,
         app.viewport.top_line,
+        app.viewport.top_wrap_index,
         page.height as usize,
         text_width,
     );

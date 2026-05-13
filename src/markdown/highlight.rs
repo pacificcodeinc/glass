@@ -29,33 +29,34 @@ pub fn render_markdown_line_with_completion(
     let leading_width = source.len() - source.trim_start().len();
     let leading = &source[..leading_width];
     let trimmed = &source[leading_width..];
+    let allow_block_element = leading_width == 0;
 
-    if trimmed.starts_with("```") {
+    if allow_block_element && trimmed.starts_with("```") {
         return Line::from(Span::styled(trimmed.to_string(), theme.code_fence));
     }
 
-    if let Some(heading_text) = trimmed.strip_prefix("# ") {
+    if allow_block_element && let Some(heading_text) = trimmed.strip_prefix("# ") {
         return Line::from(vec![
             Span::raw(leading.to_string()),
             Span::styled(heading_text.to_string(), theme.heading),
         ]);
     }
 
-    if let Some(heading_text) = trimmed.strip_prefix("## ") {
+    if allow_block_element && let Some(heading_text) = trimmed.strip_prefix("## ") {
         return Line::from(vec![
             Span::raw(leading.to_string()),
             Span::styled(heading_text.to_string(), theme.heading),
         ]);
     }
 
-    if let Some(heading_text) = trimmed.strip_prefix("### ") {
+    if allow_block_element && let Some(heading_text) = trimmed.strip_prefix("### ") {
         return Line::from(vec![
             Span::raw(leading.to_string()),
             Span::styled(heading_text.to_string(), theme.heading),
         ]);
     }
 
-    if let Some(quote_text) = trimmed.strip_prefix("> ") {
+    if allow_block_element && let Some(quote_text) = trimmed.strip_prefix("> ") {
         let mut spans = vec![
             Span::raw(leading.to_string()),
             Span::styled("│ ".to_string(), theme.quote),
@@ -125,15 +126,16 @@ pub fn render_markdown_line_with_completion(
 
 pub fn highlight_source_line(source: &str, theme: Theme, wrap_index: usize) -> Line<'static> {
     let trimmed = source.trim_start();
-    if trimmed.starts_with('#') {
+    let allow_block_element = source.len() == trimmed.len();
+    if allow_block_element && trimmed.starts_with('#') {
         return Line::from(Span::styled(source.to_string(), theme.heading));
     }
 
-    if trimmed.starts_with('>') {
+    if allow_block_element && trimmed.starts_with('>') {
         return Line::from(Span::styled(source.to_string(), theme.quote));
     }
 
-    if trimmed.starts_with("```") {
+    if allow_block_element && trimmed.starts_with("```") {
         return Line::from(Span::styled(source.to_string(), theme.code_fence));
     }
 
@@ -336,7 +338,7 @@ fn conceal_inline(source: &str, theme: Theme, base_style: Style) -> Vec<Span<'st
     while index < chars.len() {
         if chars[index] == '`' {
             if let Some(end) = find_next(&chars, index + 1, '`') {
-                push_slice(&mut spans, &chars, index + 1, end, theme.inline_code);
+                push_slice(&mut spans, &chars, index, end + 1, theme.inline_code);
                 index = end + 1;
                 continue;
             }
@@ -434,10 +436,34 @@ mod tests {
     }
 
     #[test]
-    fn inactive_inline_markers_are_concealed() {
+    fn inactive_inline_code_preserves_delimiters_for_stable_width() {
         let line =
             render_markdown_line("a **bold** `code`", Theme::monochrome_for_tests(), false, 0);
-        assert_eq!(line_text(&line), "a bold code");
+        assert_eq!(line_text(&line), "a bold `code`");
+    }
+
+    #[test]
+    fn inactive_indented_heading_renders_as_inline_text() {
+        let line =
+            render_markdown_line("  # not a heading", Theme::monochrome_for_tests(), false, 0);
+
+        assert_eq!(line_text(&line), "  # not a heading");
+        assert_eq!(
+            line.spans[0].style,
+            Style::default().fg(Theme::monochrome_for_tests().text)
+        );
+    }
+
+    #[test]
+    fn active_indented_heading_keeps_plain_source_style() {
+        let line =
+            render_markdown_line("  # not a heading", Theme::monochrome_for_tests(), true, 0);
+
+        assert_eq!(line_text(&line), "  # not a heading");
+        assert_eq!(
+            line.spans[0].style,
+            Style::default().fg(Theme::monochrome_for_tests().text)
+        );
     }
 
     #[test]
@@ -458,20 +484,24 @@ mod tests {
 
         assert!(line.spans[1].style.add_modifier.contains(Modifier::BOLD));
         assert!(line.spans[2].style.add_modifier.contains(Modifier::DIM));
-        assert!(!line.spans[2]
-            .style
-            .add_modifier
-            .contains(Modifier::CROSSED_OUT));
+        assert!(
+            !line.spans[2]
+                .style
+                .add_modifier
+                .contains(Modifier::CROSSED_OUT)
+        );
     }
 
     #[test]
     fn inactive_unchecked_checkbox_keeps_body_normal() {
         let line = render_markdown_line("- [ ] todo", Theme::monochrome_for_tests(), false, 0);
 
-        assert!(!line.spans[2]
-            .style
-            .add_modifier
-            .contains(Modifier::CROSSED_OUT));
+        assert!(
+            !line.spans[2]
+                .style
+                .add_modifier
+                .contains(Modifier::CROSSED_OUT)
+        );
     }
 
     #[test]
@@ -486,10 +516,12 @@ mod tests {
 
         assert_eq!(line_text(&line), "      wrapped text");
         assert!(line.spans[1].style.add_modifier.contains(Modifier::DIM));
-        assert!(!line.spans[1]
-            .style
-            .add_modifier
-            .contains(Modifier::CROSSED_OUT));
+        assert!(
+            !line.spans[1]
+                .style
+                .add_modifier
+                .contains(Modifier::CROSSED_OUT)
+        );
     }
 
     #[test]
@@ -503,10 +535,12 @@ mod tests {
         );
 
         assert_eq!(line_text(&line), "      wrapped text");
-        assert!(!line.spans[0]
-            .style
-            .add_modifier
-            .contains(Modifier::CROSSED_OUT));
+        assert!(
+            !line.spans[0]
+                .style
+                .add_modifier
+                .contains(Modifier::CROSSED_OUT)
+        );
     }
 
     #[test]

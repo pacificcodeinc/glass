@@ -42,9 +42,7 @@ fn parse_args() -> Result<(PathBuf, Option<PathBuf>)> {
     }
 
     let path = PathBuf::from(arg);
-    let canonical = path
-        .canonicalize()
-        .unwrap_or_else(|_| path.clone());
+    let canonical = path.canonicalize().unwrap_or_else(|_| path.clone());
 
     if canonical.is_dir() {
         Ok((canonical, None))

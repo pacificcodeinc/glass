@@ -73,6 +73,22 @@ glass <notes-directory>
 cargo build --release
 ```
 
+## Release
+
+Glass uses the Cargo package version, git tags, and GitHub compare pages for releases.
+
+```bash
+cargo test
+# Bump Cargo.toml to the next version and update CHANGELOG.md.
+git add -- Cargo.toml Cargo.lock CHANGELOG.md
+git commit -m "chore: release vX.Y.Z"
+git tag vX.Y.Z
+git push origin main vX.Y.Z
+scripts/release-notes.sh vX.Y.Z
+```
+
+The generated release notes include every commit between `vX.Y.Z` and the previous version tag, with GitHub commit links when `origin` points at GitHub.
+
 ## License
 
 MIT

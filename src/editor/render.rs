@@ -12,6 +12,7 @@ pub struct VisibleRow {
 pub fn visible_rows(
     buffer: &DocumentBuffer,
     top_line: usize,
+    top_wrap_index: usize,
     height: usize,
     width: usize,
 ) -> Vec<VisibleRow> {
@@ -38,6 +39,9 @@ pub fn visible_rows(
         let (segments, marker_len) = wrap_line(trimmed, wrap_width);
         let completed = is_checked_checkbox(trimmed);
         for (wrap_index, &(start, end)) in segments.iter().enumerate() {
+            if line == top_line && wrap_index < top_wrap_index {
+                continue;
+            }
             if rows.len() >= height {
                 break;
             }
@@ -211,7 +215,7 @@ mod tests {
     fn marker_only_checkbox_renders_as_visible_row() {
         let buffer = buffer_with("before\n- [ ] ");
 
-        let rows = visible_rows(&buffer, 0, 10, 80);
+        let rows = visible_rows(&buffer, 0, 0, 10, 80);
 
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[1].line_number, 1);
@@ -231,9 +235,20 @@ mod tests {
     fn checked_checkbox_completion_state_survives_wrapping() {
         let buffer = buffer_with("- [x] one two three four five");
 
-        let rows = visible_rows(&buffer, 0, 10, 14);
+        let rows = visible_rows(&buffer, 0, 0, 10, 14);
 
         assert!(rows.len() > 1);
         assert!(rows.iter().all(|row| row.completed));
+    }
+
+    #[test]
+    fn visible_rows_can_start_inside_wrapped_line() {
+        let buffer = buffer_with("one two three four");
+
+        let rows = visible_rows(&buffer, 0, 1, 2, 8);
+
+        assert_eq!(rows[0].line_number, 0);
+        assert_eq!(rows[0].wrap_index, 1);
+        assert_eq!(rows[0].text, "three");
     }
 }

@@ -26,6 +26,7 @@ pub enum Mode {
 #[derive(Debug, Clone, Copy)]
 pub struct Viewport {
     pub top_line: usize,
+    pub top_wrap_index: usize,
     pub horizontal_offset: usize,
     pub visible_height: usize,
     pub visible_width: usize,
@@ -35,6 +36,7 @@ impl Default for Viewport {
     fn default() -> Self {
         Self {
             top_line: 0,
+            top_wrap_index: 0,
             horizontal_offset: 0,
             visible_height: 1,
             visible_width: 1,
@@ -176,6 +178,10 @@ impl App {
             return Ok(());
         }
 
+        if self.mode != Mode::CommandLine && self.handle_navigation_modifier(key) {
+            return Ok(());
+        }
+
         match self.mode {
             Mode::Normal => self.handle_normal_key(key)?,
             Mode::Insert => self.handle_insert_key(key),
@@ -233,8 +239,7 @@ impl App {
 
         match key.code {
             KeyCode::Char(':') => {
-                self.mode = Mode::CommandLine;
-                self.command_line.clear();
+                self.enter_command_line();
             }
             KeyCode::Char('v') | KeyCode::Char('V') => {
                 self.mode = Mode::Visual;
@@ -312,30 +317,30 @@ impl App {
             }
             KeyCode::Backspace => {
                 if key.modifiers.contains(KeyModifiers::SUPER) {
-                    let line_text = self.buffer.line(self.cursor.line);
-                    let width = self.wrap_width();
-                    let (seg_start, _) =
-                        visual_line_bounds(&line_text, self.cursor.column, width);
-                    let start = self.buffer.char_index(Cursor {
-                        line: self.cursor.line,
-                        column: seg_start,
-                    });
-                    let end = self.buffer.char_index(self.cursor);
-                    self.buffer.delete_range(start, end, &mut self.cursor);
+                    self.delete_to_line_start();
                 } else if key.modifiers.contains(KeyModifiers::ALT) {
-                    // Option+Delete: delete word backward
-                    let end = self.buffer.char_index(self.cursor);
-                    let mut target = self.cursor;
-                    motions::word_backward(&self.buffer, &mut target);
-                    let start = self.buffer.char_index(target);
-                    self.buffer.delete_range(start, end, &mut self.cursor);
+                    self.delete_word_backward();
                 } else {
                     self.buffer.delete_previous_char(&mut self.cursor);
                 }
             }
-            KeyCode::Delete => self.buffer.delete_char(&mut self.cursor),
+            KeyCode::Delete => {
+                if key.modifiers.contains(KeyModifiers::SUPER) {
+                    self.delete_to_line_end();
+                } else {
+                    self.buffer.delete_char(&mut self.cursor);
+                }
+            }
             KeyCode::Tab => self.buffer.insert_str(&mut self.cursor, "    "),
-            KeyCode::Char(ch) => self.buffer.insert_char(&mut self.cursor, ch),
+            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.delete_to_line_start();
+            }
+            KeyCode::Char('k') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.delete_to_line_end();
+            }
+            KeyCode::Char(ch) if is_text_input_key(key) => {
+                self.buffer.insert_char(&mut self.cursor, ch)
+            }
             KeyCode::Left => motions::left(&mut self.cursor),
             KeyCode::Right => motions::right(&self.buffer, &mut self.cursor),
             KeyCode::Up => motions::up(&self.buffer, &mut self.cursor),
@@ -358,6 +363,9 @@ impl App {
         }
 
         match key.code {
+            KeyCode::Char(':') => {
+                self.enter_command_line();
+            }
             KeyCode::Esc => {
                 self.mode = Mode::Normal;
                 self.visual_line_anchor = None;
@@ -443,6 +451,23 @@ impl App {
         self.buffer.delete_range(start, end, &mut self.cursor);
     }
 
+    fn delete_to_line_start(&mut self) {
+        let start = self.buffer.char_index(Cursor {
+            line: self.cursor.line,
+            column: 0,
+        });
+        let end = self.buffer.char_index(self.cursor);
+        self.buffer.delete_range(start, end, &mut self.cursor);
+    }
+
+    fn delete_word_backward(&mut self) {
+        let end = self.buffer.char_index(self.cursor);
+        let mut target = self.cursor;
+        motions::word_backward(&self.buffer, &mut target);
+        let start = self.buffer.char_index(target);
+        self.buffer.delete_range(start, end, &mut self.cursor);
+    }
+
     fn change_motion(&mut self, key: KeyEvent) {
         let start_cursor = self.cursor;
         let start = self.buffer.char_index(start_cursor);
@@ -510,22 +535,30 @@ impl App {
         match key.code {
             KeyCode::Esc => {
                 self.mode = Mode::Normal;
+                self.visual_line_anchor = None;
                 self.command_line.clear();
             }
             KeyCode::Enter => {
                 let command = parse_command(&self.command_line);
                 self.command_line.clear();
                 self.mode = Mode::Normal;
+                self.visual_line_anchor = None;
                 self.execute_command(command)?;
             }
             KeyCode::Backspace => {
                 self.command_line.pop();
             }
-            KeyCode::Char(ch) => self.command_line.push(ch),
+            KeyCode::Char(ch) if is_text_input_key(key) => self.command_line.push(ch),
             _ => {}
         }
 
         Ok(())
+    }
+
+    fn enter_command_line(&mut self) {
+        self.mode = Mode::CommandLine;
+        self.visual_line_anchor = None;
+        self.command_line.clear();
     }
 
     fn handle_overlay_key(&mut self, key: KeyEvent) -> Result<()> {
@@ -629,13 +662,12 @@ impl App {
                     if path.is_file() {
                         self.overlay = None;
                         self.open_path(&path)?;
-                        self.file_tree = FileTree::load(&self.notes_dir)
-                            .with_context(|| {
-                                format!(
-                                    "failed to scan notes directory: {}",
-                                    self.notes_dir.display()
-                                )
-                            })?;
+                        self.file_tree = FileTree::load(&self.notes_dir).with_context(|| {
+                            format!(
+                                "failed to scan notes directory: {}",
+                                self.notes_dir.display()
+                            )
+                        })?;
                         return Ok(());
                     }
                 }
@@ -679,15 +711,14 @@ impl App {
                     detail: command.detail.to_string(),
                 })
                 .collect(),
-            OverlayKind::FilePicker => {
-                self.file_picker_matches()
-                    .into_iter()
-                    .map(|entry| PickerItem {
-                        label: entry.display_name.clone(),
-                        detail: entry.path.to_string_lossy().to_string(),
-                    })
-                    .collect()
-            }
+            OverlayKind::FilePicker => self
+                .file_picker_matches()
+                .into_iter()
+                .map(|entry| PickerItem {
+                    label: entry.display_name.clone(),
+                    detail: entry.path.to_string_lossy().to_string(),
+                })
+                .collect(),
         }
     }
 
@@ -742,20 +773,94 @@ impl App {
         self.cursor.column = seg_end.min(self.buffer.line_len_chars(self.cursor.line));
     }
 
+    fn handle_navigation_modifier(&mut self, key: KeyEvent) -> bool {
+        if key.modifiers.contains(KeyModifiers::SUPER) {
+            match key.code {
+                KeyCode::Left => {
+                    motions::line_start(&mut self.cursor);
+                    true
+                }
+                KeyCode::Right => {
+                    motions::line_end(&self.buffer, &mut self.cursor);
+                    true
+                }
+                KeyCode::Up => {
+                    motions::document_start(&mut self.cursor);
+                    true
+                }
+                KeyCode::Down => {
+                    motions::document_end(&self.buffer, &mut self.cursor);
+                    true
+                }
+                KeyCode::Home => {
+                    motions::document_start(&mut self.cursor);
+                    true
+                }
+                KeyCode::End => {
+                    motions::document_end(&self.buffer, &mut self.cursor);
+                    true
+                }
+                _ => false,
+            }
+        } else if key.modifiers.contains(KeyModifiers::ALT) {
+            match key.code {
+                KeyCode::Left => {
+                    motions::word_backward(&self.buffer, &mut self.cursor);
+                    true
+                }
+                KeyCode::Right => {
+                    motions::word_forward(&self.buffer, &mut self.cursor);
+                    true
+                }
+                KeyCode::Char('b') | KeyCode::Char('B') => {
+                    motions::word_backward(&self.buffer, &mut self.cursor);
+                    true
+                }
+                KeyCode::Char('f') | KeyCode::Char('F') => {
+                    motions::word_forward(&self.buffer, &mut self.cursor);
+                    true
+                }
+                _ => false,
+            }
+        } else if key.modifiers.contains(KeyModifiers::CONTROL) {
+            match key.code {
+                KeyCode::Char('a') | KeyCode::Char('A') => {
+                    motions::line_start(&mut self.cursor);
+                    true
+                }
+                KeyCode::Char('e') | KeyCode::Char('E') => {
+                    motions::line_end(&self.buffer, &mut self.cursor);
+                    true
+                }
+                KeyCode::Home => {
+                    motions::document_start(&mut self.cursor);
+                    true
+                }
+                KeyCode::End => {
+                    motions::document_end(&self.buffer, &mut self.cursor);
+                    true
+                }
+                _ => false,
+            }
+        } else {
+            false
+        }
+    }
+
     fn visual_line_down(&mut self) {
         let line_text = self.buffer.line(self.cursor.line);
         let width = self.wrap_width();
-        let (segments, _) = wrap_line(
-            line_text.trim_end_matches(['\r', '\n']),
-            width,
-        );
-        let current_seg =
-            wrap_index_for_column(&line_text, self.cursor.column, width);
+        let (segments, _) = wrap_line(line_text.trim_end_matches(['\r', '\n']), width);
+        let current_seg = wrap_index_for_column(&line_text, self.cursor.column, width);
         if current_seg + 1 < segments.len() {
             let rel = self.cursor.column.saturating_sub(segments[current_seg].0);
             let (next_start, next_end) = segments[current_seg + 1];
             let max_col = next_end.saturating_sub(1);
-            self.cursor.column = if next_start + rel > max_col { max_col } else { next_start + rel };
+            self.cursor.column = if next_start + rel > max_col {
+                max_col
+            } else {
+                next_start + rel
+            };
         } else if self.cursor.line + 1 < self.buffer.line_count() {
             self.cursor.line += 1;
             self.cursor.column = 0;
@@ -765,24 +870,21 @@ impl App {
     fn visual_line_up(&mut self) {
         let line_text = self.buffer.line(self.cursor.line);
         let width = self.wrap_width();
-        let (segments, _) = wrap_line(
-            line_text.trim_end_matches(['\r', '\n']),
-            width,
-        );
-        let current_seg =
-            wrap_index_for_column(&line_text, self.cursor.column, width);
+        let (segments, _) = wrap_line(line_text.trim_end_matches(['\r', '\n']), width);
+        let current_seg = wrap_index_for_column(&line_text, self.cursor.column, width);
         if current_seg > 0 {
             let rel = self.cursor.column.saturating_sub(segments[current_seg].0);
             let (prev_start, prev_end) = segments[current_seg - 1];
             let max_col = prev_end.saturating_sub(1);
-            self.cursor.column = if prev_start + rel > max_col { max_col } else { prev_start + rel };
+            self.cursor.column = if prev_start + rel > max_col {
+                max_col
+            } else {
+                prev_start + rel
+            };
         } else if self.cursor.line > 0 {
             self.cursor.line -= 1;
             let prev_text = self.buffer.line(self.cursor.line);
-            let (prev_segments, _) = wrap_line(
-                prev_text.trim_end_matches(['\r', '\n']),
-                width,
-            );
+            let (prev_segments, _) = wrap_line(prev_text.trim_end_matches(['\r', '\n']), width);
             if let Some(&(start, _end)) = prev_segments.last() {
                 self.cursor.column = start;
             }
@@ -804,6 +906,7 @@ impl App {
         self.buffer = DocumentBuffer::from_path(&path)?;
         self.cursor = Cursor::default();
         self.viewport.top_line = 0;
+        self.viewport.top_wrap_index = 0;
         self.viewport.horizontal_offset = 0;
         self.status_message = format!("Opened {}", path.display());
         Ok(())
@@ -811,21 +914,124 @@ impl App {
 
     fn keep_cursor_visible(&mut self) {
         self.buffer.clamp_cursor(&mut self.cursor);
+        let width = self.wrap_width();
+        self.normalize_viewport(width);
 
-        if self.cursor.line < self.viewport.top_line {
+        let cursor_wrap = wrap_index_for_column(
+            &self.buffer.line(self.cursor.line),
+            self.cursor.column,
+            width,
+        );
+        if visual_position_before(
+            self.cursor.line,
+            cursor_wrap,
+            self.viewport.top_line,
+            self.viewport.top_wrap_index,
+        ) {
             self.viewport.top_line = self.cursor.line;
+            self.viewport.top_wrap_index = cursor_wrap;
+            return;
         }
 
-        let bottom = self
+        let offset = self
+            .visual_offset_from_viewport(self.cursor.line, cursor_wrap, width)
+            .unwrap_or(usize::MAX);
+        if offset >= self.viewport.visible_height {
+            let (line, wrap_index) = self.visual_position_for_cursor_bottom(cursor_wrap, width);
+            self.viewport.top_line = line;
+            self.viewport.top_wrap_index = wrap_index;
+        }
+
+        self.normalize_viewport(width);
+    }
+
+    fn normalize_viewport(&mut self, width: usize) {
+        self.viewport.top_line = self
             .viewport
             .top_line
-            .saturating_add(self.viewport.visible_height.saturating_sub(1));
-        if self.cursor.line > bottom {
-            self.viewport.top_line = self
-                .cursor
-                .line
-                .saturating_sub(self.viewport.visible_height.saturating_sub(1));
+            .min(self.buffer.line_count().saturating_sub(1));
+        let wraps = self.line_wrap_count(self.viewport.top_line, width);
+        self.viewport.top_wrap_index = self.viewport.top_wrap_index.min(wraps.saturating_sub(1));
+    }
+
+    fn visual_offset_from_viewport(
+        &self,
+        target_line: usize,
+        target_wrap: usize,
+        width: usize,
+    ) -> Option<usize> {
+        let mut line = self.viewport.top_line;
+        let mut wrap = self.viewport.top_wrap_index;
+        let mut offset = 0;
+
+        loop {
+            if line == target_line && wrap == target_wrap {
+                return Some(offset);
+            }
+            if !visual_position_before(line, wrap, target_line, target_wrap) {
+                return None;
+            }
+
+            let next = self.next_visual_position(line, wrap, width);
+            if next == (line, wrap) {
+                return None;
+            }
+            (line, wrap) = next;
+            offset += 1;
         }
+    }
+
+    fn visual_position_for_cursor_bottom(
+        &self,
+        cursor_wrap: usize,
+        width: usize,
+    ) -> (usize, usize) {
+        let mut line = self.cursor.line;
+        let mut wrap = cursor_wrap;
+        for _ in 1..self.viewport.visible_height {
+            let previous = self.previous_visual_position(line, wrap, width);
+            if previous == (line, wrap) {
+                break;
+            }
+            (line, wrap) = previous;
+        }
+
+        (line, wrap)
+    }
+
+    fn next_visual_position(&self, line: usize, wrap: usize, width: usize) -> (usize, usize) {
+        let wrap_count = self.line_wrap_count(line, width);
+        if wrap + 1 < wrap_count {
+            return (line, wrap + 1);
+        }
+
+        if line + 1 < self.buffer.line_count() {
+            return (line + 1, 0);
+        }
+
+        (line, wrap)
+    }
+
+    fn previous_visual_position(&self, line: usize, wrap: usize, width: usize) -> (usize, usize) {
+        if wrap > 0 {
+            return (line, wrap - 1);
+        }
+
+        if line > 0 {
+            let previous_line = line - 1;
+            return (
+                previous_line,
+                self.line_wrap_count(previous_line, width).saturating_sub(1),
+            );
+        }
+
+        (line, wrap)
+    }
+
+    fn line_wrap_count(&self, line: usize, width: usize) -> usize {
+        let line_text = self.buffer.line(line);
+        let trimmed = line_text.trim_end_matches(['\r', '\n']);
+        wrap_line(trimmed, width).0.len().max(1)
     }
 
     fn toggle_checkbox(&mut self) -> bool {
@@ -858,6 +1064,15 @@ impl App {
     }
 }
 
+fn visual_position_before(
+    line: usize,
+    wrap_index: usize,
+    other_line: usize,
+    other_wrap_index: usize,
+) -> bool {
+    line < other_line || (line == other_line && wrap_index < other_wrap_index)
+}
+
 fn is_command_palette_key(key: KeyEvent) -> bool {
     key_char_is_p(key) && has_primary_modifier(key.modifiers)
 }
@@ -868,6 +1083,11 @@ fn key_char_is_p(key: KeyEvent) -> bool {
 
 fn has_primary_modifier(modifiers: KeyModifiers) -> bool {
     modifiers.intersects(KeyModifiers::SUPER | KeyModifiers::CONTROL)
+}
+
+fn is_text_input_key(key: KeyEvent) -> bool {
+    !key.modifiers
+        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER)
 }
 
 fn parse_numbered_list(text: &str) -> Option<(&str, &str)> {
@@ -1024,6 +1244,249 @@ fn fuzzy_match(candidate: &str, query: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_app(text: &str) -> App {
+        let mut buffer = DocumentBuffer::empty();
+        let mut cursor = Cursor::default();
+        buffer.insert_str(&mut cursor, text);
+        buffer.dirty = false;
+
+        App {
+            notes_dir: PathBuf::new(),
+            buffer,
+            cursor: Cursor::default(),
+            viewport: Viewport::default(),
+            mode: Mode::Normal,
+            theme: Theme::monochrome_for_tests(),
+            command_line: String::new(),
+            status_message: String::new(),
+            should_quit: false,
+            overlay: None,
+            visual_line_anchor: None,
+            file_tree: FileTree {
+                entries: Vec::new(),
+                selected: 0,
+            },
+            pending_g: false,
+            pending_delete: false,
+            pending_change: false,
+            pending_leader: false,
+            pending_leader_p: false,
+        }
+    }
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn modified_key(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
+        KeyEvent::new(code, modifiers)
+    }
+
+    fn press(app: &mut App, code: KeyCode) {
+        app.handle_event(Event::Key(key(code))).unwrap();
+    }
+
+    fn press_modified(app: &mut App, code: KeyCode, modifiers: KeyModifiers) {
+        app.handle_event(Event::Key(modified_key(code, modifiers)))
+            .unwrap();
+    }
+
+    #[test]
+    fn visual_mode_can_enter_command_line_and_quit() {
+        let mut app = test_app("text");
+        app.mode = Mode::Visual;
+        app.visual_line_anchor = Some(0);
+
+        press(&mut app, KeyCode::Char(':'));
+        assert_eq!(app.mode, Mode::CommandLine);
+        assert_eq!(app.visual_line_anchor, None);
+
+        press(&mut app, KeyCode::Char('q'));
+        press(&mut app, KeyCode::Enter);
+
+        assert!(app.should_quit);
+        assert_eq!(app.mode, Mode::Normal);
+    }
+
+    #[test]
+    fn normal_mode_a_enters_insert_at_line_end() {
+        let mut app = test_app("abc");
+        app.cursor = Cursor { line: 0, column: 1 };
+
+        press(&mut app, KeyCode::Char('A'));
+
+        assert_eq!(app.mode, Mode::Insert);
+        assert_eq!(app.cursor, Cursor { line: 0, column: 3 });
+    }
+
+    #[test]
+    fn dd_preserves_cursor_column_when_next_line_is_long_enough() {
+        let mut app = test_app("abcd\nwxyz");
+        app.cursor = Cursor { line: 0, column: 2 };
+
+        press(&mut app, KeyCode::Char('d'));
+        press(&mut app, KeyCode::Char('d'));
+
+        assert_eq!(app.buffer.as_string(), "wxyz");
+        assert_eq!(app.cursor, Cursor { line: 0, column: 2 });
+    }
+
+    #[test]
+    fn j_scrolls_viewport_through_wrapped_rows() {
+        let mut app = test_app("abcdefghijklmnopqrstuvwxyz");
+        app.resize_viewport(2, 10);
+
+        press(&mut app, KeyCode::Char('j'));
+        press(&mut app, KeyCode::Char('j'));
+
+        assert_eq!(app.viewport.top_line, 0);
+        assert!(app.viewport.top_wrap_index > 0);
+    }
+
+    #[test]
+    fn command_arrows_navigate_line_and_document_bounds() {
+        let mut app = test_app("first line\nsecond line");
+        app.cursor = Cursor { line: 1, column: 3 };
+
+        press_modified(&mut app, KeyCode::Left, KeyModifiers::SUPER);
+        assert_eq!(app.cursor, Cursor { line: 1, column: 0 });
+
+        press_modified(&mut app, KeyCode::Right, KeyModifiers::SUPER);
+        assert_eq!(
+            app.cursor,
+            Cursor {
+                line: 1,
+                column: "second line".chars().count(),
+            }
+        );
+
+        press_modified(&mut app, KeyCode::Up, KeyModifiers::SUPER);
+        assert_eq!(app.cursor, Cursor { line: 0, column: 0 });
+
+        press_modified(&mut app, KeyCode::Down, KeyModifiers::SUPER);
+        assert_eq!(
+            app.cursor,
+            Cursor {
+                line: 1,
+                column: "second line".chars().count(),
+            }
+        );
+    }
+
+    #[test]
+    fn terminal_translated_command_left_and_right_navigate_lines() {
+        let mut app = test_app("first line\nsecond line");
+        app.cursor = Cursor { line: 1, column: 3 };
+
+        press_modified(&mut app, KeyCode::Char('a'), KeyModifiers::CONTROL);
+        assert_eq!(app.cursor, Cursor { line: 1, column: 0 });
+
+        press_modified(&mut app, KeyCode::Char('e'), KeyModifiers::CONTROL);
+        assert_eq!(
+            app.cursor,
+            Cursor {
+                line: 1,
+                column: "second line".chars().count(),
+            }
+        );
+    }
+
+    #[test]
+    fn option_left_and_right_move_by_words_in_insert_mode() {
+        let mut app = test_app("one two three");
+        app.mode = Mode::Insert;
+        app.cursor = Cursor {
+            line: 0,
+            column: "one two three".chars().count(),
+        };
+
+        press_modified(&mut app, KeyCode::Left, KeyModifiers::ALT);
+        assert_eq!(app.cursor, Cursor { line: 0, column: 8 });
+
+        press_modified(&mut app, KeyCode::Right, KeyModifiers::ALT);
+        assert_eq!(
+            app.cursor,
+            Cursor {
+                line: 0,
+                column: "one two three".chars().count(),
+            }
+        );
+        assert_eq!(app.mode, Mode::Insert);
+    }
+
+    #[test]
+    fn terminal_translated_option_left_and_right_move_by_words() {
+        let mut app = test_app("one two three");
+        app.mode = Mode::Insert;
+        app.cursor = Cursor {
+            line: 0,
+            column: "one two three".chars().count(),
+        };
+
+        press_modified(&mut app, KeyCode::Char('b'), KeyModifiers::ALT);
+        assert_eq!(app.cursor, Cursor { line: 0, column: 8 });
+
+        press_modified(&mut app, KeyCode::Char('f'), KeyModifiers::ALT);
+        assert_eq!(
+            app.cursor,
+            Cursor {
+                line: 0,
+                column: "one two three".chars().count(),
+            }
+        );
+        assert_eq!(app.mode, Mode::Insert);
+    }
+
+    #[test]
+    fn command_delete_removes_to_logical_line_start_in_insert_mode() {
+        let mut app = test_app("prefix content");
+        app.mode = Mode::Insert;
+        app.cursor = Cursor { line: 0, column: 7 };
+
+        press_modified(&mut app, KeyCode::Backspace, KeyModifiers::SUPER);
+
+        assert_eq!(app.buffer.as_string(), "content");
+        assert_eq!(app.cursor, Cursor { line: 0, column: 0 });
+        assert_eq!(app.mode, Mode::Insert);
+    }
+
+    #[test]
+    fn terminal_translated_command_delete_removes_to_line_start() {
+        let mut app = test_app("prefix content");
+        app.mode = Mode::Insert;
+        app.cursor = Cursor { line: 0, column: 7 };
+
+        press_modified(&mut app, KeyCode::Char('u'), KeyModifiers::CONTROL);
+
+        assert_eq!(app.buffer.as_string(), "content");
+        assert_eq!(app.cursor, Cursor { line: 0, column: 0 });
+    }
+
+    #[test]
+    fn command_line_ignores_translated_command_navigation_chars() {
+        let mut app = test_app("text");
+        app.mode = Mode::CommandLine;
+        app.command_line = "q".to_string();
+
+        press_modified(&mut app, KeyCode::Char('e'), KeyModifiers::CONTROL);
+        press_modified(&mut app, KeyCode::Char('b'), KeyModifiers::ALT);
+
+        assert_eq!(app.command_line, "q");
+    }
+
+    #[test]
+    fn command_forward_delete_removes_to_logical_line_end_in_insert_mode() {
+        let mut app = test_app("prefix content");
+        app.mode = Mode::Insert;
+        app.cursor = Cursor { line: 0, column: 6 };
+
+        press_modified(&mut app, KeyCode::Delete, KeyModifiers::SUPER);
+
+        assert_eq!(app.buffer.as_string(), "prefix");
+        assert_eq!(app.cursor, Cursor { line: 0, column: 6 });
+        assert_eq!(app.mode, Mode::Insert);
+    }
 
     #[test]
     fn enter_continues_checkbox_items_at_end_and_middle() {

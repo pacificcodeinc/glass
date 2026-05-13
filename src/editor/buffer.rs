@@ -159,6 +159,7 @@ impl DocumentBuffer {
     }
 
     pub fn delete_line_range(&mut self, start_line: usize, end_line: usize, cursor: &mut Cursor) {
+        let target_column = cursor.column;
         let start_line = start_line.min(self.line_count().saturating_sub(1));
         let end_line = end_line.min(self.line_count().saturating_sub(1));
         let (start_line, end_line) = if start_line <= end_line {
@@ -176,7 +177,7 @@ impl DocumentBuffer {
 
         self.delete_range(start, end, cursor);
         cursor.line = start_line.min(self.line_count().saturating_sub(1));
-        cursor.column = 0;
+        cursor.column = target_column;
         self.clamp_cursor(cursor);
     }
 
@@ -275,6 +276,19 @@ mod tests {
 
         assert_eq!(buffer.as_string(), "a\n");
         assert_eq!(cursor, Cursor { line: 0, column: 0 });
+    }
+
+    #[test]
+    fn delete_line_range_preserves_cursor_column_when_possible() {
+        let mut buffer = DocumentBuffer::empty();
+        let mut cursor = Cursor::default();
+        buffer.insert_str(&mut cursor, "short\nlonger line\nlast");
+        cursor = Cursor { line: 0, column: 3 };
+
+        buffer.delete_line_range(0, 0, &mut cursor);
+
+        assert_eq!(buffer.as_string(), "longer line\nlast");
+        assert_eq!(cursor, Cursor { line: 0, column: 3 });
     }
 
     #[test]
