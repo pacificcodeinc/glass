@@ -259,6 +259,8 @@ impl App {
             KeyCode::Char('h') | KeyCode::Left => {
                 if key.modifiers.contains(KeyModifiers::SUPER) {
                     self.visual_line_start();
+                } else if key.modifiers.contains(KeyModifiers::ALT) {
+                    motions::word_backward(&self.buffer, &mut self.cursor);
                 } else {
                     motions::left(&mut self.cursor);
                 }
@@ -268,6 +270,8 @@ impl App {
             KeyCode::Char('l') | KeyCode::Right => {
                 if key.modifiers.contains(KeyModifiers::SUPER) {
                     self.visual_line_end();
+                } else if key.modifiers.contains(KeyModifiers::ALT) {
+                    motions::word_end_forward(&self.buffer, &mut self.cursor);
                 } else {
                     motions::right(&self.buffer, &mut self.cursor);
                 }
@@ -349,8 +353,24 @@ impl App {
             KeyCode::Delete => self.buffer.delete_char(&mut self.cursor),
             KeyCode::Tab => self.buffer.insert_str(&mut self.cursor, "    "),
             KeyCode::Char(ch) => self.buffer.insert_char(&mut self.cursor, ch),
-            KeyCode::Left => motions::left(&mut self.cursor),
-            KeyCode::Right => motions::right(&self.buffer, &mut self.cursor),
+            KeyCode::Left => {
+                if key.modifiers.contains(KeyModifiers::SUPER) {
+                    self.visual_line_start();
+                } else if key.modifiers.contains(KeyModifiers::ALT) {
+                    motions::word_backward(&self.buffer, &mut self.cursor);
+                } else {
+                    motions::left(&mut self.cursor);
+                }
+            }
+            KeyCode::Right => {
+                if key.modifiers.contains(KeyModifiers::SUPER) {
+                    self.visual_line_end();
+                } else if key.modifiers.contains(KeyModifiers::ALT) {
+                    motions::word_end_forward(&self.buffer, &mut self.cursor);
+                } else {
+                    motions::right(&self.buffer, &mut self.cursor);
+                }
+            }
             KeyCode::Up => motions::up(&self.buffer, &mut self.cursor),
             KeyCode::Down => motions::down(&self.buffer, &mut self.cursor),
             KeyCode::Home => self.visual_line_start(),
@@ -385,6 +405,8 @@ impl App {
             KeyCode::Char('h') | KeyCode::Left => {
                 if key.modifiers.contains(KeyModifiers::SUPER) {
                     self.visual_line_start();
+                } else if key.modifiers.contains(KeyModifiers::ALT) {
+                    motions::word_backward(&self.buffer, &mut self.cursor);
                 } else {
                     motions::left(&mut self.cursor);
                 }
@@ -394,6 +416,8 @@ impl App {
             KeyCode::Char('l') | KeyCode::Right => {
                 if key.modifiers.contains(KeyModifiers::SUPER) {
                     self.visual_line_end();
+                } else if key.modifiers.contains(KeyModifiers::ALT) {
+                    motions::word_end_forward(&self.buffer, &mut self.cursor);
                 } else {
                     motions::right(&self.buffer, &mut self.cursor);
                 }
@@ -424,19 +448,11 @@ impl App {
 
         match key.code {
             KeyCode::Char('d') => {
-                let line_text = self.buffer.line(self.cursor.line);
-                let width = self.wrap_width();
-                let (seg_start, seg_end) =
-                    visual_line_bounds(&line_text, self.cursor.column, width);
-                let start = self.buffer.char_index(Cursor {
-                    line: self.cursor.line,
-                    column: seg_start,
-                });
-                let end = self.buffer.char_index(Cursor {
-                    line: self.cursor.line,
-                    column: seg_end,
-                });
-                self.buffer.delete_range(start, end, &mut self.cursor);
+                self.buffer.delete_line_range(
+                    start_cursor.line,
+                    start_cursor.line,
+                    &mut self.cursor,
+                );
                 return;
             }
             KeyCode::Char('w') => motions::word_forward(&self.buffer, &mut target),
