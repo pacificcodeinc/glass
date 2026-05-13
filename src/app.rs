@@ -241,7 +241,9 @@ impl App {
                 self.visual_line_anchor = Some(self.cursor.line);
             }
             KeyCode::Char(' ') => {
-                self.pending_leader = true;
+                if !self.toggle_checkbox() {
+                    self.pending_leader = true;
+                }
             }
             KeyCode::Char('i') => self.mode = Mode::Insert,
             KeyCode::Char('I') => {
@@ -309,17 +311,37 @@ impl App {
                 let trimmed = current_line.trim_end_matches(['\r', '\n']);
                 let leading_ws_len = trimmed.len() - trimmed.trim_start().len();
                 let trimmed_content = &trimmed[leading_ws_len..];
+                let leading_ws = &trimmed[..leading_ws_len];
 
-                let list_prefix = trimmed_content
-                    .strip_prefix("- ")
-                    .or_else(|| trimmed_content.strip_prefix("* "))
-                    .or_else(|| trimmed_content.strip_prefix("+ "));
-
-                if let Some(content_after) = list_prefix {
+                if let Some(content_after) = trimmed_content
+                    .strip_prefix("- [ ] ")
+                    .or_else(|| trimmed_content.strip_prefix("- [x] "))
+                {
                     if content_after.is_empty() {
                         self.buffer.insert_char(&mut self.cursor, '\n');
                     } else {
-                        let prefix = format!("{}- ", &trimmed[..leading_ws_len]);
+                        let prefix = format!("{}- [ ] ", leading_ws);
+                        self.buffer.insert_char(&mut self.cursor, '\n');
+                        self.buffer.insert_str(&mut self.cursor, &prefix);
+                    }
+                } else if let Some((num_str, content_after)) = parse_numbered_list(trimmed_content) {
+                    if content_after.is_empty() {
+                        self.buffer.insert_char(&mut self.cursor, '\n');
+                    } else {
+                        let next_num: usize = num_str.parse().unwrap_or(1) + 1;
+                        let prefix = format!("{}{}. ", leading_ws, next_num);
+                        self.buffer.insert_char(&mut self.cursor, '\n');
+                        self.buffer.insert_str(&mut self.cursor, &prefix);
+                    }
+                } else if let Some(content_after) = trimmed_content
+                    .strip_prefix("- ")
+                    .or_else(|| trimmed_content.strip_prefix("* "))
+                    .or_else(|| trimmed_content.strip_prefix("+ "))
+                {
+                    if content_after.is_empty() {
+                        self.buffer.insert_char(&mut self.cursor, '\n');
+                    } else {
+                        let prefix = format!("{}- ", leading_ws);
                         self.buffer.insert_char(&mut self.cursor, '\n');
                         self.buffer.insert_str(&mut self.cursor, &prefix);
                     }
@@ -844,6 +866,35 @@ impl App {
                 .saturating_sub(self.viewport.visible_height.saturating_sub(1));
         }
     }
+
+    fn toggle_checkbox(&mut self) -> bool {
+        let original_cursor = self.cursor;
+        let line = self.buffer.line(original_cursor.line);
+        let trimmed = line.trim_end_matches(['\r', '\n']);
+        let leading_ws_len = trimmed.len() - trimmed.trim_start().len();
+        let content = &trimmed[leading_ws_len..];
+
+        let col = leading_ws_len + 3;
+
+        if content.starts_with("- [ ] ") || content.starts_with("- [x] ") {
+            let unchecked = content.starts_with("- [ ] ");
+            let start = self.buffer.char_index(Cursor {
+                line: original_cursor.line,
+                column: col,
+            });
+            self.buffer.delete_range(start, start + 1, &mut self.cursor);
+            self.cursor.column = col;
+            if unchecked {
+                self.buffer.insert_str(&mut self.cursor, "x");
+            } else {
+                self.buffer.insert_str(&mut self.cursor, " ");
+            }
+            self.cursor = original_cursor;
+            return true;
+        }
+
+        false
+    }
 }
 
 fn is_command_palette_key(key: KeyEvent) -> bool {
@@ -856,6 +907,19 @@ fn key_char_is_p(key: KeyEvent) -> bool {
 
 fn has_primary_modifier(modifiers: KeyModifiers) -> bool {
     modifiers.intersects(KeyModifiers::SUPER | KeyModifiers::CONTROL)
+}
+
+fn parse_numbered_list(text: &str) -> Option<(&str, &str)> {
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() && bytes[i].is_ascii_digit() {
+        i += 1;
+    }
+    if i > 0 && text.get(i..i + 2) == Some(". ") {
+        Some((&text[..i], &text[i + 2..]))
+    } else {
+        None
+    }
 }
 
 fn fuzzy_match(candidate: &str, query: &str) -> bool {

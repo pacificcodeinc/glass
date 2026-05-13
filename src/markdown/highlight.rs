@@ -49,6 +49,24 @@ pub fn render_markdown_line(source: &str, theme: Theme, active: bool) -> Line<'s
         return Line::from(spans);
     }
 
+    if let Some((marker, rest)) = checkbox_prefix(trimmed) {
+        let mut spans = vec![
+            Span::raw(leading.to_string()),
+            Span::styled(marker.to_string(), theme.list_marker),
+        ];
+        spans.extend(conceal_inline(rest, theme, Style::default().fg(theme.text)));
+        return Line::from(spans);
+    }
+
+    if let Some((marker, rest)) = numbered_list_prefix(trimmed) {
+        let mut spans = vec![
+            Span::raw(leading.to_string()),
+            Span::styled(marker.to_string(), theme.list_marker),
+        ];
+        spans.extend(conceal_inline(rest, theme, Style::default().fg(theme.text)));
+        return Line::from(spans);
+    }
+
     if let Some(item_text) = list_item_text(trimmed) {
         let marker_len = trimmed.len() - item_text.len();
         let mut spans = vec![
@@ -82,6 +100,19 @@ pub fn highlight_source_line(source: &str, theme: Theme) -> Line<'static> {
 
     if trimmed.starts_with("```") {
         return Line::from(Span::styled(source.to_string(), theme.code_fence));
+    }
+
+    if let Some((ws_end, marker_end)) = split_list_marker(source) {
+        let mut spans = vec![
+            Span::raw(source[..ws_end].to_string()),
+            Span::styled(source[ws_end..marker_end].to_string(), theme.list_marker),
+        ];
+        spans.extend(conceal_inline(
+            &source[marker_end..],
+            theme,
+            Style::default().fg(theme.text),
+        ));
+        return Line::from(spans);
     }
 
     let mut spans = Vec::new();
@@ -196,11 +227,59 @@ fn is_list_marker_at(chars: &[char], index: usize) -> bool {
     at_line_start && matches!((marker, next), (Some('-' | '*' | '+'), Some(' ')))
 }
 
+fn checkbox_prefix(trimmed: &str) -> Option<(&str, &str)> {
+    if let Some(rest) = trimmed
+        .strip_prefix("- [ ] ")
+        .or_else(|| trimmed.strip_prefix("- [x] "))
+    {
+        let marker_len = trimmed.len() - rest.len();
+        Some((&trimmed[..marker_len], rest))
+    } else {
+        None
+    }
+}
+
+fn numbered_list_prefix(trimmed: &str) -> Option<(&str, &str)> {
+    let bytes = trimmed.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() && bytes[i].is_ascii_digit() {
+        i += 1;
+    }
+    if i > 0 && trimmed.get(i..i + 2) == Some(". ") {
+        Some((&trimmed[..i + 2], &trimmed[i + 2..]))
+    } else {
+        None
+    }
+}
+
 fn list_item_text(trimmed: &str) -> Option<&str> {
     trimmed
         .strip_prefix("- ")
         .or_else(|| trimmed.strip_prefix("* "))
         .or_else(|| trimmed.strip_prefix("+ "))
+}
+
+fn split_list_marker(source: &str) -> Option<(usize, usize)> {
+    let trimmed = source.trim_start();
+    let ws = source.len() - trimmed.len();
+
+    if trimmed.starts_with("- [ ] ") || trimmed.starts_with("- [x] ") {
+        return Some((ws, ws + 6));
+    }
+    if trimmed.starts_with("- ") || trimmed.starts_with("* ") || trimmed.starts_with("+ ") {
+        return Some((ws, ws + 2));
+    }
+
+    let bytes = trimmed.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() && bytes[i].is_ascii_digit() {
+        i += 1;
+    }
+    if i > 0 && trimmed.get(i..i + 2) == Some(". ") {
+        return Some((ws, ws + i + 2));
+    }
+
+    None
 }
 
 fn conceal_inline(source: &str, theme: Theme, base_style: Style) -> Vec<Span<'static>> {
