@@ -203,8 +203,9 @@ fn highlight_source_segment(
                 Span::raw(source[..ws_end].to_string()),
                 Span::styled(source[ws_end..marker_end].to_string(), theme.list_marker),
             ];
+            let rest = slice_chars(source, marker_end, segment_end);
             spans.extend(conceal_inline(
-                &source[marker_end..],
+                &rest,
                 theme,
                 Style::default().fg(theme.text),
             ));
@@ -1220,6 +1221,35 @@ mod tests {
             }),
             "split link label should be underlined and blue"
         );
+    }
+
+    #[test]
+    fn active_wrapped_list_segment_does_not_render_past_segment_end() {
+        let source = "- [ ] Strip out unnecessary information from URLs without pretty titles (e.g., https:)";
+        let (segments, _) = crate::editor::render::wrap_line(source, 72);
+        assert!(segments.len() > 1);
+
+        let first = render_markdown_segment_with_completion(
+            source,
+            segments[0].0,
+            segments[0].1,
+            Theme::monochrome_for_tests(),
+            true,
+            0,
+            false,
+        );
+        let second = render_markdown_segment_with_completion(
+            source,
+            segments[1].0,
+            segments[1].1,
+            Theme::monochrome_for_tests(),
+            true,
+            1,
+            false,
+        );
+
+        assert!(!line_text(&first).contains("(e"));
+        assert!(line_text(&second).starts_with("(e.g."));
     }
 
     #[test]
