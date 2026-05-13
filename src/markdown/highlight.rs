@@ -393,6 +393,30 @@ mod tests {
         assert_eq!(line_text(&line), "a bold code");
     }
 
+    #[test]
+    fn inactive_checkbox_renders_full_marker() {
+        let line = render_markdown_line("- [ ] todo", Theme::monochrome_for_tests(), false);
+        assert_eq!(line_text(&line), "- [ ] todo");
+    }
+
+    #[test]
+    fn inactive_checked_checkbox_renders_full_marker() {
+        let line = render_markdown_line("- [x] done", Theme::monochrome_for_tests(), false);
+        assert_eq!(line_text(&line), "- [x] done");
+    }
+
+    #[test]
+    fn inactive_numbered_list_renders_full_marker() {
+        let line = render_markdown_line("1. first item", Theme::monochrome_for_tests(), false);
+        assert_eq!(line_text(&line), "1. first item");
+    }
+
+    #[test]
+    fn inactive_numbered_list_multi_digit() {
+        let line = render_markdown_line("10. tenth item", Theme::monochrome_for_tests(), false);
+        assert_eq!(line_text(&line), "10. tenth item");
+    }
+
     fn line_text(line: &Line<'static>) -> String {
         line.spans
             .iter()
