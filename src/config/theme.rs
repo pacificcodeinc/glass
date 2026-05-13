@@ -32,6 +32,7 @@ impl Theme {
         let background = Color::Reset;
         let text = Color::Reset;
         let muted = Color::DarkGray;
+        let link = Color::Rgb(0, 81, 213);
         let selection_bg = Color::Gray;
         let selection_fg = Color::Black;
         let (status_bg, status_fg) = if is_light_terminal() {
@@ -45,7 +46,7 @@ impl Theme {
             text,
             muted,
             heading: Style::default().fg(text).add_modifier(Modifier::BOLD),
-            link: Style::default().fg(text).add_modifier(Modifier::UNDERLINED),
+            link: Style::default().fg(link).add_modifier(Modifier::UNDERLINED),
             inline_code: Style::default().fg(text).add_modifier(Modifier::DIM),
             quote: Style::default().fg(muted).add_modifier(Modifier::ITALIC),
             list_marker: Style::default().fg(muted),

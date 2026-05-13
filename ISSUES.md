@@ -11,7 +11,7 @@
 - [x] Empty checkbox rows: marker-only lines like `- [ ] ` stay visible, scrollable, and reachable with `G`.
 - [x] Line deletion: `dd` and visual delete can remove the final blank line without a trailing ghost row.
 - [ ] Tables: render Markdown tables.
-- [ ] Wiki-links: render `[[File.md]]` distinctly and jump to the linked file.
+- [x] Wiki-links: render `[[File.md]]` distinctly and jump to the linked file.
 - [ ] Strikethrough: render `~~text~~`, including inside list items.
 - [x] Visual mode: make command handling work consistently.
 - [x] Scrolling: `j` and `k` keep wrapped cursor rows visible.
@@ -19,5 +19,7 @@
 - [x] Lists: nested content only renders sublists or inline formatting, not headings or other block elements.
 - [x] Vim motions: normal-mode `A` enters insert mode at the end of the line.
 - [x] Line deletion: `dd` preserves the cursor column when the next line is long enough.
-- [ ] Render URLS and links nicely
+- [x] URLs and links: render bare URLs, Markdown links, and wiki links nicely, and follow links with `gf`.
 - [ ] Undo `u` action
+- [x] hrefs: covered Markdown links do not leak URL fragments across wrapped visual rows.
+- [ ] Cmd+Delete is broken

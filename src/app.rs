@@ -1,4 +1,7 @@
-use std::path::{Path, PathBuf};
+use std::{
+    path::{Path, PathBuf},
+    process::Command as ProcessCommand,
+};
 
 use anyhow::{Context, Result};
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -13,6 +16,7 @@ use crate::{
         render::{visual_line_bounds, wrap_index_for_column, wrap_line},
     },
     fs::tree::FileTree,
+    markdown::inline::{LinkKind, link_at_column},
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -216,6 +220,7 @@ impl App {
             match key.code {
                 KeyCode::Char('g') => motions::document_start(&mut self.cursor),
                 KeyCode::Char('e') => motions::word_end_backward(&self.buffer, &mut self.cursor),
+                KeyCode::Char('f') => self.follow_link_under_cursor()?,
                 _ => {}
             }
             return Ok(());
@@ -246,7 +251,9 @@ impl App {
                 self.visual_line_anchor = Some(self.cursor.line);
             }
             KeyCode::Enter => {
-                self.toggle_checkbox();
+                if !self.toggle_checkbox() {
+                    self.follow_link_under_cursor()?;
+                }
             }
             KeyCode::Char(' ') => {
                 self.pending_leader = true;
@@ -357,6 +364,7 @@ impl App {
             match key.code {
                 KeyCode::Char('g') => motions::document_start(&mut self.cursor),
                 KeyCode::Char('e') => motions::word_end_backward(&self.buffer, &mut self.cursor),
+                KeyCode::Char('f') => self.follow_link_under_cursor()?,
                 _ => {}
             }
             return Ok(());
@@ -912,6 +920,54 @@ impl App {
         Ok(())
     }
 
+    fn follow_link_under_cursor(&mut self) -> Result<()> {
+        let line = self.buffer.line(self.cursor.line);
+        let source = line.trim_end_matches(['\r', '\n']);
+        let Some(link) = link_at_column(source, self.cursor.column) else {
+            self.status_message = "No link under cursor".to_string();
+            return Ok(());
+        };
+
+        let target = link.target.trim();
+        if target.is_empty() {
+            self.status_message = "No link under cursor".to_string();
+            return Ok(());
+        }
+
+        if is_external_link(target) {
+            let url = normalized_external_url(target);
+            open_external_url(&url)?;
+            self.status_message = format!("Opened {url}");
+            return Ok(());
+        }
+
+        let path = self.resolve_link_path(target, link.kind);
+        self.open_path(&path)
+    }
+
+    fn resolve_link_path(&self, target: &str, kind: LinkKind) -> PathBuf {
+        let target = target
+            .split_once('#')
+            .map(|(path, _)| path)
+            .unwrap_or(target);
+        let mut path = PathBuf::from(target);
+        if matches!(kind, LinkKind::Wiki) && path.extension().is_none() {
+            path.set_extension("md");
+        }
+
+        if path.is_absolute() {
+            return path;
+        }
+
+        let base_dir = self
+            .buffer
+            .path
+            .as_deref()
+            .and_then(Path::parent)
+            .unwrap_or(&self.notes_dir);
+        base_dir.join(path)
+    }
+
     fn keep_cursor_visible(&mut self) {
         self.buffer.clamp_cursor(&mut self.cursor);
         let width = self.wrap_width();
@@ -1241,6 +1297,39 @@ fn fuzzy_match(candidate: &str, query: &str) -> bool {
     false
 }
 
+fn is_external_link(target: &str) -> bool {
+    target.starts_with("https://") || target.starts_with("http://") || target.starts_with("www.")
+}
+
+fn normalized_external_url(target: &str) -> String {
+    if target.starts_with("www.") {
+        format!("https://{target}")
+    } else {
+        target.to_string()
+    }
+}
+
+fn open_external_url(url: &str) -> Result<()> {
+    let mut command = if cfg!(target_os = "macos") {
+        let mut command = ProcessCommand::new("open");
+        command.arg(url);
+        command
+    } else if cfg!(target_os = "windows") {
+        let mut command = ProcessCommand::new("cmd");
+        command.args(["/C", "start", "", url]);
+        command
+    } else {
+        let mut command = ProcessCommand::new("xdg-open");
+        command.arg(url);
+        command
+    };
+
+    command
+        .spawn()
+        .with_context(|| format!("failed to open URL: {url}"))?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1473,6 +1562,53 @@ mod tests {
         press_modified(&mut app, KeyCode::Char('b'), KeyModifiers::ALT);
 
         assert_eq!(app.command_line, "q");
+    }
+
+    #[test]
+    fn gf_without_link_sets_status_message() {
+        let mut app = test_app("plain text");
+
+        press(&mut app, KeyCode::Char('g'));
+        press(&mut app, KeyCode::Char('f'));
+
+        assert_eq!(app.status_message, "No link under cursor");
+    }
+
+    #[test]
+    fn gf_opens_relative_markdown_link_under_cursor() {
+        let root = std::env::temp_dir().join(format!(
+            "glass-link-test-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let notes = root.join("notes");
+        std::fs::create_dir_all(&notes).unwrap();
+        let index = notes.join("index.md");
+        let target = notes.join("target.md");
+        std::fs::write(&target, "target").unwrap();
+
+        let mut app = test_app("[Target](target.md)");
+        app.notes_dir = notes;
+        app.buffer.path = Some(index);
+        app.cursor = Cursor { line: 0, column: 2 };
+
+        press(&mut app, KeyCode::Char('g'));
+        press(&mut app, KeyCode::Char('f'));
+
+        assert_eq!(app.buffer.path.as_deref(), Some(target.as_path()));
+        assert_eq!(app.buffer.as_string(), "target");
+    }
+
+    #[test]
+    fn wiki_link_paths_default_to_markdown_files() {
+        let mut app = test_app("[[Daily Note]]");
+        app.notes_dir = PathBuf::from("/notes");
+
+        let path = app.resolve_link_path("Daily Note", LinkKind::Wiki);
+
+        assert_eq!(path, PathBuf::from("/notes/Daily Note.md"));
     }
 
     #[test]

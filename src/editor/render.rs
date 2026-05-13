@@ -3,7 +3,10 @@ use crate::editor::buffer::DocumentBuffer;
 #[derive(Debug, Clone)]
 pub struct VisibleRow {
     pub line_number: usize,
+    pub full_text: String,
     pub text: String,
+    pub source_start: usize,
+    pub source_end: usize,
     pub wrap_index: usize,
     pub continuation_indent: usize,
     pub completed: bool,
@@ -27,7 +30,10 @@ pub fn visible_rows(
         if trimmed.is_empty() {
             rows.push(VisibleRow {
                 line_number: line,
+                full_text: String::new(),
                 text: String::new(),
+                source_start: 0,
+                source_end: 0,
                 wrap_index: 0,
                 continuation_indent: 0,
                 completed: false,
@@ -49,7 +55,10 @@ pub fn visible_rows(
             let chunk: String = chars[start..end].iter().collect();
             rows.push(VisibleRow {
                 line_number: line,
+                full_text: trimmed.to_string(),
                 text: chunk,
+                source_start: start,
+                source_end: end,
                 wrap_index,
                 continuation_indent: if wrap_index > 0 { marker_len } else { 0 },
                 completed,
