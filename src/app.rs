@@ -62,6 +62,7 @@ pub struct App {
     pub should_quit: bool,
     pub visual_line_anchor: Option<usize>,
     preferred_column: Option<usize>,
+    preferred_visual_column: Option<usize>,
     pending_g: bool,
     pending_delete: bool,
     pending_change: bool,
@@ -91,6 +92,7 @@ impl App {
             should_quit: false,
             visual_line_anchor: None,
             preferred_column: None,
+            preferred_visual_column: None,
             pending_g: false,
             pending_delete: false,
             pending_change: false,
@@ -777,6 +779,7 @@ impl App {
 
     fn reset_preferred_column(&mut self) {
         self.preferred_column = None;
+        self.preferred_visual_column = None;
     }
 
     fn move_to_line_preserving_column(&mut self, line: usize) {
@@ -803,22 +806,68 @@ impl App {
         self.move_to_line_preserving_column(self.buffer.line_count().saturating_sub(1));
     }
 
+    fn preferred_visual_column(&mut self, segment_start: usize) -> usize {
+        match self.preferred_visual_column {
+            Some(column) => column,
+            None => {
+                let column = self.cursor.column.saturating_sub(segment_start);
+                self.preferred_visual_column = Some(column);
+                column
+            }
+        }
+    }
+
+    fn move_to_visual_segment_preserving_column(
+        &mut self,
+        line: usize,
+        segment_index: usize,
+        width: usize,
+    ) {
+        let line = line.min(self.buffer.line_count().saturating_sub(1));
+        let line_text = self.buffer.line(line);
+        let (segments, _) = wrap_line(line_text.trim_end_matches(['\r', '\n']), width);
+        let Some(&(start, end)) = segments.get(segment_index) else {
+            self.cursor.line = line;
+            self.cursor.column = self.buffer.line_len_chars(line);
+            return;
+        };
+
+        let column = self.preferred_visual_column(start);
+        let max_col = visual_segment_max_column(
+            &segments,
+            segment_index,
+            self.buffer.line_len_chars(line),
+            end,
+        );
+        self.cursor.line = line;
+        self.cursor.column = (start + column).min(max_col);
+    }
+
     fn visual_line_down(&mut self) {
         let line_text = self.buffer.line(self.cursor.line);
         let width = self.wrap_width();
         let (segments, _) = wrap_line(line_text.trim_end_matches(['\r', '\n']), width);
         let current_seg = wrap_index_for_column(&line_text, self.cursor.column, width);
+        let segment_start = segments
+            .get(current_seg)
+            .map(|(start, _)| *start)
+            .unwrap_or_default();
+        let rel = self.preferred_visual_column(segment_start);
         if current_seg + 1 < segments.len() {
-            let rel = self.cursor.column.saturating_sub(segments[current_seg].0);
             let (next_start, next_end) = segments[current_seg + 1];
-            let max_col = next_end.saturating_sub(1);
+            let max_col = visual_segment_max_column(
+                &segments,
+                current_seg + 1,
+                self.buffer.line_len_chars(self.cursor.line),
+                next_end,
+            );
             self.cursor.column = if next_start + rel > max_col {
                 max_col
             } else {
                 next_start + rel
             };
         } else if self.cursor.line + 1 < self.buffer.line_count() {
-            self.move_line_down_preserving_column();
+            self.move_to_visual_segment_preserving_column(self.cursor.line + 1, 0, width);
         }
     }
 
@@ -827,17 +876,34 @@ impl App {
         let width = self.wrap_width();
         let (segments, _) = wrap_line(line_text.trim_end_matches(['\r', '\n']), width);
         let current_seg = wrap_index_for_column(&line_text, self.cursor.column, width);
+        let segment_start = segments
+            .get(current_seg)
+            .map(|(start, _)| *start)
+            .unwrap_or_default();
+        let rel = self.preferred_visual_column(segment_start);
         if current_seg > 0 {
-            let rel = self.cursor.column.saturating_sub(segments[current_seg].0);
             let (prev_start, prev_end) = segments[current_seg - 1];
-            let max_col = prev_end.saturating_sub(1);
+            let max_col = visual_segment_max_column(
+                &segments,
+                current_seg - 1,
+                self.buffer.line_len_chars(self.cursor.line),
+                prev_end,
+            );
             self.cursor.column = if prev_start + rel > max_col {
                 max_col
             } else {
                 prev_start + rel
             };
         } else if self.cursor.line > 0 {
-            self.move_line_up_preserving_column();
+            let previous_line = self.cursor.line - 1;
+            let previous_text = self.buffer.line(previous_line);
+            let (previous_segments, _) =
+                wrap_line(previous_text.trim_end_matches(['\r', '\n']), width);
+            self.move_to_visual_segment_preserving_column(
+                previous_line,
+                previous_segments.len().saturating_sub(1),
+                width,
+            );
         }
     }
 
@@ -1073,6 +1139,19 @@ fn visual_position_before(
     line < other_line || (line == other_line && wrap_index < other_wrap_index)
 }
 
+fn visual_segment_max_column(
+    segments: &[(usize, usize)],
+    segment_index: usize,
+    line_len: usize,
+    segment_end: usize,
+) -> usize {
+    if segments.len() == 1 && segment_index == 0 {
+        line_len
+    } else {
+        segment_end.saturating_sub(1).min(line_len)
+    }
+}
+
 fn is_text_input_key(key: KeyEvent) -> bool {
     !key.modifiers
         .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER)
@@ -1259,6 +1338,7 @@ mod tests {
             should_quit: false,
             visual_line_anchor: None,
             preferred_column: None,
+            preferred_visual_column: None,
             pending_g: false,
             pending_delete: false,
             pending_change: false,
@@ -1337,6 +1417,7 @@ mod tests {
     #[test]
     fn vertical_movement_restores_preferred_column_after_short_line() {
         let mut app = test_app("abcdef\nx\nabcdef");
+        app.resize_viewport(5, 80);
         app.cursor = Cursor { line: 0, column: 5 };
 
         press(&mut app, KeyCode::Char('j'));
@@ -1344,6 +1425,38 @@ mod tests {
 
         press(&mut app, KeyCode::Char('j'));
         assert_eq!(app.cursor, Cursor { line: 2, column: 5 });
+    }
+
+    #[test]
+    fn wrapped_visual_movement_restores_preferred_column_after_short_segment() {
+        let mut app = test_app("abcdef gh ijklmnop");
+        app.resize_viewport(5, 10);
+        app.cursor = Cursor { line: 0, column: 5 };
+
+        press(&mut app, KeyCode::Char('j'));
+        assert_eq!(app.cursor, Cursor { line: 0, column: 8 });
+
+        press(&mut app, KeyCode::Char('j'));
+        assert_eq!(
+            app.cursor,
+            Cursor {
+                line: 0,
+                column: 15
+            }
+        );
+    }
+
+    #[test]
+    fn wrapped_visual_movement_preserves_column_across_physical_lines() {
+        let mut app = test_app("abcdef gh\nijklmnop");
+        app.resize_viewport(5, 10);
+        app.cursor = Cursor { line: 0, column: 5 };
+
+        press(&mut app, KeyCode::Char('j'));
+        assert_eq!(app.cursor, Cursor { line: 0, column: 8 });
+
+        press(&mut app, KeyCode::Char('j'));
+        assert_eq!(app.cursor, Cursor { line: 1, column: 5 });
     }
 
     #[test]
