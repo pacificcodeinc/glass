@@ -11,6 +11,13 @@ pub struct DocumentBuffer {
     text: Rope,
     pub dirty: bool,
     saved_text: Rope,
+    undo_stack: Vec<BufferSnapshot>,
+}
+
+#[derive(Debug, Clone)]
+struct BufferSnapshot {
+    text: Rope,
+    cursor: Cursor,
 }
 
 impl DocumentBuffer {
@@ -21,6 +28,7 @@ impl DocumentBuffer {
             text: text.clone(),
             saved_text: text,
             dirty: false,
+            undo_stack: Vec::new(),
         }
     }
 
@@ -33,6 +41,7 @@ impl DocumentBuffer {
             saved_text: text.clone(),
             text,
             dirty: false,
+            undo_stack: Vec::new(),
         })
     }
 
@@ -45,6 +54,7 @@ impl DocumentBuffer {
                 saved_text: Rope::new(),
                 text: Rope::new(),
                 dirty: false,
+                undo_stack: Vec::new(),
             })
         }
     }
@@ -83,9 +93,14 @@ impl DocumentBuffer {
     }
 
     pub fn insert_char(&mut self, cursor: &mut Cursor, ch: char) {
+        self.push_undo_snapshot(*cursor);
+        self.insert_char_raw(cursor, ch);
+    }
+
+    fn insert_char_raw(&mut self, cursor: &mut Cursor, ch: char) {
         let index = self.char_index(*cursor);
         self.text.insert_char(index, ch);
-        self.dirty = self.text != self.saved_text;
+        self.update_dirty();
 
         if ch == '\n' {
             cursor.line += 1;
@@ -96,8 +111,13 @@ impl DocumentBuffer {
     }
 
     pub fn insert_str(&mut self, cursor: &mut Cursor, value: &str) {
+        if value.is_empty() {
+            return;
+        }
+
+        self.push_undo_snapshot(*cursor);
         for ch in value.chars() {
-            self.insert_char(cursor, ch);
+            self.insert_char_raw(cursor, ch);
         }
     }
 
@@ -111,6 +131,7 @@ impl DocumentBuffer {
             return;
         }
 
+        self.push_undo_snapshot(*cursor);
         let previous = end - 1;
         let previous_line_len = if cursor.column == 0 {
             Some(self.line_len_chars(cursor.line.saturating_sub(1)))
@@ -118,7 +139,7 @@ impl DocumentBuffer {
             None
         };
         self.text.remove(previous..end);
-        self.dirty = self.text != self.saved_text;
+        self.update_dirty();
 
         if cursor.column > 0 {
             cursor.column -= 1;
@@ -134,12 +155,23 @@ impl DocumentBuffer {
             return;
         }
 
+        self.push_undo_snapshot(*cursor);
         self.text.remove(start..start + 1);
-        self.dirty = self.text != self.saved_text;
+        self.update_dirty();
         self.clamp_cursor(cursor);
     }
 
     pub fn delete_range(&mut self, start: usize, end: usize, cursor: &mut Cursor) {
+        self.delete_range_impl(start, end, cursor, true);
+    }
+
+    fn delete_range_impl(
+        &mut self,
+        start: usize,
+        end: usize,
+        cursor: &mut Cursor,
+        record_undo: bool,
+    ) {
         let start = start.min(self.text.len_chars());
         let end = end.min(self.text.len_chars());
         let (start, end) = if start <= end {
@@ -152,9 +184,42 @@ impl DocumentBuffer {
             return;
         }
 
+        if record_undo {
+            self.push_undo_snapshot(*cursor);
+        }
         self.text.remove(start..end);
-        self.dirty = self.text != self.saved_text;
+        self.update_dirty();
         *cursor = self.cursor_from_char_index(start);
+        self.clamp_cursor(cursor);
+    }
+
+    pub fn replace_range(
+        &mut self,
+        start: usize,
+        end: usize,
+        replacement: &str,
+        cursor: &mut Cursor,
+    ) {
+        let start = start.min(self.text.len_chars());
+        let end = end.min(self.text.len_chars());
+        let (start, end) = if start <= end {
+            (start, end)
+        } else {
+            (end, start)
+        };
+        if start == end && replacement.is_empty() {
+            return;
+        }
+
+        self.push_undo_snapshot(*cursor);
+        if start != end {
+            self.text.remove(start..end);
+        }
+        if !replacement.is_empty() {
+            self.text.insert(start, replacement);
+        }
+        self.update_dirty();
+        *cursor = self.cursor_from_char_index(start + replacement.chars().count());
         self.clamp_cursor(cursor);
     }
 
@@ -202,6 +267,37 @@ impl DocumentBuffer {
 
     pub fn as_string(&self) -> String {
         self.text.to_string()
+    }
+
+    pub fn undo(&mut self, cursor: &mut Cursor) -> bool {
+        let Some(snapshot) = self.undo_stack.pop() else {
+            return false;
+        };
+
+        self.text = snapshot.text;
+        self.update_dirty();
+        *cursor = snapshot.cursor;
+        self.clamp_cursor(cursor);
+        true
+    }
+
+    fn push_undo_snapshot(&mut self, cursor: Cursor) {
+        if self
+            .undo_stack
+            .last()
+            .is_some_and(|snapshot| snapshot.text == self.text && snapshot.cursor == cursor)
+        {
+            return;
+        }
+
+        self.undo_stack.push(BufferSnapshot {
+            text: self.text.clone(),
+            cursor,
+        });
+    }
+
+    fn update_dirty(&mut self) {
+        self.dirty = self.text != self.saved_text;
     }
 
     fn visible_len_lines(&self) -> usize {
@@ -264,6 +360,37 @@ mod tests {
 
         assert_eq!(buffer.as_string(), "one ");
         assert_eq!(cursor, Cursor { line: 0, column: 4 });
+    }
+
+    #[test]
+    fn undo_restores_text_and_cursor() {
+        let mut buffer = DocumentBuffer::empty();
+        let mut cursor = Cursor::default();
+        buffer.insert_str(&mut cursor, "abc");
+
+        assert!(buffer.undo(&mut cursor));
+
+        assert_eq!(buffer.as_string(), "");
+        assert_eq!(cursor, Cursor::default());
+        assert!(!buffer.dirty);
+    }
+
+    #[test]
+    fn undo_replace_range_is_atomic() {
+        let mut buffer = DocumentBuffer::empty();
+        let mut cursor = Cursor::default();
+        buffer.insert_str(&mut cursor, "- [ ] todo");
+        buffer.undo_stack.clear();
+        buffer.dirty = false;
+        cursor = Cursor { line: 0, column: 3 };
+        let start = buffer.char_index(cursor);
+
+        buffer.replace_range(start, start + 1, "x", &mut cursor);
+        assert_eq!(buffer.as_string(), "- [x] todo");
+
+        assert!(buffer.undo(&mut cursor));
+        assert_eq!(buffer.as_string(), "- [ ] todo");
+        assert_eq!(cursor, Cursor { line: 0, column: 3 });
     }
 
     #[test]

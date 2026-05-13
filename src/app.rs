@@ -309,6 +309,7 @@ impl App {
             }
             KeyCode::Char('G') => motions::document_end(&self.buffer, &mut self.cursor),
             KeyCode::Char('g') => self.pending_g = true,
+            KeyCode::Char('u') => self.undo(),
             KeyCode::Char('x') | KeyCode::Delete => self.buffer.delete_char(&mut self.cursor),
             _ => {}
         }
@@ -474,6 +475,14 @@ impl App {
         motions::word_backward(&self.buffer, &mut target);
         let start = self.buffer.char_index(target);
         self.buffer.delete_range(start, end, &mut self.cursor);
+    }
+
+    fn undo(&mut self) {
+        if self.buffer.undo(&mut self.cursor) {
+            self.status_message = "Undid change".to_string();
+        } else {
+            self.status_message = "Already at oldest change".to_string();
+        }
     }
 
     fn change_motion(&mut self, key: KeyEvent) {
@@ -1105,13 +1114,9 @@ impl App {
                 line: original_cursor.line,
                 column: col,
             });
-            self.buffer.delete_range(start, start + 1, &mut self.cursor);
-            self.cursor.column = col;
-            if unchecked {
-                self.buffer.insert_str(&mut self.cursor, "x");
-            } else {
-                self.buffer.insert_str(&mut self.cursor, " ");
-            }
+            let replacement = if unchecked { "x" } else { " " };
+            self.buffer
+                .replace_range(start, start + 1, replacement, &mut self.cursor);
             self.cursor = original_cursor;
             return true;
         }
@@ -1171,8 +1176,7 @@ fn insert_newline_with_list_continuation(buffer: &mut DocumentBuffer, cursor: &m
     match list_continuation_after_enter(&current_line, cursor.column) {
         ListContinuation::None => buffer.insert_char(cursor, '\n'),
         ListContinuation::Continue(prefix) => {
-            buffer.insert_char(cursor, '\n');
-            buffer.insert_str(cursor, &prefix);
+            buffer.insert_str(cursor, &format!("\n{prefix}"));
         }
         ListContinuation::EndList { delete_to_column } => {
             let line = cursor.line;
@@ -1182,11 +1186,9 @@ fn insert_newline_with_list_continuation(buffer: &mut DocumentBuffer, cursor: &m
                 line,
                 column: delete_to_column,
             });
-            buffer.delete_range(start, end, cursor);
+            let replacement = if had_line_ending { "" } else { "\n" };
+            buffer.replace_range(start, end, replacement, cursor);
             *cursor = Cursor { line, column: 0 };
-            if !had_line_ending {
-                buffer.insert_char(cursor, '\n');
-            }
         }
     }
 }
@@ -1562,6 +1564,32 @@ mod tests {
         press_modified(&mut app, KeyCode::Char('b'), KeyModifiers::ALT);
 
         assert_eq!(app.command_line, "q");
+    }
+
+    #[test]
+    fn normal_mode_u_undoes_last_insert() {
+        let mut app = test_app("");
+        app.mode = Mode::Insert;
+
+        press(&mut app, KeyCode::Char('a'));
+        press(&mut app, KeyCode::Esc);
+        press(&mut app, KeyCode::Char('u'));
+
+        assert_eq!(app.buffer.as_string(), "");
+        assert_eq!(app.cursor, Cursor::default());
+        assert_eq!(app.status_message, "Undid change");
+    }
+
+    #[test]
+    fn normal_mode_u_undoes_checkbox_toggle_atomically() {
+        let mut app = test_app("- [ ] todo");
+        app.cursor = Cursor { line: 0, column: 0 };
+
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.buffer.as_string(), "- [x] todo");
+
+        press(&mut app, KeyCode::Char('u'));
+        assert_eq!(app.buffer.as_string(), "- [ ] todo");
     }
 
     #[test]

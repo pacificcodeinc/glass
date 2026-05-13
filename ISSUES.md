@@ -20,6 +20,6 @@
 - [x] Vim motions: normal-mode `A` enters insert mode at the end of the line.
 - [x] Line deletion: `dd` preserves the cursor column when the next line is long enough.
 - [x] URLs and links: render bare URLs, Markdown links, and wiki links nicely, and follow links with `gf`.
-- [ ] Undo `u` action
-- [x] hrefs: covered Markdown links do not leak URL fragments across wrapped visual rows.
+- [x] Undo `u` action: normal-mode `u` restores text and cursor for recent edits.
+- [ ] hrefs: covered Markdown links do not leak URL fragments across wrapped visual rows.
 - [ ] Cmd+Delete is broken
