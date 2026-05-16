@@ -32,10 +32,15 @@ impl Theme {
         let background = Color::Reset;
         let text = Color::Reset;
         let muted = Color::DarkGray;
-        let link = Color::Rgb(0, 81, 213);
+        let light_terminal = is_light_terminal();
+        let link = if light_terminal {
+            Color::Rgb(0, 81, 213)
+        } else {
+            Color::Rgb(89, 168, 255)
+        };
         let selection_bg = Color::Gray;
         let selection_fg = Color::Black;
-        let (status_bg, status_fg) = if is_light_terminal() {
+        let (status_bg, status_fg) = if light_terminal {
             (Color::Black, Color::White)
         } else {
             (Color::White, Color::Black)
