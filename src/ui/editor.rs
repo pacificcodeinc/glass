@@ -1,13 +1,13 @@
 use ratatui::{
-    Frame,
     layout::{Position, Rect},
     style::Style,
     text::{Line, Span, Text},
     widgets::Paragraph,
+    Frame,
 };
 
 use crate::{
-    app::{App, Mode},
+    app::{App, Mode, SearchMatch},
     config::theme::Theme,
     editor::render::{
         column_in_wrap_segment, detect_list_marker, visible_rows, wrap_index_for_column, wrap_line,
@@ -86,6 +86,16 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App, theme: Theme) {
                 row.completed && row.wrap_index > 0,
             );
 
+            if !app.search.query.is_empty() {
+                let ranges = search_ranges_for_row(
+                    &app.search.matches,
+                    row.line_number,
+                    row.source_start,
+                    row.source_end,
+                );
+                line = highlight_search_ranges(line, &ranges, theme);
+            }
+
             if row.continuation_indent > 0 {
                 let indent = Span::raw(" ".repeat(row.continuation_indent));
                 line.spans.insert(0, indent);
@@ -149,4 +159,165 @@ fn selected_line(mut line: Line<'static>, theme: Theme) -> Line<'static> {
         span.style = theme.selection;
     }
     line
+}
+
+fn highlight_search_ranges(
+    mut line: Line<'static>,
+    ranges: &[(usize, usize)],
+    theme: Theme,
+) -> Line<'static> {
+    if ranges.is_empty() {
+        return line;
+    }
+
+    let ranges = merged_ranges(ranges);
+    if ranges.is_empty() {
+        return line;
+    }
+
+    let original_spans = std::mem::take(&mut line.spans);
+    let mut highlighted = Vec::new();
+    let mut span_start = 0usize;
+
+    for span in original_spans {
+        let text = span.content.into_owned();
+        let span_len = text.chars().count();
+        let span_end = span_start + span_len;
+        let mut local_cursor = 0usize;
+
+        for &(range_start, range_end) in &ranges {
+            if range_end <= span_start || range_start >= span_end {
+                continue;
+            }
+
+            let local_start = range_start.max(span_start) - span_start;
+            let local_end = range_end.min(span_end) - span_start;
+            if local_cursor < local_start {
+                highlighted.push(Span::styled(
+                    char_slice(&text, local_cursor, local_start),
+                    span.style,
+                ));
+            }
+            highlighted.push(Span::styled(
+                char_slice(&text, local_start, local_end),
+                theme.selection,
+            ));
+            local_cursor = local_end;
+        }
+
+        if local_cursor < span_len {
+            highlighted.push(Span::styled(
+                char_slice(&text, local_cursor, span_len),
+                span.style,
+            ));
+        }
+
+        span_start = span_end;
+    }
+
+    line.spans = highlighted;
+    line
+}
+
+fn search_ranges_for_row(
+    matches: &[SearchMatch],
+    line_number: usize,
+    source_start: usize,
+    source_end: usize,
+) -> Vec<(usize, usize)> {
+    let mut ranges = Vec::new();
+
+    for search_match in matches {
+        if search_match.end_line < line_number || search_match.line > line_number {
+            continue;
+        }
+
+        let start = if search_match.line == line_number {
+            search_match.column
+        } else {
+            source_start
+        };
+        let end = if search_match.end_line == line_number {
+            search_match.end_column
+        } else {
+            source_end
+        };
+
+        let start = start.max(source_start);
+        let end = end.min(source_end);
+        if start < end {
+            ranges.push((start - source_start, end - source_start));
+        }
+    }
+
+    ranges
+}
+
+fn merged_ranges(ranges: &[(usize, usize)]) -> Vec<(usize, usize)> {
+    let mut ranges = ranges
+        .iter()
+        .copied()
+        .filter(|(start, end)| start < end)
+        .collect::<Vec<_>>();
+    ranges.sort_unstable_by_key(|(start, end)| (*start, *end));
+
+    let mut merged: Vec<(usize, usize)> = Vec::new();
+    for (start, end) in ranges {
+        if let Some((_, last_end)) = merged.last_mut() {
+            if start <= *last_end {
+                *last_end = (*last_end).max(end);
+                continue;
+            }
+        }
+
+        merged.push((start, end));
+    }
+
+    merged
+}
+
+fn char_slice(text: &str, start: usize, end: usize) -> String {
+    text.chars()
+        .skip(start)
+        .take(end.saturating_sub(start))
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn search_highlight_splits_requested_ranges() {
+        let theme = Theme::monochrome_for_tests();
+        let line = Line::from(vec![
+            Span::styled("before ", Style::default().fg(theme.text)),
+            Span::styled("needle after", Style::default().fg(theme.text)),
+        ]);
+
+        let line = highlight_search_ranges(line, &[(7, 13)], theme);
+
+        assert_eq!(line.spans.len(), 3);
+        assert_eq!(line.spans[1].content.as_ref(), "needle");
+        assert_eq!(line.spans[1].style, theme.selection);
+    }
+
+    #[test]
+    fn search_ranges_split_across_wrapped_rows() {
+        let search_match = SearchMatch {
+            line: 0,
+            column: 5,
+            end_line: 0,
+            end_column: 12,
+        };
+
+        assert_eq!(
+            search_ranges_for_row(&[search_match], 0, 0, 8),
+            vec![(5, 8)]
+        );
+        assert_eq!(
+            search_ranges_for_row(&[search_match], 0, 8, 16),
+            vec![(0, 4)]
+        );
+    }
 }

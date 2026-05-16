@@ -10,14 +10,14 @@ use crate::{
     config::theme::Theme,
     editor::{
         buffer::DocumentBuffer,
-        commands::{Command, parse_command},
+        commands::{parse_command, Command},
         cursor::Cursor,
         motions,
         render::{visual_line_bounds, wrap_index_for_column, wrap_line},
     },
     fs::tree::FileTree,
     markdown::highlight::concealed_wrap_line,
-    markdown::inline::{LinkKind, link_at_column},
+    markdown::inline::{link_at_column, LinkKind},
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -26,6 +26,80 @@ pub enum Mode {
     Insert,
     CommandLine,
     Visual,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommandPrompt {
+    Command,
+    Search,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SheetItemKind {
+    Command,
+    File,
+    Search,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SheetAction {
+    Command(String),
+    Complete(String),
+    File(PathBuf),
+    Search {
+        line: usize,
+        column: usize,
+        end_line: usize,
+        end_column: usize,
+    },
+    BeginSearch,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SheetItem {
+    pub kind: SheetItemKind,
+    pub label: String,
+    pub detail: String,
+    pub replacement: String,
+    pub action: SheetAction,
+}
+
+#[derive(Debug, Clone)]
+pub struct CommandSheetState {
+    pub items: Vec<SheetItem>,
+    pub selected: usize,
+    pub prompt: CommandPrompt,
+    pub return_mode: Mode,
+    pub return_visual_line_anchor: Option<usize>,
+    pub explicit_selection: bool,
+}
+
+impl Default for CommandSheetState {
+    fn default() -> Self {
+        Self {
+            items: Vec::new(),
+            selected: 0,
+            prompt: CommandPrompt::Command,
+            return_mode: Mode::Normal,
+            return_visual_line_anchor: None,
+            explicit_selection: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SearchMatch {
+    pub line: usize,
+    pub column: usize,
+    pub end_line: usize,
+    pub end_column: usize,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct SearchState {
+    pub query: String,
+    pub matches: Vec<SearchMatch>,
+    pub selected: usize,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -52,12 +126,15 @@ impl Default for Viewport {
 #[derive(Debug)]
 pub struct App {
     pub notes_dir: PathBuf,
+    pub file_tree: FileTree,
     pub buffer: DocumentBuffer,
     pub cursor: Cursor,
     pub viewport: Viewport,
     pub mode: Mode,
     pub theme: Theme,
     pub command_line: String,
+    pub sheet: CommandSheetState,
+    pub search: SearchState,
     pub status_message: String,
     pub should_quit: bool,
     pub visual_line_anchor: Option<usize>,
@@ -82,12 +159,15 @@ impl App {
 
         Ok(Self {
             notes_dir,
+            file_tree,
             buffer,
             cursor: Cursor::default(),
             viewport: Viewport::default(),
             mode: Mode::Normal,
             theme: Theme::system(),
             command_line: String::new(),
+            sheet: CommandSheetState::default(),
+            search: SearchState::default(),
             status_message: "Glass".to_string(),
             should_quit: false,
             visual_line_anchor: None,
@@ -115,6 +195,11 @@ impl App {
 
         if key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Char('c') {
             self.request_quit(false)?;
+            return Ok(());
+        }
+
+        if self.mode != Mode::CommandLine && is_command_sheet_shortcut(key) {
+            self.enter_command_sheet(CommandPrompt::Command);
             return Ok(());
         }
 
@@ -171,6 +256,9 @@ impl App {
         match key.code {
             KeyCode::Char(':') => {
                 self.enter_command_line();
+            }
+            KeyCode::Char('/') => {
+                self.enter_search_sheet();
             }
             KeyCode::Char('v') | KeyCode::Char('V') => {
                 self.mode = Mode::Visual;
@@ -276,6 +364,8 @@ impl App {
             }
             KeyCode::Char('G') => self.document_end_preserving_column(),
             KeyCode::Char('g') => self.pending_g = true,
+            KeyCode::Char('n') => self.jump_search_match(1),
+            KeyCode::Char('N') => self.jump_search_match(-1),
             KeyCode::Char('u') => self.undo(),
             KeyCode::Char('x') | KeyCode::Delete => {
                 self.buffer.delete_char(&mut self.cursor);
@@ -371,6 +461,9 @@ impl App {
         match key.code {
             KeyCode::Char(':') => {
                 self.enter_command_line();
+            }
+            KeyCode::Char('/') => {
+                self.enter_search_sheet();
             }
             KeyCode::Esc => {
                 self.mode = Mode::Normal;
@@ -596,21 +689,29 @@ impl App {
     fn handle_command_key(&mut self, key: KeyEvent) -> Result<()> {
         match key.code {
             KeyCode::Esc => {
-                self.mode = Mode::Normal;
-                self.visual_line_anchor = None;
-                self.command_line.clear();
+                self.close_command_sheet();
             }
             KeyCode::Enter => {
-                let command = parse_command(&self.command_line);
-                self.command_line.clear();
-                self.mode = Mode::Normal;
-                self.visual_line_anchor = None;
-                self.execute_command(command)?;
+                self.accept_command_sheet()?;
             }
             KeyCode::Backspace => {
                 self.command_line.pop();
+                self.sheet.explicit_selection = false;
+                self.refresh_sheet_items();
             }
-            KeyCode::Char(ch) if is_text_input_key(key) => self.command_line.push(ch),
+            KeyCode::Tab | KeyCode::Down => self.move_sheet_selection(1),
+            KeyCode::BackTab | KeyCode::Up => self.move_sheet_selection(-1),
+            KeyCode::Right => self.apply_sheet_completion(),
+            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.command_line.clear();
+                self.sheet.explicit_selection = false;
+                self.refresh_sheet_items();
+            }
+            KeyCode::Char(ch) if is_text_input_key(key) => {
+                self.command_line.push(ch);
+                self.sheet.explicit_selection = false;
+                self.refresh_sheet_items();
+            }
             _ => {}
         }
 
@@ -618,9 +719,201 @@ impl App {
     }
 
     fn enter_command_line(&mut self) {
+        self.enter_command_sheet(CommandPrompt::Command);
+    }
+
+    fn enter_search_sheet(&mut self) {
+        self.enter_command_sheet(CommandPrompt::Search);
+    }
+
+    fn enter_command_sheet(&mut self, prompt: CommandPrompt) {
+        self.sheet.return_mode = self.mode;
+        self.sheet.return_visual_line_anchor = self.visual_line_anchor;
+        self.sheet.prompt = prompt;
+        self.sheet.selected = 0;
+        self.sheet.explicit_selection = false;
         self.mode = Mode::CommandLine;
         self.visual_line_anchor = None;
         self.command_line.clear();
+        self.refresh_sheet_items();
+    }
+
+    fn close_command_sheet(&mut self) {
+        if matches!(self.sheet.prompt, CommandPrompt::Search)
+            || self.command_line.trim().starts_with('/')
+        {
+            self.clear_search();
+        }
+        self.mode = self.sheet.return_mode;
+        self.visual_line_anchor = self.sheet.return_visual_line_anchor.take();
+        self.command_line.clear();
+        self.sheet.items.clear();
+        self.sheet.selected = 0;
+        self.sheet.explicit_selection = false;
+    }
+
+    fn finish_command_sheet(&mut self) {
+        self.mode = Mode::Normal;
+        self.visual_line_anchor = None;
+        self.command_line.clear();
+        self.sheet.items.clear();
+        self.sheet.selected = 0;
+        self.sheet.explicit_selection = false;
+    }
+
+    fn move_sheet_selection(&mut self, delta: isize) {
+        let len = self.sheet.items.len();
+        if len == 0 {
+            self.sheet.selected = 0;
+            return;
+        }
+
+        let current = self.sheet.selected.min(len - 1) as isize;
+        let next = (current + delta).rem_euclid(len as isize) as usize;
+        self.sheet.selected = next;
+        self.sheet.explicit_selection = true;
+    }
+
+    fn apply_sheet_completion(&mut self) {
+        let Some(item) = self.sheet.items.get(self.sheet.selected) else {
+            return;
+        };
+
+        match item.action {
+            SheetAction::BeginSearch => {
+                self.sheet.prompt = CommandPrompt::Search;
+                self.command_line.clear();
+            }
+            _ => {
+                self.command_line = item.replacement.clone();
+            }
+        }
+        self.sheet.selected = 0;
+        self.sheet.explicit_selection = false;
+        self.refresh_sheet_items();
+    }
+
+    fn accept_command_sheet(&mut self) -> Result<()> {
+        let input = self.command_line.trim().to_string();
+        if input.is_empty() {
+            self.finish_command_sheet();
+            return Ok(());
+        }
+
+        let selected = self.sheet.items.get(self.sheet.selected).cloned();
+        if self.sheet.explicit_selection {
+            if let Some(item) = selected {
+                return self.execute_sheet_item(item);
+            }
+        }
+
+        if matches!(self.sheet.prompt, CommandPrompt::Search) {
+            return self.execute_search_query(&input, selected);
+        }
+
+        if let Some(search_query) = input.strip_prefix('/') {
+            return self.execute_search_query(search_query.trim(), selected);
+        }
+
+        match parse_command(&input) {
+            Command::Unknown(_) => {
+                if let Some(item) =
+                    selected.filter(|item| !matches!(item.kind, SheetItemKind::Command))
+                {
+                    self.execute_sheet_item(item)
+                } else if let Some(path) = resolve_command_path_input(&input, &self.notes_dir) {
+                    self.finish_command_sheet();
+                    self.open_path(&path)
+                } else {
+                    self.finish_command_sheet();
+                    self.execute_command(Command::Unknown(input))
+                }
+            }
+            command => {
+                self.finish_command_sheet();
+                self.execute_command(command)
+            }
+        }
+    }
+
+    fn execute_sheet_item(&mut self, item: SheetItem) -> Result<()> {
+        match item.action {
+            SheetAction::Command(command) => {
+                self.finish_command_sheet();
+                self.execute_command(parse_command(&command))
+            }
+            SheetAction::Complete(value) => {
+                self.command_line = value;
+                self.sheet.selected = 0;
+                self.sheet.explicit_selection = false;
+                self.refresh_sheet_items();
+                Ok(())
+            }
+            SheetAction::File(path) => {
+                self.finish_command_sheet();
+                self.open_path(&path)
+            }
+            SheetAction::Search {
+                line,
+                column,
+                end_line,
+                end_column,
+            } => {
+                self.activate_search(
+                    &item.replacement,
+                    SearchMatch {
+                        line,
+                        column,
+                        end_line,
+                        end_column,
+                    },
+                );
+                self.finish_command_sheet();
+                self.cursor = Cursor { line, column };
+                self.reset_preferred_column();
+                self.status_message = format!("Found on line {}", line + 1);
+                Ok(())
+            }
+            SheetAction::BeginSearch => {
+                self.sheet.prompt = CommandPrompt::Search;
+                self.command_line.clear();
+                self.clear_search();
+                self.sheet.selected = 0;
+                self.sheet.explicit_selection = false;
+                self.refresh_sheet_items();
+                Ok(())
+            }
+        }
+    }
+
+    fn execute_search_query(&mut self, query: &str, selected: Option<SheetItem>) -> Result<()> {
+        if query.is_empty() {
+            self.clear_search();
+            self.finish_command_sheet();
+            self.status_message = "Search needs text".to_string();
+            return Ok(());
+        }
+
+        if let Some(item) = selected.filter(|item| matches!(item.kind, SheetItemKind::Search)) {
+            return self.execute_sheet_item(item);
+        }
+
+        if let Some(search_match) = first_search_match(&self.buffer, query) {
+            self.activate_search(query, search_match);
+            self.finish_command_sheet();
+            self.cursor = Cursor {
+                line: search_match.line,
+                column: search_match.column,
+            };
+            self.reset_preferred_column();
+            self.status_message = format!("Found on line {}", search_match.line + 1);
+        } else {
+            self.clear_search();
+            self.finish_command_sheet();
+            self.status_message = format!("No match: {query}");
+        }
+
+        Ok(())
     }
 
     fn execute_command(&mut self, command: Command) -> Result<()> {
@@ -640,8 +933,74 @@ impl App {
         Ok(())
     }
 
+    fn clear_search(&mut self) {
+        self.search = SearchState::default();
+    }
+
+    fn preview_search(&mut self, query: &str) {
+        let query = query.trim();
+        if query.is_empty() {
+            self.clear_search();
+            return;
+        }
+
+        self.search.query = query.to_string();
+        self.search.matches = search_matches_for_query(&self.buffer, query);
+        self.search.selected = 0;
+    }
+
+    fn activate_search(&mut self, query: &str, selected_match: SearchMatch) {
+        self.search.query = query.trim().to_string();
+        self.search.matches = search_matches_for_query(&self.buffer, query);
+        if self.search.matches.is_empty() {
+            self.search.matches.push(selected_match);
+        }
+        self.search.selected = self
+            .search
+            .matches
+            .iter()
+            .position(|candidate| *candidate == selected_match)
+            .unwrap_or_default();
+    }
+
+    fn jump_search_match(&mut self, delta: isize) {
+        if self.search.query.is_empty() {
+            self.status_message = "No active search".to_string();
+            return;
+        }
+
+        self.search.matches = search_matches_for_query(&self.buffer, &self.search.query);
+        if self.search.matches.is_empty() {
+            self.status_message = format!("No match: {}", self.search.query);
+            return;
+        }
+
+        let len = self.search.matches.len();
+        let current = self.search.selected.min(len - 1) as isize;
+        self.search.selected = (current + delta).rem_euclid(len as isize) as usize;
+        let search_match = self.search.matches[self.search.selected];
+        self.cursor = Cursor {
+            line: search_match.line,
+            column: search_match.column,
+        };
+        self.reset_preferred_column();
+        self.status_message = format!("Found on line {}", search_match.line + 1);
+    }
+
+    pub fn search_result_indicator(&self) -> Option<(usize, usize)> {
+        if self.search.query.is_empty() || self.search.matches.is_empty() {
+            return None;
+        }
+
+        Some((
+            self.search.selected.min(self.search.matches.len() - 1) + 1,
+            self.search.matches.len(),
+        ))
+    }
+
     fn save_current_file(&mut self) -> Result<()> {
         self.buffer.save()?;
+        self.refresh_file_tree()?;
         self.status_message = "Saved".to_string();
         Ok(())
     }
@@ -919,7 +1278,7 @@ impl App {
             self.notes_dir.join(path)
         };
 
-        self.buffer = DocumentBuffer::from_path(&path)?;
+        self.buffer = DocumentBuffer::from_path_or_empty(&path)?;
         self.cursor = Cursor::default();
         self.reset_preferred_column();
         self.viewport.top_line = 0;
@@ -927,6 +1286,45 @@ impl App {
         self.viewport.horizontal_offset = 0;
         self.status_message = format!("Opened {}", path.display());
         Ok(())
+    }
+
+    fn refresh_file_tree(&mut self) -> Result<()> {
+        self.file_tree = FileTree::load(&self.notes_dir).with_context(|| {
+            format!(
+                "failed to scan notes directory: {}",
+                self.notes_dir.display()
+            )
+        })?;
+        self.refresh_sheet_items();
+        Ok(())
+    }
+
+    fn refresh_sheet_items(&mut self) {
+        let input = self.command_line.trim().to_string();
+        let mut items = if matches!(self.sheet.prompt, CommandPrompt::Search) {
+            self.preview_search(&input);
+            search_sheet_items(&self.buffer, &input)
+        } else if let Some(search_query) = input.strip_prefix('/') {
+            let query = search_query.trim();
+            self.preview_search(query);
+            search_sheet_items(&self.buffer, query)
+        } else {
+            self.clear_search();
+            command_sheet_items(&input, &self.notes_dir, &self.file_tree)
+        };
+
+        items.truncate(128);
+        self.sheet.items = items.into_iter().map(|(_, item)| item).collect();
+        if self.sheet.selected >= self.sheet.items.len() {
+            self.sheet.selected = 0;
+            self.sheet.explicit_selection = false;
+        }
+    }
+
+    pub fn sheet_panel_height(&self, max_height: u16) -> u16 {
+        let content_rows = self.sheet.items.len() as u16;
+        let desired = content_rows.min(9);
+        desired.min(max_height.saturating_sub(1))
     }
 
     fn follow_link_under_cursor(&mut self) -> Result<()> {
@@ -1157,6 +1555,522 @@ fn is_text_input_key(key: KeyEvent) -> bool {
         .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER)
 }
 
+fn is_command_sheet_shortcut(key: KeyEvent) -> bool {
+    matches!(key.code, KeyCode::Char('p') | KeyCode::Char('P'))
+        && key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER)
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CommandCandidate {
+    replacement: &'static str,
+    label: &'static str,
+    detail: &'static str,
+    aliases: &'static [&'static str],
+    action: CommandCandidateAction,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum CommandCandidateAction {
+    Command(&'static str),
+    Complete(&'static str),
+    BeginSearch,
+}
+
+const COMMAND_CANDIDATES: &[CommandCandidate] = &[
+    CommandCandidate {
+        replacement: "w",
+        label: "write",
+        detail: "Save current file",
+        aliases: &["w", "write", "save"],
+        action: CommandCandidateAction::Command("w"),
+    },
+    CommandCandidate {
+        replacement: "q",
+        label: "quit",
+        detail: "Quit if there are no unsaved changes",
+        aliases: &["q", "quit", "close"],
+        action: CommandCandidateAction::Command("q"),
+    },
+    CommandCandidate {
+        replacement: "q!",
+        label: "quit!",
+        detail: "Quit and discard unsaved changes",
+        aliases: &["q!", "quit!", "force quit"],
+        action: CommandCandidateAction::Command("q!"),
+    },
+    CommandCandidate {
+        replacement: "wq",
+        label: "write quit",
+        detail: "Save current file and quit",
+        aliases: &["wq", "x", "write quit", "save quit"],
+        action: CommandCandidateAction::Command("wq"),
+    },
+    CommandCandidate {
+        replacement: "e ",
+        label: "edit",
+        detail: "Open a file path",
+        aliases: &["e", "edit", "open", "file"],
+        action: CommandCandidateAction::Complete("e "),
+    },
+    CommandCandidate {
+        replacement: "/",
+        label: "search",
+        detail: "Find text in the current document",
+        aliases: &["/", "search", "find"],
+        action: CommandCandidateAction::BeginSearch,
+    },
+];
+
+fn command_sheet_items(
+    input: &str,
+    notes_dir: &Path,
+    file_tree: &FileTree,
+) -> Vec<(usize, SheetItem)> {
+    let mut items = Vec::new();
+
+    for candidate in COMMAND_CANDIDATES {
+        if let Some(score) = score_command_candidate(input, candidate) {
+            items.push((1_000 + score, command_sheet_item(candidate)));
+        }
+    }
+
+    let file_query = file_query_for_command_input(input);
+    for entry in file_tree.entries.iter().filter(|entry| !entry.is_dir) {
+        if let Some(score) = score_file_entry(file_query, notes_dir, entry) {
+            let relative = relative_path_label(notes_dir, &entry.path);
+            items.push((
+                score,
+                SheetItem {
+                    kind: SheetItemKind::File,
+                    label: entry.display_name.clone(),
+                    detail: relative.clone(),
+                    replacement: if input.starts_with("e ") || input.starts_with("edit ") {
+                        format!("e {relative}")
+                    } else {
+                        relative
+                    },
+                    action: SheetAction::File(entry.path.clone()),
+                },
+            ));
+        }
+    }
+
+    items.sort_by(|left, right| {
+        left.0
+            .cmp(&right.0)
+            .then_with(|| left.1.label.cmp(&right.1.label))
+            .then_with(|| left.1.detail.cmp(&right.1.detail))
+    });
+    items
+}
+
+fn command_sheet_item(candidate: &CommandCandidate) -> SheetItem {
+    let action = match candidate.action {
+        CommandCandidateAction::Command(command) => SheetAction::Command(command.to_string()),
+        CommandCandidateAction::Complete(value) => SheetAction::Complete(value.to_string()),
+        CommandCandidateAction::BeginSearch => SheetAction::BeginSearch,
+    };
+
+    SheetItem {
+        kind: SheetItemKind::Command,
+        label: candidate.label.to_string(),
+        detail: candidate.detail.to_string(),
+        replacement: candidate.replacement.to_string(),
+        action,
+    }
+}
+
+fn score_command_candidate(input: &str, candidate: &CommandCandidate) -> Option<usize> {
+    let input = input.trim();
+    if input.is_empty() {
+        return Some(0);
+    }
+
+    candidate
+        .aliases
+        .iter()
+        .filter_map(|alias| score_fuzzy_text(input, alias))
+        .min()
+}
+
+fn file_query_for_command_input(input: &str) -> &str {
+    let input = input.trim();
+    if let Some((command, rest)) = input.split_once(' ') {
+        if matches!(command, "e" | "edit") {
+            return rest.trim();
+        }
+    }
+    input
+}
+
+fn resolve_command_path_input(input: &str, notes_dir: &Path) -> Option<PathBuf> {
+    let input = input.trim();
+    if input.is_empty() || input.contains(' ') {
+        return None;
+    }
+    if !(input.ends_with(".md") || input.contains('/') || input.contains('\\')) {
+        return None;
+    }
+
+    Some(if Path::new(input).is_absolute() {
+        PathBuf::from(input)
+    } else {
+        notes_dir.join(input)
+    })
+}
+
+fn search_sheet_items(buffer: &DocumentBuffer, query: &str) -> Vec<(usize, SheetItem)> {
+    let query = query.trim();
+    if query.is_empty() {
+        return Vec::new();
+    }
+
+    let exact_matches = exact_search_matches(buffer, query);
+    if !exact_matches.is_empty() {
+        return exact_matches
+            .into_iter()
+            .enumerate()
+            .map(|(index, search_match)| {
+                (
+                    index,
+                    SheetItem {
+                        kind: SheetItemKind::Search,
+                        label: format!("Line {}", search_match.line + 1),
+                        detail: search_match_preview(buffer, search_match),
+                        replacement: query.to_string(),
+                        action: SheetAction::Search {
+                            line: search_match.line,
+                            column: search_match.column,
+                            end_line: search_match.end_line,
+                            end_column: search_match.end_column,
+                        },
+                    },
+                )
+            })
+            .collect();
+    }
+
+    let mut items = Vec::new();
+    for line in 0..buffer.line_count() {
+        let raw = buffer.line(line);
+        let preview = raw.trim_end_matches(['\r', '\n']).trim().to_string();
+        if preview.is_empty() {
+            continue;
+        }
+
+        if let Some(score) = score_fuzzy_text(query, &preview) {
+            let column = search_match_column(query, &raw).unwrap_or_default();
+            let search_match = line_search_match(buffer, line, column, query);
+            items.push((
+                score + line,
+                SheetItem {
+                    kind: SheetItemKind::Search,
+                    label: format!("Line {}", line + 1),
+                    detail: preview,
+                    replacement: query.to_string(),
+                    action: SheetAction::Search {
+                        line,
+                        column,
+                        end_line: search_match.end_line,
+                        end_column: search_match.end_column,
+                    },
+                },
+            ));
+        }
+    }
+
+    items.sort_by(|left, right| {
+        left.0
+            .cmp(&right.0)
+            .then_with(|| left.1.label.cmp(&right.1.label))
+    });
+    items
+}
+
+fn first_search_match(buffer: &DocumentBuffer, query: &str) -> Option<SearchMatch> {
+    if let Some(search_match) = search_matches_for_query(buffer, query).into_iter().next() {
+        return Some(search_match);
+    }
+
+    search_sheet_items(buffer, query)
+        .into_iter()
+        .find_map(|(_, item)| match item.action {
+            SheetAction::Search {
+                line,
+                column,
+                end_line,
+                end_column,
+            } => Some(SearchMatch {
+                line,
+                column,
+                end_line,
+                end_column,
+            }),
+            _ => None,
+        })
+}
+
+fn search_matches_for_query(buffer: &DocumentBuffer, query: &str) -> Vec<SearchMatch> {
+    let exact_matches = exact_search_matches(buffer, query);
+    if !exact_matches.is_empty() {
+        return exact_matches;
+    }
+
+    search_sheet_items(buffer, query)
+        .into_iter()
+        .filter_map(|(_, item)| match item.action {
+            SheetAction::Search {
+                line,
+                column,
+                end_line,
+                end_column,
+            } => Some(SearchMatch {
+                line,
+                column,
+                end_line,
+                end_column,
+            }),
+            _ => None,
+        })
+        .collect()
+}
+
+fn line_search_match(
+    buffer: &DocumentBuffer,
+    line: usize,
+    column: usize,
+    query: &str,
+) -> SearchMatch {
+    let line_len = buffer.line_len_chars(line);
+    let end_column = column
+        .saturating_add(query.chars().count().max(1))
+        .min(line_len)
+        .max(column.min(line_len));
+
+    SearchMatch {
+        line,
+        column,
+        end_line: line,
+        end_column,
+    }
+}
+
+fn exact_search_matches(buffer: &DocumentBuffer, query: &str) -> Vec<SearchMatch> {
+    let query = query.trim();
+    if query.is_empty() {
+        return Vec::new();
+    }
+
+    let needle = normalize_search_text(query);
+    if needle.is_empty() {
+        return Vec::new();
+    }
+
+    let source = buffer.as_string();
+    let haystack = SearchIndex::new(&source);
+    let mut matches = Vec::new();
+    let mut byte_offset = 0usize;
+
+    while let Some(relative_start) = haystack.text[byte_offset..].find(&needle) {
+        let start_byte = byte_offset + relative_start;
+        let end_byte = start_byte + needle.len();
+        let normalized_start = haystack.text[..start_byte].chars().count();
+        let normalized_end = haystack.text[..end_byte].chars().count();
+        if let Some(source_index) = haystack.source_indices.get(normalized_start) {
+            let start_cursor = buffer.cursor_from_char_index(*source_index);
+            let end_source_index = haystack
+                .source_indices
+                .get(normalized_end)
+                .copied()
+                .unwrap_or_else(|| source.chars().count());
+            let end_cursor = buffer.cursor_from_char_index(end_source_index);
+            matches.push(SearchMatch {
+                line: start_cursor.line,
+                column: start_cursor.column,
+                end_line: end_cursor.line,
+                end_column: end_cursor.column,
+            });
+        }
+        byte_offset = end_byte.max(start_byte + 1);
+    }
+
+    matches
+}
+
+struct SearchIndex {
+    text: String,
+    source_indices: Vec<usize>,
+}
+
+impl SearchIndex {
+    fn new(source: &str) -> Self {
+        let mut text = String::new();
+        let mut source_indices = Vec::new();
+        let mut previous_was_whitespace = false;
+
+        for (source_index, ch) in source.chars().enumerate() {
+            if ch.is_whitespace() {
+                if !previous_was_whitespace {
+                    text.push(' ');
+                    source_indices.push(source_index);
+                    previous_was_whitespace = true;
+                }
+                continue;
+            }
+
+            text.push(ch.to_ascii_lowercase());
+            source_indices.push(source_index);
+            previous_was_whitespace = false;
+        }
+
+        Self {
+            text,
+            source_indices,
+        }
+    }
+}
+
+fn normalize_search_text(source: &str) -> String {
+    let mut normalized = String::new();
+    let mut previous_was_whitespace = false;
+
+    for ch in source.trim().chars() {
+        if ch.is_whitespace() {
+            if !previous_was_whitespace {
+                normalized.push(' ');
+                previous_was_whitespace = true;
+            }
+            continue;
+        }
+
+        normalized.push(ch.to_ascii_lowercase());
+        previous_was_whitespace = false;
+    }
+
+    normalized
+}
+
+fn search_match_preview(buffer: &DocumentBuffer, search_match: SearchMatch) -> String {
+    let start = buffer.char_index(Cursor {
+        line: search_match.line,
+        column: search_match.column,
+    });
+    let preview = buffer
+        .as_string()
+        .chars()
+        .skip(start)
+        .take(96)
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    if preview.is_empty() {
+        buffer
+            .line(search_match.line)
+            .trim_end_matches(['\r', '\n'])
+            .trim()
+            .to_string()
+    } else {
+        preview
+    }
+}
+
+fn score_file_entry(
+    query: &str,
+    notes_dir: &Path,
+    entry: &crate::fs::tree::TreeEntry,
+) -> Option<usize> {
+    if query.trim().is_empty() {
+        return Some(0);
+    }
+
+    let relative = relative_path_label(notes_dir, &entry.path);
+
+    score_fuzzy_text(query, &entry.display_name)
+        .or_else(|| score_fuzzy_text(query, &relative).map(|score| score + 200))
+}
+
+fn relative_path_label(notes_dir: &Path, path: &Path) -> String {
+    path.strip_prefix(notes_dir)
+        .unwrap_or(path)
+        .to_string_lossy()
+        .into_owned()
+}
+
+fn score_fuzzy_text(query: &str, candidate: &str) -> Option<usize> {
+    let query = normalize_fuzzy_text(query);
+    let candidate = normalize_fuzzy_text(candidate);
+    score_normalized_fuzzy_text(&query, &candidate)
+}
+
+fn score_normalized_fuzzy_text(query: &str, candidate: &str) -> Option<usize> {
+    if query.is_empty() {
+        return Some(0);
+    }
+
+    if candidate == query {
+        return Some(0);
+    }
+
+    if candidate.starts_with(query) {
+        return Some(1 + candidate.len().saturating_sub(query.len()));
+    }
+
+    if let Some(index) = candidate.find(query) {
+        return Some(100 + index);
+    }
+
+    subsequence_score(query, candidate)
+}
+
+fn subsequence_score(query: &str, candidate: &str) -> Option<usize> {
+    let mut query_chars = query.chars();
+    let mut next_query = query_chars.next()?;
+    let mut first_match = None;
+    let mut last_match = 0usize;
+    let mut gaps = 0usize;
+
+    for (index, ch) in candidate.chars().enumerate() {
+        if ch != next_query {
+            continue;
+        }
+
+        if first_match.is_none() {
+            first_match = Some(index);
+        } else {
+            gaps += index.saturating_sub(last_match + 1);
+        }
+        last_match = index;
+
+        if let Some(next) = query_chars.next() {
+            next_query = next;
+        } else {
+            return Some(400 + first_match.unwrap_or_default() + gaps);
+        }
+    }
+
+    None
+}
+
+fn search_match_column(query: &str, candidate: &str) -> Option<usize> {
+    let query = normalize_fuzzy_text(query);
+    let candidate = normalize_fuzzy_text(candidate);
+    if let Some(byte_index) = candidate.find(&query) {
+        return Some(candidate[..byte_index].chars().count());
+    }
+
+    let mut query_chars = query.chars();
+    let next_query = query_chars.next()?;
+    candidate.chars().position(|ch| ch == next_query)
+}
+
+fn normalize_fuzzy_text(text: &str) -> String {
+    text.to_lowercase()
+}
+
 fn parse_numbered_list(text: &str) -> Option<(&str, &str)> {
     let bytes = text.as_bytes();
     let mut i = 0;
@@ -1319,6 +2233,7 @@ fn open_external_url(url: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fs::tree::{FileTree, TreeEntry};
 
     fn test_app(text: &str) -> App {
         let mut buffer = DocumentBuffer::empty();
@@ -1328,12 +2243,18 @@ mod tests {
 
         App {
             notes_dir: PathBuf::new(),
+            file_tree: FileTree {
+                entries: Vec::new(),
+                selected: 0,
+            },
             buffer,
             cursor: Cursor::default(),
             viewport: Viewport::default(),
             mode: Mode::Normal,
             theme: Theme::monochrome_for_tests(),
             command_line: String::new(),
+            sheet: CommandSheetState::default(),
+            search: SearchState::default(),
             status_message: String::new(),
             should_quit: false,
             visual_line_anchor: None,
@@ -1636,15 +2557,257 @@ mod tests {
     }
 
     #[test]
-    fn primary_p_no_longer_opens_picker_or_palette() {
+    fn primary_p_opens_command_sheet_and_esc_closes_it() {
         let mut app = test_app("text");
         app.status_message = "ready".to_string();
 
         press_modified(&mut app, KeyCode::Char('p'), KeyModifiers::SUPER);
 
+        assert_eq!(app.mode, Mode::CommandLine);
+        assert_eq!(app.sheet.prompt, CommandPrompt::Command);
+        assert_eq!(app.command_line, "");
+        assert!(!app.sheet.items.is_empty());
+
+        press(&mut app, KeyCode::Esc);
+
         assert_eq!(app.mode, Mode::Normal);
         assert_eq!(app.status_message, "ready");
         assert_eq!(app.command_line, "");
+    }
+
+    #[test]
+    fn command_sheet_filters_matches_and_opens_selected_file() {
+        let mut app = test_app("text");
+        app.notes_dir = PathBuf::from("/notes");
+        app.file_tree.entries = vec![
+            TreeEntry {
+                path: PathBuf::from("/notes/alpha.md"),
+                display_name: "alpha.md".to_string(),
+                is_dir: false,
+            },
+            TreeEntry {
+                path: PathBuf::from("/notes/beta.md"),
+                display_name: "beta.md".to_string(),
+                is_dir: false,
+            },
+        ];
+
+        press_modified(&mut app, KeyCode::Char('p'), KeyModifiers::SUPER);
+        press(&mut app, KeyCode::Char('b'));
+        press(&mut app, KeyCode::Enter);
+
+        assert_eq!(app.mode, Mode::Normal);
+        assert_eq!(
+            app.buffer.path.as_deref(),
+            Some(Path::new("/notes/beta.md"))
+        );
+        assert_eq!(app.buffer.as_string(), "");
+    }
+
+    #[test]
+    fn command_sheet_lists_files_before_commands() {
+        let mut app = test_app("text");
+        app.notes_dir = PathBuf::from("/notes");
+        app.file_tree.entries = vec![TreeEntry {
+            path: PathBuf::from("/notes/CHANGELOG.md"),
+            display_name: "CHANGELOG.md".to_string(),
+            is_dir: false,
+        }];
+
+        press(&mut app, KeyCode::Char(':'));
+
+        assert_eq!(app.sheet.items[0].kind, SheetItemKind::File);
+        assert_eq!(app.sheet.items[0].label, "CHANGELOG.md");
+    }
+
+    #[test]
+    fn command_sheet_accepts_new_markdown_paths_that_do_not_exist() {
+        let mut app = test_app("text");
+        app.notes_dir = PathBuf::from("/notes");
+
+        press_modified(&mut app, KeyCode::Char('p'), KeyModifiers::SUPER);
+        press(&mut app, KeyCode::Char('n'));
+        press(&mut app, KeyCode::Char('e'));
+        press(&mut app, KeyCode::Char('w'));
+        press(&mut app, KeyCode::Char('-'));
+        press(&mut app, KeyCode::Char('n'));
+        press(&mut app, KeyCode::Char('o'));
+        press(&mut app, KeyCode::Char('t'));
+        press(&mut app, KeyCode::Char('e'));
+        press(&mut app, KeyCode::Char('.'));
+        press(&mut app, KeyCode::Char('m'));
+        press(&mut app, KeyCode::Char('d'));
+        press(&mut app, KeyCode::Enter);
+
+        assert_eq!(app.mode, Mode::Normal);
+        assert_eq!(
+            app.buffer.path.as_deref(),
+            Some(Path::new("/notes/new-note.md"))
+        );
+        assert_eq!(app.buffer.as_string(), "");
+    }
+
+    #[test]
+    fn command_sheet_keeps_typed_commands_fast() {
+        let mut app = test_app("text");
+
+        press(&mut app, KeyCode::Char(':'));
+        press(&mut app, KeyCode::Char('q'));
+        press(&mut app, KeyCode::Enter);
+
+        assert!(app.should_quit);
+        assert_eq!(app.mode, Mode::Normal);
+    }
+
+    #[test]
+    fn command_sheet_does_not_execute_partial_command_suggestions_by_accident() {
+        let mut app = test_app("text");
+        app.notes_dir = PathBuf::from("/notes");
+
+        press(&mut app, KeyCode::Char(':'));
+        press(&mut app, KeyCode::Char('e'));
+        press(&mut app, KeyCode::Enter);
+
+        assert_eq!(app.mode, Mode::Normal);
+        assert_eq!(app.status_message, "Unknown command: e");
+        assert_eq!(app.buffer.path, None);
+    }
+
+    #[test]
+    fn command_sheet_can_complete_selected_files_into_the_input() {
+        let mut app = test_app("text");
+        app.notes_dir = PathBuf::from("/notes");
+        app.file_tree.entries = vec![TreeEntry {
+            path: PathBuf::from("/notes/projects/glass.md"),
+            display_name: "glass.md".to_string(),
+            is_dir: false,
+        }];
+
+        press(&mut app, KeyCode::Char(':'));
+        for ch in "gla".chars() {
+            press(&mut app, KeyCode::Char(ch));
+        }
+        press(&mut app, KeyCode::Right);
+
+        assert_eq!(app.command_line, "projects/glass.md");
+    }
+
+    #[test]
+    fn slash_opens_same_sheet_for_search_results() {
+        let mut app = test_app("alpha\nneedle here\nomega");
+
+        press(&mut app, KeyCode::Char('/'));
+        assert_eq!(app.mode, Mode::CommandLine);
+        assert_eq!(app.sheet.prompt, CommandPrompt::Search);
+
+        for ch in "needle".chars() {
+            press(&mut app, KeyCode::Char(ch));
+        }
+
+        assert_eq!(app.sheet.items[0].kind, SheetItemKind::Search);
+        press(&mut app, KeyCode::Enter);
+
+        assert_eq!(app.mode, Mode::Normal);
+        assert_eq!(app.cursor.line, 1);
+        assert_eq!(app.cursor.column, 0);
+        assert_eq!(app.search_result_indicator(), Some((1, 1)));
+    }
+
+    #[test]
+    fn search_finds_queries_across_line_breaks() {
+        let mut app = test_app("alpha foo\nbar omega");
+
+        press(&mut app, KeyCode::Char('/'));
+        for ch in "foo bar".chars() {
+            press(&mut app, KeyCode::Char(ch));
+        }
+
+        assert_eq!(app.sheet.items[0].kind, SheetItemKind::Search);
+        assert_eq!(app.sheet.items[0].label, "Line 1");
+        press(&mut app, KeyCode::Enter);
+
+        assert_eq!(app.mode, Mode::Normal);
+        assert_eq!(app.cursor, Cursor { line: 0, column: 6 });
+        assert_eq!(
+            app.search.matches[0],
+            SearchMatch {
+                line: 0,
+                column: 6,
+                end_line: 1,
+                end_column: 3,
+            }
+        );
+        assert_eq!(app.search_result_indicator(), Some((1, 1)));
+    }
+
+    #[test]
+    fn command_mode_slash_search_uses_the_shared_sheet() {
+        let mut app = test_app("alpha\nneedle here\nomega");
+
+        press(&mut app, KeyCode::Char(':'));
+        press(&mut app, KeyCode::Char('/'));
+        for ch in "needle".chars() {
+            press(&mut app, KeyCode::Char(ch));
+        }
+
+        assert_eq!(app.sheet.items[0].kind, SheetItemKind::Search);
+        press(&mut app, KeyCode::Enter);
+
+        assert_eq!(app.cursor.line, 1);
+        assert_eq!(app.mode, Mode::Normal);
+    }
+
+    #[test]
+    fn normal_mode_n_and_shift_n_navigate_search_results() {
+        let mut app = test_app("needle\nmiddle needle\nneedle end");
+
+        press(&mut app, KeyCode::Char('/'));
+        for ch in "needle".chars() {
+            press(&mut app, KeyCode::Char(ch));
+        }
+        press(&mut app, KeyCode::Enter);
+
+        assert_eq!(app.search_result_indicator(), Some((1, 3)));
+        assert_eq!(app.cursor, Cursor { line: 0, column: 0 });
+
+        press(&mut app, KeyCode::Char('n'));
+        assert_eq!(app.search_result_indicator(), Some((2, 3)));
+        assert_eq!(app.cursor, Cursor { line: 1, column: 7 });
+
+        press(&mut app, KeyCode::Char('N'));
+        assert_eq!(app.search_result_indicator(), Some((1, 3)));
+        assert_eq!(app.cursor, Cursor { line: 0, column: 0 });
+    }
+
+    #[test]
+    fn normal_mode_n_navigates_multiline_search_results() {
+        let mut app = test_app("foo\nbar\nmiddle\nfoo bar");
+
+        press(&mut app, KeyCode::Char('/'));
+        for ch in "foo bar".chars() {
+            press(&mut app, KeyCode::Char(ch));
+        }
+        press(&mut app, KeyCode::Enter);
+
+        assert_eq!(app.search_result_indicator(), Some((1, 2)));
+        assert_eq!(app.cursor, Cursor { line: 0, column: 0 });
+
+        press(&mut app, KeyCode::Char('n'));
+        assert_eq!(app.search_result_indicator(), Some((2, 2)));
+        assert_eq!(app.cursor, Cursor { line: 3, column: 0 });
+    }
+
+    #[test]
+    fn command_sheet_has_no_extra_height_without_results() {
+        let mut app = test_app("text");
+
+        press(&mut app, KeyCode::Char('/'));
+        assert_eq!(app.sheet_panel_height(20), 0);
+
+        for ch in "missing".chars() {
+            press(&mut app, KeyCode::Char(ch));
+        }
+        assert_eq!(app.sheet_panel_height(20), 0);
     }
 
     #[test]
