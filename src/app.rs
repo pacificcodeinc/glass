@@ -27,6 +27,7 @@ use crate::{
 };
 
 const STATUS_MESSAGE_TTL: Duration = Duration::from_secs(3);
+const MOUSE_SCROLL_ROWS: usize = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
@@ -327,6 +328,16 @@ impl App {
                     self.update_text_selection(anchor, cursor);
                     self.cancel_pending_operators();
                     self.reset_preferred_column();
+                }
+            }
+            MouseEventKind::ScrollDown => {
+                if self.viewport_contains(mouse.column, mouse.row) {
+                    self.scroll_visual_rows(MOUSE_SCROLL_ROWS as isize);
+                }
+            }
+            MouseEventKind::ScrollUp => {
+                if self.viewport_contains(mouse.column, mouse.row) {
+                    self.scroll_visual_rows(-(MOUSE_SCROLL_ROWS as isize));
                 }
             }
             _ => {}
@@ -1190,16 +1201,26 @@ impl App {
     }
 
     fn cursor_for_mouse_position(&self, column: u16, row: u16) -> Option<Cursor> {
-        if column < self.viewport.x || row < self.viewport.y {
+        if !self.viewport_contains(column, row) {
             return None;
         }
 
         let local_x = column.saturating_sub(self.viewport.x) as usize;
         let local_y = row.saturating_sub(self.viewport.y) as usize;
-        if local_x >= self.viewport.visible_width || local_y >= self.viewport.visible_height {
-            return None;
+        self.cursor_for_viewport_position(local_x, local_y)
+    }
+
+    fn viewport_contains(&self, column: u16, row: u16) -> bool {
+        if column < self.viewport.x || row < self.viewport.y {
+            return false;
         }
 
+        let local_x = column.saturating_sub(self.viewport.x) as usize;
+        let local_y = row.saturating_sub(self.viewport.y) as usize;
+        local_x < self.viewport.visible_width && local_y < self.viewport.visible_height
+    }
+
+    fn cursor_for_viewport_position(&self, local_x: usize, local_y: usize) -> Option<Cursor> {
         let gutter = (self.buffer.line_count().to_string().len() + 1) as usize;
         let text_x = local_x.saturating_sub(gutter);
         let width = self.wrap_width();
@@ -1233,6 +1254,123 @@ impl App {
             line: row.line_number,
             column: column.min(self.buffer.line_len_chars(row.line_number)),
         })
+    }
+
+    fn scroll_visual_rows(&mut self, delta: isize) {
+        if delta == 0 {
+            return;
+        }
+
+        let width = self.wrap_width();
+        self.normalize_viewport(width);
+        let steps = delta.unsigned_abs();
+
+        for _ in 0..steps {
+            let next = if delta > 0 {
+                self.next_visual_position(
+                    self.viewport.top_line,
+                    self.viewport.top_wrap_index,
+                    width,
+                )
+            } else {
+                self.previous_visual_position(
+                    self.viewport.top_line,
+                    self.viewport.top_wrap_index,
+                    width,
+                )
+            };
+
+            if next == (self.viewport.top_line, self.viewport.top_wrap_index) {
+                break;
+            }
+            (self.viewport.top_line, self.viewport.top_wrap_index) = next;
+        }
+
+        self.normalize_viewport(width);
+        self.keep_cursor_in_scrolled_viewport(width);
+        self.cancel_pending_operators();
+        self.reset_preferred_column();
+    }
+
+    fn keep_cursor_in_scrolled_viewport(&mut self, width: usize) {
+        let cursor_wrap = wrap_index_for_column(
+            &self.buffer.line(self.cursor.line),
+            self.cursor.column,
+            width,
+        );
+        let preferred_column = self.current_visual_column(width);
+
+        if visual_position_before(
+            self.cursor.line,
+            cursor_wrap,
+            self.viewport.top_line,
+            self.viewport.top_wrap_index,
+        ) {
+            self.cursor = self.cursor_for_visual_position(
+                self.viewport.top_line,
+                self.viewport.top_wrap_index,
+                width,
+                preferred_column,
+            );
+            return;
+        }
+
+        let offset = self
+            .visual_offset_from_viewport(self.cursor.line, cursor_wrap, width)
+            .unwrap_or(usize::MAX);
+        if offset >= self.viewport.visible_height {
+            let (line, wrap_index) =
+                self.visual_position_at_viewport_offset(self.viewport.visible_height - 1, width);
+            self.cursor =
+                self.cursor_for_visual_position(line, wrap_index, width, preferred_column);
+        }
+    }
+
+    fn current_visual_column(&self, width: usize) -> usize {
+        let line_text = self.buffer.line(self.cursor.line);
+        let (segment_start, _) = visual_line_bounds(&line_text, self.cursor.column, width);
+        self.cursor.column.saturating_sub(segment_start)
+    }
+
+    fn visual_position_at_viewport_offset(&self, offset: usize, width: usize) -> (usize, usize) {
+        let mut line = self.viewport.top_line;
+        let mut wrap = self.viewport.top_wrap_index;
+        for _ in 0..offset {
+            let next = self.next_visual_position(line, wrap, width);
+            if next == (line, wrap) {
+                break;
+            }
+            (line, wrap) = next;
+        }
+        (line, wrap)
+    }
+
+    fn cursor_for_visual_position(
+        &self,
+        line: usize,
+        wrap_index: usize,
+        width: usize,
+        preferred_column: usize,
+    ) -> Cursor {
+        let line = line.min(self.buffer.line_count().saturating_sub(1));
+        let line_text = self.buffer.line(line);
+        let trimmed = line_text.trim_end_matches(['\r', '\n']);
+        let (segments, _) = wrap_line(trimmed, width);
+        let segment_index = wrap_index.min(segments.len().saturating_sub(1));
+        let Some(&(start, end)) = segments.get(segment_index) else {
+            return Cursor { line, column: 0 };
+        };
+
+        let max_col = visual_segment_max_column(
+            &segments,
+            segment_index,
+            self.buffer.line_len_chars(line),
+            end,
+        );
+        Cursor {
+            line,
+            column: (start + preferred_column).min(max_col),
+        }
     }
 
     fn visual_line_start(&mut self) {
@@ -2610,6 +2748,26 @@ mod tests {
         .unwrap();
     }
 
+    fn scroll_down(app: &mut App, column: u16, row: u16) {
+        app.handle_event(Event::Mouse(MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }))
+        .unwrap();
+    }
+
+    fn scroll_up(app: &mut App, column: u16, row: u16) {
+        app.handle_event(Event::Mouse(MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }))
+        .unwrap();
+    }
+
     #[test]
     fn visual_mode_can_enter_command_line_and_quit() {
         let mut app = test_app("text");
@@ -2681,6 +2839,58 @@ mod tests {
         click(&mut app, 4, 1);
 
         assert_eq!(app.cursor, Cursor { line: 0, column: 8 });
+    }
+
+    #[test]
+    fn mouse_wheel_scrolls_view_without_moving_visible_cursor() {
+        let mut app = test_app("l0\nl1\nl2\nl3\nl4\nl5\nl6\nl7\nl8");
+        app.resize_viewport(6, 20);
+        app.viewport.top_line = 0;
+        app.cursor = Cursor { line: 4, column: 1 };
+
+        scroll_down(&mut app, 0, 0);
+
+        assert_eq!(app.viewport.top_line, 3);
+        assert_eq!(app.cursor, Cursor { line: 4, column: 1 });
+    }
+
+    #[test]
+    fn mouse_wheel_moves_cursor_when_scroll_hides_it() {
+        let mut app = test_app("l0\nl1\nl2\nl3\nl4\nl5\nl6\nl7\nl8");
+        app.resize_viewport(4, 20);
+        app.viewport.top_line = 0;
+        app.cursor = Cursor { line: 0, column: 1 };
+
+        scroll_down(&mut app, 0, 0);
+
+        assert_eq!(app.viewport.top_line, 3);
+        assert_eq!(app.cursor, Cursor { line: 3, column: 1 });
+    }
+
+    #[test]
+    fn mouse_wheel_scrolls_wrapped_visual_rows() {
+        let mut app = test_app("abcdefghij");
+        app.resize_viewport(2, 8);
+        app.cursor = Cursor { line: 0, column: 8 };
+
+        scroll_down(&mut app, 0, 0);
+
+        assert_eq!(app.viewport.top_line, 0);
+        assert_eq!(app.viewport.top_wrap_index, 1);
+        assert_eq!(app.cursor, Cursor { line: 0, column: 8 });
+    }
+
+    #[test]
+    fn mouse_wheel_scrolls_up() {
+        let mut app = test_app("l0\nl1\nl2\nl3\nl4\nl5\nl6\nl7\nl8");
+        app.resize_viewport(6, 20);
+        app.viewport.top_line = 5;
+        app.cursor = Cursor { line: 6, column: 1 };
+
+        scroll_up(&mut app, 0, 0);
+
+        assert_eq!(app.viewport.top_line, 2);
+        assert_eq!(app.cursor, Cursor { line: 6, column: 1 });
     }
 
     #[test]
