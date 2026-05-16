@@ -134,8 +134,18 @@ mod tests {
         let mut app = App::new(dir.clone(), None)?;
         app.search.query = "needle".to_string();
         app.search.matches = vec![
-            crate::app::SearchMatch { line: 0, column: 0 },
-            crate::app::SearchMatch { line: 2, column: 4 },
+            crate::app::SearchMatch {
+                line: 0,
+                column: 0,
+                end_line: 0,
+                end_column: 6,
+            },
+            crate::app::SearchMatch {
+                line: 2,
+                column: 4,
+                end_line: 2,
+                end_column: 10,
+            },
         ];
         app.search.selected = 1;
 

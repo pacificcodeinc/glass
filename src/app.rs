@@ -46,7 +46,12 @@ pub enum SheetAction {
     Command(String),
     Complete(String),
     File(PathBuf),
-    Search { line: usize, column: usize },
+    Search {
+        line: usize,
+        column: usize,
+        end_line: usize,
+        end_column: usize,
+    },
     BeginSearch,
 }
 
@@ -86,6 +91,8 @@ impl Default for CommandSheetState {
 pub struct SearchMatch {
     pub line: usize,
     pub column: usize,
+    pub end_line: usize,
+    pub end_column: usize,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -846,8 +853,21 @@ impl App {
                 self.finish_command_sheet();
                 self.open_path(&path)
             }
-            SheetAction::Search { line, column } => {
-                self.activate_search(&item.replacement, SearchMatch { line, column });
+            SheetAction::Search {
+                line,
+                column,
+                end_line,
+                end_column,
+            } => {
+                self.activate_search(
+                    &item.replacement,
+                    SearchMatch {
+                        line,
+                        column,
+                        end_line,
+                        end_column,
+                    },
+                );
                 self.finish_command_sheet();
                 self.cursor = Cursor { line, column };
                 self.reset_preferred_column();
@@ -1707,6 +1727,31 @@ fn search_sheet_items(buffer: &DocumentBuffer, query: &str) -> Vec<(usize, Sheet
         return Vec::new();
     }
 
+    let exact_matches = exact_search_matches(buffer, query);
+    if !exact_matches.is_empty() {
+        return exact_matches
+            .into_iter()
+            .enumerate()
+            .map(|(index, search_match)| {
+                (
+                    index,
+                    SheetItem {
+                        kind: SheetItemKind::Search,
+                        label: format!("Line {}", search_match.line + 1),
+                        detail: search_match_preview(buffer, search_match),
+                        replacement: query.to_string(),
+                        action: SheetAction::Search {
+                            line: search_match.line,
+                            column: search_match.column,
+                            end_line: search_match.end_line,
+                            end_column: search_match.end_column,
+                        },
+                    },
+                )
+            })
+            .collect();
+    }
+
     let mut items = Vec::new();
     for line in 0..buffer.line_count() {
         let raw = buffer.line(line);
@@ -1717,6 +1762,7 @@ fn search_sheet_items(buffer: &DocumentBuffer, query: &str) -> Vec<(usize, Sheet
 
         if let Some(score) = score_fuzzy_text(query, &preview) {
             let column = search_match_column(query, &raw).unwrap_or_default();
+            let search_match = line_search_match(buffer, line, column, query);
             items.push((
                 score + line,
                 SheetItem {
@@ -1724,7 +1770,12 @@ fn search_sheet_items(buffer: &DocumentBuffer, query: &str) -> Vec<(usize, Sheet
                     label: format!("Line {}", line + 1),
                     detail: preview,
                     replacement: query.to_string(),
-                    action: SheetAction::Search { line, column },
+                    action: SheetAction::Search {
+                        line,
+                        column,
+                        end_line: search_match.end_line,
+                        end_column: search_match.end_column,
+                    },
                 },
             ));
         }
@@ -1746,7 +1797,17 @@ fn first_search_match(buffer: &DocumentBuffer, query: &str) -> Option<SearchMatc
     search_sheet_items(buffer, query)
         .into_iter()
         .find_map(|(_, item)| match item.action {
-            SheetAction::Search { line, column } => Some(SearchMatch { line, column }),
+            SheetAction::Search {
+                line,
+                column,
+                end_line,
+                end_column,
+            } => Some(SearchMatch {
+                line,
+                column,
+                end_line,
+                end_column,
+            }),
             _ => None,
         })
 }
@@ -1760,10 +1821,40 @@ fn search_matches_for_query(buffer: &DocumentBuffer, query: &str) -> Vec<SearchM
     search_sheet_items(buffer, query)
         .into_iter()
         .filter_map(|(_, item)| match item.action {
-            SheetAction::Search { line, column } => Some(SearchMatch { line, column }),
+            SheetAction::Search {
+                line,
+                column,
+                end_line,
+                end_column,
+            } => Some(SearchMatch {
+                line,
+                column,
+                end_line,
+                end_column,
+            }),
             _ => None,
         })
         .collect()
+}
+
+fn line_search_match(
+    buffer: &DocumentBuffer,
+    line: usize,
+    column: usize,
+    query: &str,
+) -> SearchMatch {
+    let line_len = buffer.line_len_chars(line);
+    let end_column = column
+        .saturating_add(query.chars().count().max(1))
+        .min(line_len)
+        .max(column.min(line_len));
+
+    SearchMatch {
+        line,
+        column,
+        end_line: line,
+        end_column,
+    }
 }
 
 fn exact_search_matches(buffer: &DocumentBuffer, query: &str) -> Vec<SearchMatch> {
@@ -1772,26 +1863,119 @@ fn exact_search_matches(buffer: &DocumentBuffer, query: &str) -> Vec<SearchMatch
         return Vec::new();
     }
 
-    let needle = query.to_ascii_lowercase();
-    let mut matches = Vec::new();
-    for line in 0..buffer.line_count() {
-        let raw = buffer.line(line);
-        let source = raw.trim_end_matches(['\r', '\n']);
-        let haystack = source.to_ascii_lowercase();
-        let mut byte_offset = 0usize;
+    let needle = normalize_search_text(query);
+    if needle.is_empty() {
+        return Vec::new();
+    }
 
-        while let Some(relative_start) = haystack[byte_offset..].find(&needle) {
-            let start_byte = byte_offset + relative_start;
-            let end_byte = start_byte + needle.len();
+    let source = buffer.as_string();
+    let haystack = SearchIndex::new(&source);
+    let mut matches = Vec::new();
+    let mut byte_offset = 0usize;
+
+    while let Some(relative_start) = haystack.text[byte_offset..].find(&needle) {
+        let start_byte = byte_offset + relative_start;
+        let end_byte = start_byte + needle.len();
+        let normalized_start = haystack.text[..start_byte].chars().count();
+        let normalized_end = haystack.text[..end_byte].chars().count();
+        if let Some(source_index) = haystack.source_indices.get(normalized_start) {
+            let start_cursor = buffer.cursor_from_char_index(*source_index);
+            let end_source_index = haystack
+                .source_indices
+                .get(normalized_end)
+                .copied()
+                .unwrap_or_else(|| source.chars().count());
+            let end_cursor = buffer.cursor_from_char_index(end_source_index);
             matches.push(SearchMatch {
-                line,
-                column: source[..start_byte].chars().count(),
+                line: start_cursor.line,
+                column: start_cursor.column,
+                end_line: end_cursor.line,
+                end_column: end_cursor.column,
             });
-            byte_offset = end_byte.max(start_byte + 1);
         }
+        byte_offset = end_byte.max(start_byte + 1);
     }
 
     matches
+}
+
+struct SearchIndex {
+    text: String,
+    source_indices: Vec<usize>,
+}
+
+impl SearchIndex {
+    fn new(source: &str) -> Self {
+        let mut text = String::new();
+        let mut source_indices = Vec::new();
+        let mut previous_was_whitespace = false;
+
+        for (source_index, ch) in source.chars().enumerate() {
+            if ch.is_whitespace() {
+                if !previous_was_whitespace {
+                    text.push(' ');
+                    source_indices.push(source_index);
+                    previous_was_whitespace = true;
+                }
+                continue;
+            }
+
+            text.push(ch.to_ascii_lowercase());
+            source_indices.push(source_index);
+            previous_was_whitespace = false;
+        }
+
+        Self {
+            text,
+            source_indices,
+        }
+    }
+}
+
+fn normalize_search_text(source: &str) -> String {
+    let mut normalized = String::new();
+    let mut previous_was_whitespace = false;
+
+    for ch in source.trim().chars() {
+        if ch.is_whitespace() {
+            if !previous_was_whitespace {
+                normalized.push(' ');
+                previous_was_whitespace = true;
+            }
+            continue;
+        }
+
+        normalized.push(ch.to_ascii_lowercase());
+        previous_was_whitespace = false;
+    }
+
+    normalized
+}
+
+fn search_match_preview(buffer: &DocumentBuffer, search_match: SearchMatch) -> String {
+    let start = buffer.char_index(Cursor {
+        line: search_match.line,
+        column: search_match.column,
+    });
+    let preview = buffer
+        .as_string()
+        .chars()
+        .skip(start)
+        .take(96)
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    if preview.is_empty() {
+        buffer
+            .line(search_match.line)
+            .trim_end_matches(['\r', '\n'])
+            .trim()
+            .to_string()
+    } else {
+        preview
+    }
 }
 
 fn score_file_entry(
@@ -2530,6 +2714,33 @@ mod tests {
     }
 
     #[test]
+    fn search_finds_queries_across_line_breaks() {
+        let mut app = test_app("alpha foo\nbar omega");
+
+        press(&mut app, KeyCode::Char('/'));
+        for ch in "foo bar".chars() {
+            press(&mut app, KeyCode::Char(ch));
+        }
+
+        assert_eq!(app.sheet.items[0].kind, SheetItemKind::Search);
+        assert_eq!(app.sheet.items[0].label, "Line 1");
+        press(&mut app, KeyCode::Enter);
+
+        assert_eq!(app.mode, Mode::Normal);
+        assert_eq!(app.cursor, Cursor { line: 0, column: 6 });
+        assert_eq!(
+            app.search.matches[0],
+            SearchMatch {
+                line: 0,
+                column: 6,
+                end_line: 1,
+                end_column: 3,
+            }
+        );
+        assert_eq!(app.search_result_indicator(), Some((1, 1)));
+    }
+
+    #[test]
     fn command_mode_slash_search_uses_the_shared_sheet() {
         let mut app = test_app("alpha\nneedle here\nomega");
 
@@ -2566,6 +2777,24 @@ mod tests {
         press(&mut app, KeyCode::Char('N'));
         assert_eq!(app.search_result_indicator(), Some((1, 3)));
         assert_eq!(app.cursor, Cursor { line: 0, column: 0 });
+    }
+
+    #[test]
+    fn normal_mode_n_navigates_multiline_search_results() {
+        let mut app = test_app("foo\nbar\nmiddle\nfoo bar");
+
+        press(&mut app, KeyCode::Char('/'));
+        for ch in "foo bar".chars() {
+            press(&mut app, KeyCode::Char(ch));
+        }
+        press(&mut app, KeyCode::Enter);
+
+        assert_eq!(app.search_result_indicator(), Some((1, 2)));
+        assert_eq!(app.cursor, Cursor { line: 0, column: 0 });
+
+        press(&mut app, KeyCode::Char('n'));
+        assert_eq!(app.search_result_indicator(), Some((2, 2)));
+        assert_eq!(app.cursor, Cursor { line: 3, column: 0 });
     }
 
     #[test]
