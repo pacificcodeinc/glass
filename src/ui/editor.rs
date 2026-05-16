@@ -1,9 +1,9 @@
 use ratatui::{
-    Frame,
     layout::{Position, Rect},
     style::Style,
     text::{Line, Span, Text},
     widgets::Paragraph,
+    Frame,
 };
 
 use crate::{
@@ -91,6 +91,11 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App, theme: Theme) {
                 line.spans.insert(0, indent);
             }
 
+            if !app.search.query.is_empty() {
+                let query = app.search.query.as_str();
+                line = highlight_search_matches(line, query, theme);
+            }
+
             if visual_range
                 .as_ref()
                 .is_some_and(|range| range.contains(&row.line_number))
@@ -149,4 +154,112 @@ fn selected_line(mut line: Line<'static>, theme: Theme) -> Line<'static> {
         span.style = theme.selection;
     }
     line
+}
+
+fn highlight_search_matches(mut line: Line<'static>, query: &str, theme: Theme) -> Line<'static> {
+    let query = query.trim();
+    if query.is_empty() {
+        return line;
+    }
+
+    let visible_text = line
+        .spans
+        .iter()
+        .map(|span| span.content.as_ref())
+        .collect::<String>();
+    let ranges = search_ranges(&visible_text, query);
+    if ranges.is_empty() {
+        return line;
+    }
+
+    let original_spans = std::mem::take(&mut line.spans);
+    let mut highlighted = Vec::new();
+    let mut span_start = 0usize;
+
+    for span in original_spans {
+        let text = span.content.into_owned();
+        let span_len = text.chars().count();
+        let span_end = span_start + span_len;
+        let mut local_cursor = 0usize;
+
+        for &(range_start, range_end) in &ranges {
+            if range_end <= span_start || range_start >= span_end {
+                continue;
+            }
+
+            let local_start = range_start.max(span_start) - span_start;
+            let local_end = range_end.min(span_end) - span_start;
+            if local_cursor < local_start {
+                highlighted.push(Span::styled(
+                    char_slice(&text, local_cursor, local_start),
+                    span.style,
+                ));
+            }
+            highlighted.push(Span::styled(
+                char_slice(&text, local_start, local_end),
+                theme.selection,
+            ));
+            local_cursor = local_end;
+        }
+
+        if local_cursor < span_len {
+            highlighted.push(Span::styled(
+                char_slice(&text, local_cursor, span_len),
+                span.style,
+            ));
+        }
+
+        span_start = span_end;
+    }
+
+    line.spans = highlighted;
+    line
+}
+
+fn search_ranges(text: &str, query: &str) -> Vec<(usize, usize)> {
+    let haystack = text.to_ascii_lowercase();
+    let needle = query.to_ascii_lowercase();
+    if needle.is_empty() {
+        return Vec::new();
+    }
+
+    let mut ranges = Vec::new();
+    let mut byte_offset = 0usize;
+    while let Some(relative_start) = haystack[byte_offset..].find(&needle) {
+        let start_byte = byte_offset + relative_start;
+        let end_byte = start_byte + needle.len();
+        let start = haystack[..start_byte].chars().count();
+        let end = haystack[..end_byte].chars().count();
+        ranges.push((start, end));
+        byte_offset = end_byte;
+    }
+
+    ranges
+}
+
+fn char_slice(text: &str, start: usize, end: usize) -> String {
+    text.chars()
+        .skip(start)
+        .take(end.saturating_sub(start))
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn search_highlight_splits_visible_text_matches() {
+        let theme = Theme::monochrome_for_tests();
+        let line = Line::from(vec![
+            Span::styled("before ", Style::default().fg(theme.text)),
+            Span::styled("needle after", Style::default().fg(theme.text)),
+        ]);
+
+        let line = highlight_search_matches(line, "needle", theme);
+
+        assert_eq!(line.spans.len(), 3);
+        assert_eq!(line.spans[1].content.as_ref(), "needle");
+        assert_eq!(line.spans[1].style, theme.selection);
+    }
 }
