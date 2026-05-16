@@ -1,6 +1,7 @@
 use std::{
     path::{Path, PathBuf},
     process::Command as ProcessCommand,
+    time::{Duration, Instant},
 };
 
 #[cfg(not(test))]
@@ -24,6 +25,8 @@ use crate::{
     markdown::highlight::concealed_wrap_line,
     markdown::inline::{link_at_column, LinkKind},
 };
+
+const STATUS_MESSAGE_TTL: Duration = Duration::from_secs(3);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
@@ -162,6 +165,7 @@ pub struct App {
     pub search: SearchState,
     pub text_selection: Option<TextSelection>,
     pub status_message: String,
+    status_message_expires_at: Option<Instant>,
     pub should_quit: bool,
     pub visual_line_anchor: Option<usize>,
     preferred_column: Option<usize>,
@@ -198,6 +202,7 @@ impl App {
             search: SearchState::default(),
             text_selection: None,
             status_message: "Glass".to_string(),
+            status_message_expires_at: None,
             should_quit: false,
             visual_line_anchor: None,
             preferred_column: None,
@@ -213,12 +218,26 @@ impl App {
     pub fn handle_event(&mut self, event: Event) -> Result<()> {
         match event {
             Event::Key(key) => self.handle_key_event(key)?,
-            Event::Mouse(mouse) => self.handle_mouse_event(mouse),
+            Event::Mouse(mouse) => self.handle_mouse_event(mouse)?,
             _ => {}
         }
 
         self.keep_cursor_visible();
         Ok(())
+    }
+
+    pub fn tick(&mut self) {
+        if let Some(expires_at) = self.status_message_expires_at {
+            if Instant::now() >= expires_at {
+                self.status_message.clear();
+                self.status_message_expires_at = None;
+            }
+        }
+    }
+
+    fn set_status(&mut self, message: impl Into<String>) {
+        self.status_message = message.into();
+        self.status_message_expires_at = Some(Instant::now() + STATUS_MESSAGE_TTL);
     }
 
     fn handle_key_event(&mut self, key: KeyEvent) -> Result<()> {
@@ -263,29 +282,34 @@ impl App {
         self.viewport.y = y;
     }
 
-    fn handle_mouse_event(&mut self, mouse: MouseEvent) {
+    fn handle_mouse_event(&mut self, mouse: MouseEvent) -> Result<()> {
         if self.mode == Mode::CommandLine {
-            return;
+            return Ok(());
         }
 
         match mouse.kind {
             MouseEventKind::Down(MouseButton::Left) => {
                 let Some(cursor) = self.cursor_for_mouse_position(mouse.column, mouse.row) else {
-                    return;
+                    return Ok(());
                 };
 
                 self.cursor = cursor;
                 self.clear_text_selection();
-                self.mouse_anchor = Some(cursor);
                 self.cancel_pending_operators();
                 self.reset_preferred_column();
+                if mouse.modifiers.contains(KeyModifiers::SUPER) {
+                    self.follow_link_under_cursor()?;
+                    return Ok(());
+                }
+
+                self.mouse_anchor = Some(cursor);
             }
             MouseEventKind::Drag(MouseButton::Left) => {
                 let Some(anchor) = self.mouse_anchor else {
-                    return;
+                    return Ok(());
                 };
                 let Some(cursor) = self.cursor_for_mouse_position(mouse.column, mouse.row) else {
-                    return;
+                    return Ok(());
                 };
 
                 self.cursor = cursor;
@@ -307,6 +331,8 @@ impl App {
             }
             _ => {}
         }
+
+        Ok(())
     }
 
     fn cancel_pending_operators(&mut self) {
@@ -339,10 +365,10 @@ impl App {
         match copy_to_clipboard(&selected_text) {
             Ok(()) => {
                 self.last_copied_selection = Some(selected_text);
-                self.status_message = "Copied selection".to_string();
+                self.set_status("Copied selection");
             }
             Err(error) => {
-                self.status_message = format!("Copy failed: {error:#}");
+                self.set_status(format!("Copy failed: {error:#}"));
             }
         }
     }
@@ -499,11 +525,11 @@ impl App {
             KeyCode::Char('D') => self.delete_to_line_end(),
             KeyCode::Char('c') => {
                 self.pending_change = true;
-                self.status_message = "change".to_string();
+                self.set_status("change");
             }
             KeyCode::Char('d') => {
                 self.pending_delete = true;
-                self.status_message = "delete".to_string();
+                self.set_status("delete");
             }
             KeyCode::Char('G') => self.document_end_preserving_column(),
             KeyCode::Char('g') => self.pending_g = true,
@@ -756,9 +782,9 @@ impl App {
 
     fn undo(&mut self) {
         if self.buffer.undo(&mut self.cursor) {
-            self.status_message = "Undid change".to_string();
+            self.set_status("Undid change");
         } else {
-            self.status_message = "Already at oldest change".to_string();
+            self.set_status("Already at oldest change");
         }
     }
 
@@ -1014,7 +1040,7 @@ impl App {
                 self.finish_command_sheet();
                 self.cursor = Cursor { line, column };
                 self.reset_preferred_column();
-                self.status_message = format!("Found on line {}", line + 1);
+                self.set_status(format!("Found on line {}", line + 1));
                 Ok(())
             }
             SheetAction::BeginSearch => {
@@ -1033,7 +1059,7 @@ impl App {
         if query.is_empty() {
             self.clear_search();
             self.finish_command_sheet();
-            self.status_message = "Search needs text".to_string();
+            self.set_status("Search needs text");
             return Ok(());
         }
 
@@ -1049,11 +1075,11 @@ impl App {
                 column: search_match.column,
             };
             self.reset_preferred_column();
-            self.status_message = format!("Found on line {}", search_match.line + 1);
+            self.set_status(format!("Found on line {}", search_match.line + 1));
         } else {
             self.clear_search();
             self.finish_command_sheet();
-            self.status_message = format!("No match: {query}");
+            self.set_status(format!("No match: {query}"));
         }
 
         Ok(())
@@ -1069,7 +1095,7 @@ impl App {
             }
             Command::Edit(path) => self.open_path(&path)?,
             Command::Unknown(value) => {
-                self.status_message = format!("Unknown command: {value}");
+                self.set_status(format!("Unknown command: {value}"));
             }
         }
 
@@ -1108,13 +1134,13 @@ impl App {
 
     fn jump_search_match(&mut self, delta: isize) {
         if self.search.query.is_empty() {
-            self.status_message = "No active search".to_string();
+            self.set_status("No active search");
             return;
         }
 
         self.search.matches = search_matches_for_query(&self.buffer, &self.search.query);
         if self.search.matches.is_empty() {
-            self.status_message = format!("No match: {}", self.search.query);
+            self.set_status(format!("No match: {}", self.search.query));
             return;
         }
 
@@ -1127,7 +1153,7 @@ impl App {
             column: search_match.column,
         };
         self.reset_preferred_column();
-        self.status_message = format!("Found on line {}", search_match.line + 1);
+        self.set_status(format!("Found on line {}", search_match.line + 1));
     }
 
     pub fn search_result_indicator(&self) -> Option<(usize, usize)> {
@@ -1144,13 +1170,13 @@ impl App {
     fn save_current_file(&mut self) -> Result<()> {
         self.buffer.save()?;
         self.refresh_file_tree()?;
-        self.status_message = "Saved".to_string();
+        self.set_status("Saved");
         Ok(())
     }
 
     fn request_quit(&mut self, force: bool) -> Result<()> {
         if self.buffer.dirty && !force {
-            self.status_message = "Unsaved changes; use :wq or :q!".to_string();
+            self.set_status("Unsaved changes; use :wq or :q!");
             return Ok(());
         }
 
@@ -1457,7 +1483,7 @@ impl App {
 
     fn open_path(&mut self, path: &Path) -> Result<()> {
         if self.buffer.dirty {
-            self.status_message = "Unsaved changes; save before switching files".to_string();
+            self.set_status("Unsaved changes; save before switching files");
             return Ok(());
         }
 
@@ -1473,7 +1499,7 @@ impl App {
         self.viewport.top_line = 0;
         self.viewport.top_wrap_index = 0;
         self.viewport.horizontal_offset = 0;
-        self.status_message = format!("Opened {}", path.display());
+        self.set_status(format!("Opened {}", path.display()));
         Ok(())
     }
 
@@ -1520,20 +1546,20 @@ impl App {
         let line = self.buffer.line(self.cursor.line);
         let source = line.trim_end_matches(['\r', '\n']);
         let Some(link) = link_at_column(source, self.cursor.column) else {
-            self.status_message = "No link under cursor".to_string();
+            self.set_status("No link under cursor");
             return Ok(());
         };
 
         let target = link.target.trim();
         if target.is_empty() {
-            self.status_message = "No link under cursor".to_string();
+            self.set_status("No link under cursor");
             return Ok(());
         }
 
         if is_external_link(target) {
             let url = normalized_external_url(target);
             open_external_url(&url)?;
-            self.status_message = format!("Opened {url}");
+            self.set_status(format!("Opened {url}"));
             return Ok(());
         }
 
@@ -2514,6 +2540,7 @@ mod tests {
             search: SearchState::default(),
             text_selection: None,
             status_message: String::new(),
+            status_message_expires_at: None,
             should_quit: false,
             visual_line_anchor: None,
             preferred_column: None,
@@ -2549,6 +2576,16 @@ mod tests {
             column,
             row,
             modifiers: KeyModifiers::NONE,
+        }))
+        .unwrap();
+    }
+
+    fn super_click(app: &mut App, column: u16, row: u16) {
+        app.handle_event(Event::Mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column,
+            row,
+            modifiers: KeyModifiers::SUPER,
         }))
         .unwrap();
     }
@@ -2647,6 +2684,28 @@ mod tests {
     }
 
     #[test]
+    fn super_click_opens_link_under_mouse() -> Result<()> {
+        let dir = std::env::temp_dir().join(format!("glass-super-click-{}", std::process::id()));
+        std::fs::create_dir_all(&dir)?;
+        let linked = dir.join("next.md");
+        std::fs::write(&linked, "opened")?;
+
+        let mut app = test_app("[Next](next.md)");
+        app.notes_dir = dir.clone();
+        app.resize_viewport(5, 30);
+
+        super_click(&mut app, 3, 0);
+
+        assert_eq!(app.buffer.path.as_deref(), Some(linked.as_path()));
+        assert_eq!(app.buffer.as_string(), "opened");
+        assert!(app.status_message.starts_with("Opened "));
+        assert!(app.status_message_expires_at.is_some());
+
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    #[test]
     fn mouse_drag_selects_text_and_copies_immediately() {
         let mut app = test_app("bravo");
         app.resize_viewport(5, 20);
@@ -2682,6 +2741,20 @@ mod tests {
 
         assert_eq!(app.selected_text().as_deref(), Some("rav"));
         assert_eq!(app.mouse_anchor, None);
+    }
+
+    #[test]
+    fn temporary_status_messages_expire() {
+        let mut app = test_app("text");
+        app.set_status("Opened note.md");
+        assert_eq!(app.status_message, "Opened note.md");
+        assert!(app.status_message_expires_at.is_some());
+
+        app.status_message_expires_at = Some(Instant::now() - Duration::from_millis(1));
+        app.tick();
+
+        assert_eq!(app.status_message, "");
+        assert_eq!(app.status_message_expires_at, None);
     }
 
     #[test]

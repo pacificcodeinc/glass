@@ -62,6 +62,7 @@ fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result
 
 fn run_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) -> Result<()> {
     while !app.should_quit {
+        app.tick();
         terminal.draw(|frame| ui::draw(frame, app))?;
         execute!(terminal.backend_mut(), cursor_style(app.mode))?;
 
