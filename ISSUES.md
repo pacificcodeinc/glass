@@ -14,7 +14,7 @@ Bug & feature log for glass.
 
 ## Editor & Input
 
-- [ ] **Mouse support**: click anywhere in the editor to move the cursor.
+- [x] **Mouse support**: click anywhere in the editor to move the cursor.
 - [ ] **Vim motions**: achieve full parity with standard Vim motions.
 - [ ] **Simple mode**: add a non-Vim editing mode (post-1.0).
 - [ ] **Spell check**: add spell-checking support.

@@ -4,7 +4,9 @@ use std::{
 };
 
 use anyhow::{Context, Result};
-use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
 
 use crate::{
     config::theme::Theme,
@@ -13,7 +15,7 @@ use crate::{
         commands::{parse_command, Command},
         cursor::Cursor,
         motions,
-        render::{visual_line_bounds, wrap_index_for_column, wrap_line},
+        render::{visible_rows, visual_line_bounds, wrap_index_for_column, wrap_line},
     },
     fs::tree::FileTree,
     markdown::highlight::concealed_wrap_line,
@@ -104,6 +106,8 @@ pub struct SearchState {
 
 #[derive(Debug, Clone, Copy)]
 pub struct Viewport {
+    pub x: u16,
+    pub y: u16,
     pub top_line: usize,
     pub top_wrap_index: usize,
     pub horizontal_offset: usize,
@@ -114,6 +118,8 @@ pub struct Viewport {
 impl Default for Viewport {
     fn default() -> Self {
         Self {
+            x: 0,
+            y: 0,
             top_line: 0,
             top_wrap_index: 0,
             horizontal_offset: 0,
@@ -180,8 +186,10 @@ impl App {
     }
 
     pub fn handle_event(&mut self, event: Event) -> Result<()> {
-        if let Event::Key(key) = event {
-            self.handle_key_event(key)?;
+        match event {
+            Event::Key(key) => self.handle_key_event(key)?,
+            Event::Mouse(mouse) => self.handle_mouse_event(mouse),
+            _ => {}
         }
 
         self.keep_cursor_visible();
@@ -221,6 +229,30 @@ impl App {
         self.viewport.visible_height = visible_height.max(1);
         self.viewport.visible_width = visible_width.max(1);
         self.keep_cursor_visible();
+    }
+
+    pub fn move_viewport_to(&mut self, x: u16, y: u16) {
+        self.viewport.x = x;
+        self.viewport.y = y;
+    }
+
+    fn handle_mouse_event(&mut self, mouse: MouseEvent) {
+        if !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+            return;
+        }
+        if self.mode == Mode::CommandLine {
+            return;
+        }
+
+        let Some(cursor) = self.cursor_for_mouse_position(mouse.column, mouse.row) else {
+            return;
+        };
+
+        self.cursor = cursor;
+        self.pending_g = false;
+        self.pending_delete = false;
+        self.pending_change = false;
+        self.reset_preferred_column();
     }
 
     fn handle_normal_key(&mut self, key: KeyEvent) -> Result<()> {
@@ -1018,6 +1050,52 @@ impl App {
     fn wrap_width(&self) -> usize {
         let gutter = (self.buffer.line_count().to_string().len() + 1) as usize;
         self.viewport.visible_width.saturating_sub(gutter).max(1)
+    }
+
+    fn cursor_for_mouse_position(&self, column: u16, row: u16) -> Option<Cursor> {
+        if column < self.viewport.x || row < self.viewport.y {
+            return None;
+        }
+
+        let local_x = column.saturating_sub(self.viewport.x) as usize;
+        let local_y = row.saturating_sub(self.viewport.y) as usize;
+        if local_x >= self.viewport.visible_width || local_y >= self.viewport.visible_height {
+            return None;
+        }
+
+        let gutter = (self.buffer.line_count().to_string().len() + 1) as usize;
+        let text_x = local_x.saturating_sub(gutter);
+        let width = self.wrap_width();
+        let rows = visible_rows(
+            &self.buffer,
+            self.viewport.top_line,
+            self.viewport.top_wrap_index,
+            self.viewport.visible_height,
+            width,
+            |line_num, text, width| {
+                if line_num == self.cursor.line {
+                    wrap_line(text, width)
+                } else {
+                    concealed_wrap_line(text, width)
+                }
+            },
+        );
+
+        let Some(row) = rows.get(local_y) else {
+            let line = self.buffer.line_count().saturating_sub(1);
+            return Some(Cursor {
+                line,
+                column: self.buffer.line_len_chars(line),
+            });
+        };
+
+        let text_x = text_x.saturating_sub(row.continuation_indent);
+        let segment_len = row.source_end.saturating_sub(row.source_start);
+        let column = row.source_start + text_x.min(segment_len);
+        Some(Cursor {
+            line: row.line_number,
+            column: column.min(self.buffer.line_len_chars(row.line_number)),
+        })
     }
 
     fn visual_line_start(&mut self) {
@@ -2283,6 +2361,16 @@ mod tests {
             .unwrap();
     }
 
+    fn click(app: &mut App, column: u16, row: u16) {
+        app.handle_event(Event::Mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }))
+        .unwrap();
+    }
+
     #[test]
     fn visual_mode_can_enter_command_line_and_quit() {
         let mut app = test_app("text");
@@ -2333,6 +2421,27 @@ mod tests {
 
         assert_eq!(app.viewport.top_line, 0);
         assert!(app.viewport.top_wrap_index > 0);
+    }
+
+    #[test]
+    fn mouse_click_moves_cursor_to_visible_position() {
+        let mut app = test_app("alpha\nbravo charlie\nomega");
+        app.resize_viewport(5, 20);
+        app.move_viewport_to(2, 1);
+
+        click(&mut app, 7, 2);
+
+        assert_eq!(app.cursor, Cursor { line: 1, column: 3 });
+    }
+
+    #[test]
+    fn mouse_click_maps_wrapped_rows_to_source_columns() {
+        let mut app = test_app("abcdefghij");
+        app.resize_viewport(5, 8);
+
+        click(&mut app, 4, 1);
+
+        assert_eq!(app.cursor, Cursor { line: 0, column: 8 });
     }
 
     #[test]

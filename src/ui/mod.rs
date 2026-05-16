@@ -18,6 +18,7 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
     let editor_theme = app.theme;
     let editor_page = editor::page_area(areas.editor);
     app.resize_viewport(editor_page.height as usize, editor_page.width as usize);
+    app.move_viewport_to(editor_page.x, editor_page.y);
 
     editor::render(frame, areas.editor, app, editor_theme);
     if let Some(sheet_area) = areas.sheet {
