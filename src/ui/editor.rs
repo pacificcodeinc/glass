@@ -7,7 +7,7 @@ use ratatui::{
 };
 
 use crate::{
-    app::{App, Mode, SearchMatch},
+    app::{App, Mode, SearchMatch, TextSelection},
     config::theme::Theme,
     editor::render::{
         column_in_wrap_segment, detect_list_marker, visible_rows, wrap_index_for_column, wrap_line,
@@ -89,6 +89,16 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App, theme: Theme) {
             if !app.search.query.is_empty() {
                 let ranges = search_ranges_for_row(
                     &app.search.matches,
+                    row.line_number,
+                    row.source_start,
+                    row.source_end,
+                );
+                line = highlight_search_ranges(line, &ranges, theme);
+            }
+
+            if let Some(selection) = app.text_selection {
+                let ranges = selection_ranges_for_row(
+                    selection,
                     row.line_number,
                     row.source_start,
                     row.source_end,
@@ -253,6 +263,37 @@ fn search_ranges_for_row(
     ranges
 }
 
+fn selection_ranges_for_row(
+    selection: TextSelection,
+    line_number: usize,
+    source_start: usize,
+    source_end: usize,
+) -> Vec<(usize, usize)> {
+    let (start_cursor, end_cursor) = selection.ordered();
+    if end_cursor.line < line_number || start_cursor.line > line_number {
+        return Vec::new();
+    }
+
+    let start = if start_cursor.line == line_number {
+        start_cursor.column
+    } else {
+        source_start
+    };
+    let end = if end_cursor.line == line_number {
+        end_cursor.column
+    } else {
+        source_end
+    };
+
+    let start = start.max(source_start);
+    let end = end.min(source_end);
+    if start < end {
+        vec![(start - source_start, end - source_start)]
+    } else {
+        Vec::new()
+    }
+}
+
 fn merged_ranges(ranges: &[(usize, usize)]) -> Vec<(usize, usize)> {
     let mut ranges = ranges
         .iter()
@@ -319,5 +360,16 @@ mod tests {
             search_ranges_for_row(&[search_match], 0, 8, 16),
             vec![(0, 4)]
         );
+    }
+
+    #[test]
+    fn selection_ranges_split_across_wrapped_rows() {
+        let selection = TextSelection {
+            anchor: crate::editor::cursor::Cursor { line: 0, column: 2 },
+            head: crate::editor::cursor::Cursor { line: 0, column: 9 },
+        };
+
+        assert_eq!(selection_ranges_for_row(selection, 0, 0, 6), vec![(2, 6)]);
+        assert_eq!(selection_ranges_for_row(selection, 0, 6, 12), vec![(0, 3)]);
     }
 }

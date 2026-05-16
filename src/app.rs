@@ -3,6 +3,9 @@ use std::{
     process::Command as ProcessCommand,
 };
 
+#[cfg(not(test))]
+use std::{io::Write, process::Stdio};
+
 use anyhow::{Context, Result};
 use crossterm::event::{
     Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
@@ -104,6 +107,22 @@ pub struct SearchState {
     pub selected: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TextSelection {
+    pub anchor: Cursor,
+    pub head: Cursor,
+}
+
+impl TextSelection {
+    pub fn ordered(self) -> (Cursor, Cursor) {
+        if cursor_before_or_equal(self.anchor, self.head) {
+            (self.anchor, self.head)
+        } else {
+            (self.head, self.anchor)
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct Viewport {
     pub x: u16,
@@ -141,6 +160,7 @@ pub struct App {
     pub command_line: String,
     pub sheet: CommandSheetState,
     pub search: SearchState,
+    pub text_selection: Option<TextSelection>,
     pub status_message: String,
     pub should_quit: bool,
     pub visual_line_anchor: Option<usize>,
@@ -149,6 +169,8 @@ pub struct App {
     pending_g: bool,
     pending_delete: bool,
     pending_change: bool,
+    mouse_anchor: Option<Cursor>,
+    last_copied_selection: Option<String>,
 }
 
 impl App {
@@ -174,6 +196,7 @@ impl App {
             command_line: String::new(),
             sheet: CommandSheetState::default(),
             search: SearchState::default(),
+            text_selection: None,
             status_message: "Glass".to_string(),
             should_quit: false,
             visual_line_anchor: None,
@@ -182,6 +205,8 @@ impl App {
             pending_g: false,
             pending_delete: false,
             pending_change: false,
+            mouse_anchor: None,
+            last_copied_selection: None,
         })
     }
 
@@ -200,6 +225,8 @@ impl App {
         if matches!(key.kind, KeyEventKind::Release) {
             return Ok(());
         }
+
+        self.clear_text_selection();
 
         if key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Char('c') {
             self.request_quit(false)?;
@@ -237,22 +264,106 @@ impl App {
     }
 
     fn handle_mouse_event(&mut self, mouse: MouseEvent) {
-        if !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
-            return;
-        }
         if self.mode == Mode::CommandLine {
             return;
         }
 
-        let Some(cursor) = self.cursor_for_mouse_position(mouse.column, mouse.row) else {
-            return;
-        };
+        match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                let Some(cursor) = self.cursor_for_mouse_position(mouse.column, mouse.row) else {
+                    return;
+                };
 
-        self.cursor = cursor;
+                self.cursor = cursor;
+                self.clear_text_selection();
+                self.mouse_anchor = Some(cursor);
+                self.cancel_pending_operators();
+                self.reset_preferred_column();
+            }
+            MouseEventKind::Drag(MouseButton::Left) => {
+                let Some(anchor) = self.mouse_anchor else {
+                    return;
+                };
+                let Some(cursor) = self.cursor_for_mouse_position(mouse.column, mouse.row) else {
+                    return;
+                };
+
+                self.cursor = cursor;
+                self.update_text_selection(anchor, cursor);
+                self.cancel_pending_operators();
+                self.reset_preferred_column();
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                let anchor = self.mouse_anchor.take();
+                if let (Some(anchor), Some(cursor)) = (
+                    anchor,
+                    self.cursor_for_mouse_position(mouse.column, mouse.row),
+                ) {
+                    self.cursor = cursor;
+                    self.update_text_selection(anchor, cursor);
+                    self.cancel_pending_operators();
+                    self.reset_preferred_column();
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn cancel_pending_operators(&mut self) {
         self.pending_g = false;
         self.pending_delete = false;
         self.pending_change = false;
-        self.reset_preferred_column();
+    }
+
+    fn clear_text_selection(&mut self) {
+        self.mouse_anchor = None;
+        self.text_selection = None;
+        self.last_copied_selection = None;
+    }
+
+    fn update_text_selection(&mut self, anchor: Cursor, head: Cursor) {
+        if anchor == head {
+            self.text_selection = None;
+            self.last_copied_selection = None;
+            return;
+        }
+
+        self.text_selection = Some(TextSelection { anchor, head });
+        let Some(selected_text) = self.selected_text() else {
+            return;
+        };
+        if self.last_copied_selection.as_ref() == Some(&selected_text) {
+            return;
+        }
+
+        match copy_to_clipboard(&selected_text) {
+            Ok(()) => {
+                self.last_copied_selection = Some(selected_text);
+                self.status_message = "Copied selection".to_string();
+            }
+            Err(error) => {
+                self.status_message = format!("Copy failed: {error:#}");
+            }
+        }
+    }
+
+    fn selected_text(&self) -> Option<String> {
+        let selection = self.text_selection?;
+        let (start, end) = selection.ordered();
+        let start = self.buffer.char_index(start);
+        let end = self.buffer.char_index(end);
+        if start == end {
+            return None;
+        }
+
+        Some(
+            self.buffer
+                .as_string()
+                .chars()
+                .skip(start)
+                .take(end.saturating_sub(start))
+                .collect(),
+        )
     }
 
     fn handle_normal_key(&mut self, key: KeyEvent) -> Result<()> {
@@ -1615,6 +1726,10 @@ fn visual_position_before(
     line < other_line || (line == other_line && wrap_index < other_wrap_index)
 }
 
+fn cursor_before_or_equal(left: Cursor, right: Cursor) -> bool {
+    left.line < right.line || (left.line == right.line && left.column <= right.column)
+}
+
 fn visual_segment_max_column(
     segments: &[(usize, usize)],
     segment_index: usize,
@@ -2309,6 +2424,70 @@ fn open_external_url(url: &str) -> Result<()> {
 }
 
 #[cfg(test)]
+fn copy_to_clipboard(_text: &str) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(all(not(test), target_os = "macos"))]
+fn copy_to_clipboard(text: &str) -> Result<()> {
+    copy_with_command("pbcopy", &[], text)
+}
+
+#[cfg(all(not(test), target_os = "windows"))]
+fn copy_to_clipboard(text: &str) -> Result<()> {
+    copy_with_command("clip", &[], text)
+}
+
+#[cfg(all(not(test), unix, not(target_os = "macos")))]
+fn copy_to_clipboard(text: &str) -> Result<()> {
+    let mut last_error = None;
+    for (program, args) in [
+        ("wl-copy", &[][..]),
+        ("xclip", &["-selection", "clipboard"][..]),
+        ("xsel", &["--clipboard", "--input"][..]),
+    ] {
+        match copy_with_command(program, args, text) {
+            Ok(()) => return Ok(()),
+            Err(error) => last_error = Some(error),
+        }
+    }
+
+    Err(last_error.unwrap_or_else(|| anyhow::anyhow!("no clipboard command configured")))
+}
+
+#[cfg(all(not(test), not(any(unix, target_os = "windows"))))]
+fn copy_to_clipboard(_text: &str) -> Result<()> {
+    anyhow::bail!("clipboard copy is not supported on this platform")
+}
+
+#[cfg(not(test))]
+fn copy_with_command(program: &str, args: &[&str], text: &str) -> Result<()> {
+    let mut child = ProcessCommand::new(program)
+        .args(args)
+        .stdin(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("failed to start clipboard command `{program}`"))?;
+
+    let mut stdin = child
+        .stdin
+        .take()
+        .with_context(|| format!("failed to open stdin for `{program}`"))?;
+    stdin
+        .write_all(text.as_bytes())
+        .with_context(|| format!("failed to write selection to `{program}`"))?;
+    drop(stdin);
+
+    let status = child
+        .wait()
+        .with_context(|| format!("failed to wait for `{program}`"))?;
+    if !status.success() {
+        anyhow::bail!("clipboard command `{program}` exited with {status}");
+    }
+
+    Ok(())
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::fs::tree::{FileTree, TreeEntry};
@@ -2333,6 +2512,7 @@ mod tests {
             command_line: String::new(),
             sheet: CommandSheetState::default(),
             search: SearchState::default(),
+            text_selection: None,
             status_message: String::new(),
             should_quit: false,
             visual_line_anchor: None,
@@ -2341,6 +2521,8 @@ mod tests {
             pending_g: false,
             pending_delete: false,
             pending_change: false,
+            mouse_anchor: None,
+            last_copied_selection: None,
         }
     }
 
@@ -2364,6 +2546,26 @@ mod tests {
     fn click(app: &mut App, column: u16, row: u16) {
         app.handle_event(Event::Mouse(MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Left),
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }))
+        .unwrap();
+    }
+
+    fn drag(app: &mut App, column: u16, row: u16) {
+        app.handle_event(Event::Mouse(MouseEvent {
+            kind: MouseEventKind::Drag(MouseButton::Left),
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }))
+        .unwrap();
+    }
+
+    fn release(app: &mut App, column: u16, row: u16) {
+        app.handle_event(Event::Mouse(MouseEvent {
+            kind: MouseEventKind::Up(MouseButton::Left),
             column,
             row,
             modifiers: KeyModifiers::NONE,
@@ -2442,6 +2644,44 @@ mod tests {
         click(&mut app, 4, 1);
 
         assert_eq!(app.cursor, Cursor { line: 0, column: 8 });
+    }
+
+    #[test]
+    fn mouse_drag_selects_text_and_copies_immediately() {
+        let mut app = test_app("bravo");
+        app.resize_viewport(5, 20);
+
+        click(&mut app, 3, 0);
+        drag(&mut app, 6, 0);
+
+        assert_eq!(app.cursor, Cursor { line: 0, column: 4 });
+        assert_eq!(app.selected_text().as_deref(), Some("rav"));
+        assert_eq!(app.status_message, "Copied selection");
+        assert_eq!(app.last_copied_selection.as_deref(), Some("rav"));
+    }
+
+    #[test]
+    fn mouse_drag_selection_can_cross_wrapped_rows() {
+        let mut app = test_app("abcdefghij");
+        app.resize_viewport(5, 8);
+
+        click(&mut app, 4, 0);
+        drag(&mut app, 3, 1);
+
+        assert_eq!(app.selected_text().as_deref(), Some("cdefg"));
+    }
+
+    #[test]
+    fn mouse_release_keeps_selection_but_stops_dragging() {
+        let mut app = test_app("bravo");
+        app.resize_viewport(5, 20);
+
+        click(&mut app, 3, 0);
+        drag(&mut app, 6, 0);
+        release(&mut app, 6, 0);
+
+        assert_eq!(app.selected_text().as_deref(), Some("rav"));
+        assert_eq!(app.mouse_anchor, None);
     }
 
     #[test]
