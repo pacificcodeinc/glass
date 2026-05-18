@@ -12,7 +12,10 @@ use crate::{
     editor::render::{
         column_in_wrap_segment, detect_list_marker, visible_rows, wrap_index_for_column, wrap_line,
     },
-    markdown::highlight::{concealed_wrap_line, render_markdown_segment_with_completion},
+    markdown::{
+        highlight::{concealed_wrap_line, render_markdown_segment_with_completion},
+        table::{TableLayout, table_wrap_line},
+    },
 };
 
 const ARTICLE_WIDTH: u16 = 82;
@@ -32,6 +35,7 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App, theme: Theme) {
     let line_count = app.buffer.line_count();
     let gutter_width: u16 = (line_count.to_string().len() + 1) as u16;
     let text_width = page.width.saturating_sub(gutter_width).max(1) as usize;
+    let table_layout = TableLayout::new(&app.buffer);
 
     frame.render_widget(
         ratatui::widgets::Clear,
@@ -51,6 +55,8 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App, theme: Theme) {
         |line_num, text, w| {
             if line_num == app.cursor.line {
                 wrap_line(text, w)
+            } else if table_layout.is_table_row(line_num) {
+                table_wrap_line(text, w)
             } else {
                 concealed_wrap_line(text, w)
             }
@@ -75,34 +81,52 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App, theme: Theme) {
             let is_cursor_row =
                 row.line_number == app.cursor.line && row.wrap_index == wrap_index_of_cursor;
             let active = row.line_number == app.cursor.line;
+            let table_row = (!active && row.wrap_index == 0)
+                .then(|| {
+                    table_layout.render_row(row.line_number, &row.full_text, text_width, theme)
+                })
+                .flatten();
 
-            let mut line = render_markdown_segment_with_completion(
-                &row.full_text,
-                row.source_start,
-                row.source_end,
-                theme,
-                active,
-                row.wrap_index,
-                row.completed && row.wrap_index > 0,
-            );
+            let (mut line, source_map) = if let Some(rendered) = table_row {
+                (rendered.line, Some(rendered.source_map))
+            } else {
+                (
+                    render_markdown_segment_with_completion(
+                        &row.full_text,
+                        row.source_start,
+                        row.source_end,
+                        theme,
+                        active,
+                        row.wrap_index,
+                        row.completed && row.wrap_index > 0,
+                    ),
+                    None,
+                )
+            };
 
             if !app.search.query.is_empty() {
-                let ranges = search_ranges_for_row(
+                let mut ranges = search_ranges_for_row(
                     &app.search.matches,
                     row.line_number,
                     row.source_start,
                     row.source_end,
                 );
+                if let Some(source_map) = &source_map {
+                    ranges = source_ranges_to_visual_ranges(source_map, row.source_start, &ranges);
+                }
                 line = highlight_search_ranges(line, &ranges, theme);
             }
 
             if let Some(selection) = app.text_selection {
-                let ranges = selection_ranges_for_row(
+                let mut ranges = selection_ranges_for_row(
                     selection,
                     row.line_number,
                     row.source_start,
                     row.source_end,
                 );
+                if let Some(source_map) = &source_map {
+                    ranges = source_ranges_to_visual_ranges(source_map, row.source_start, &ranges);
+                }
                 line = highlight_search_ranges(line, &ranges, theme);
             }
 
@@ -294,6 +318,40 @@ fn selection_ranges_for_row(
     }
 }
 
+fn source_ranges_to_visual_ranges(
+    source_map: &[Option<usize>],
+    source_start: usize,
+    source_ranges: &[(usize, usize)],
+) -> Vec<(usize, usize)> {
+    let mut ranges = Vec::new();
+    let mut active_start = None;
+
+    for (visual_index, source_index) in source_map.iter().copied().enumerate() {
+        let selected = source_index
+            .and_then(|source_index| source_index.checked_sub(source_start))
+            .is_some_and(|local_source| {
+                source_ranges
+                    .iter()
+                    .any(|(start, end)| local_source >= *start && local_source < *end)
+            });
+
+        match (active_start, selected) {
+            (None, true) => active_start = Some(visual_index),
+            (Some(start), false) => {
+                ranges.push((start, visual_index));
+                active_start = None;
+            }
+            _ => {}
+        }
+    }
+
+    if let Some(start) = active_start {
+        ranges.push((start, source_map.len()));
+    }
+
+    ranges
+}
+
 fn merged_ranges(ranges: &[(usize, usize)]) -> Vec<(usize, usize)> {
     let mut ranges = ranges
         .iter()
@@ -371,5 +429,24 @@ mod tests {
 
         assert_eq!(selection_ranges_for_row(selection, 0, 0, 6), vec![(2, 6)]);
         assert_eq!(selection_ranges_for_row(selection, 0, 6, 12), vec![(0, 3)]);
+    }
+
+    #[test]
+    fn source_ranges_map_to_table_visual_ranges() {
+        let source_map = vec![
+            None,
+            Some(2),
+            Some(3),
+            None,
+            None,
+            Some(8),
+            Some(9),
+            Some(10),
+        ];
+
+        assert_eq!(
+            source_ranges_to_visual_ranges(&source_map, 0, &[(2, 4), (9, 11)]),
+            vec![(1, 3), (6, 8)]
+        );
     }
 }

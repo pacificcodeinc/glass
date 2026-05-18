@@ -22,8 +22,11 @@ use crate::{
         render::{visible_rows, visual_line_bounds, wrap_index_for_column, wrap_line},
     },
     fs::tree::FileTree,
-    markdown::highlight::concealed_wrap_line,
     markdown::inline::{LinkKind, link_at_column},
+    markdown::{
+        highlight::concealed_wrap_line,
+        table::{TableLayout, table_wrap_line},
+    },
 };
 
 const STATUS_MESSAGE_TTL: Duration = Duration::from_secs(3);
@@ -1224,6 +1227,7 @@ impl App {
         let gutter = (self.buffer.line_count().to_string().len() + 1) as usize;
         let text_x = local_x.saturating_sub(gutter);
         let width = self.wrap_width();
+        let table_layout = TableLayout::new(&self.buffer);
         let rows = visible_rows(
             &self.buffer,
             self.viewport.top_line,
@@ -1233,6 +1237,8 @@ impl App {
             |line_num, text, width| {
                 if line_num == self.cursor.line {
                     wrap_line(text, width)
+                } else if table_layout.is_table_row(line_num) {
+                    table_wrap_line(text, width)
                 } else {
                     concealed_wrap_line(text, width)
                 }
@@ -1847,8 +1853,11 @@ impl App {
     fn line_wrap_count(&self, line: usize, width: usize) -> usize {
         let line_text = self.buffer.line(line);
         let trimmed = line_text.trim_end_matches(['\r', '\n']);
+        let table_layout = TableLayout::new(&self.buffer);
         let (segments, _) = if line == self.cursor.line {
             wrap_line(trimmed, width)
+        } else if table_layout.is_table_row(line) {
+            table_wrap_line(trimmed, width)
         } else {
             concealed_wrap_line(trimmed, width)
         };

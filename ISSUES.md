@@ -5,7 +5,7 @@ Bug & feature log for glass.
 ## Rendering
 
 - [ ] **Fenced code blocks**: highlight the language identifier (e.g., `rust` in ` ```rust `).
-- [ ] **Tables**: render Markdown tables.
+- [x] **Tables**: render Markdown tables.
 - [ ] **Strikethrough**: render `~~text~~`, including inside list items.
 - [ ] **URL display**: strip unnecessary parts (e.g., `https://`) from bare URLs that lack pretty titles.
 - [ ] **Link expansion**: only expand URLs to their real Markdown form on hover, not whenever their line is active in Normal mode.
