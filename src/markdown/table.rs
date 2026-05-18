@@ -120,25 +120,35 @@ impl TableLayout {
         let mut spans = Vec::new();
         let mut source_map = Vec::new();
 
-        for column in 0..block.column_count() {
-            if column > 0 {
-                append_span(
-                    &mut spans,
-                    &mut source_map,
-                    " │ ".to_string(),
-                    Style::default().fg(theme.muted),
-                    std::iter::repeat_n(None, 3),
-                );
-            }
+        append_span(
+            &mut spans,
+            &mut source_map,
+            if is_delimiter { "├" } else { "│" }.to_string(),
+            Style::default().fg(theme.muted),
+            std::iter::once(None),
+        );
 
+        for column in 0..block.column_count() {
             if is_delimiter {
-                let separator = format!(" {} ", "─".repeat(widths[column]));
+                let separator = "─".repeat(widths[column] + 2);
                 append_span(
                     &mut spans,
                     &mut source_map,
                     separator.clone(),
                     Style::default().fg(theme.muted),
                     std::iter::repeat_n(None, separator.chars().count()),
+                );
+                let joint = if column + 1 == block.column_count() {
+                    "┤"
+                } else {
+                    "┼"
+                };
+                append_span(
+                    &mut spans,
+                    &mut source_map,
+                    joint.to_string(),
+                    Style::default().fg(theme.muted),
+                    std::iter::once(None),
                 );
                 continue;
             }
@@ -177,6 +187,13 @@ impl TableLayout {
                 style,
                 std::iter::once(None),
             );
+            append_span(
+                &mut spans,
+                &mut source_map,
+                "│".to_string(),
+                Style::default().fg(theme.muted),
+                std::iter::once(None),
+            );
         }
 
         Some(RenderedTableLine {
@@ -198,7 +215,7 @@ impl TableBlock {
         }
 
         let mut widths = self.widths.clone();
-        let fixed_width = column_count * 2 + column_count.saturating_sub(1) * 3;
+        let fixed_width = column_count * 2 + column_count + 1;
 
         while fixed_width + widths.iter().sum::<usize>() > available_width
             && widths.iter().any(|width| *width > 1)
@@ -481,9 +498,20 @@ mod tests {
             .render_row(2, "| Ada | 12 |", 80, Theme::monochrome_for_tests())
             .expect("rendered table row");
 
-        assert_eq!(line_text(&rendered.line), " Ada   │     12 ");
-        assert_eq!(rendered.source_map[1], Some(2));
-        assert_eq!(rendered.source_map[13], Some(8));
+        assert_eq!(line_text(&rendered.line), "│ Ada  │    12 │");
+        assert_eq!(rendered.source_map[2], Some(2));
+        assert_eq!(rendered.source_map[12], Some(8));
+    }
+
+    #[test]
+    fn renders_delimiter_as_box_separator() {
+        let buffer = buffer_with("| Name | Count |\n| --- | ---: |\n| Ada | 12 |\n");
+        let layout = TableLayout::new(&buffer);
+        let rendered = layout
+            .render_row(1, "| --- | ---: |", 80, Theme::monochrome_for_tests())
+            .expect("rendered table delimiter");
+
+        assert_eq!(line_text(&rendered.line), "├──────┼───────┤");
     }
 
     #[test]
@@ -500,6 +528,6 @@ mod tests {
             )
             .expect("rendered table row");
 
-        assert_eq!(line_text(&rendered.line), " Ada   │  long d… ");
+        assert_eq!(line_text(&rendered.line), "│ Ada  │ long d… │");
     }
 }

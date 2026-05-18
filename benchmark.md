@@ -1,8 +1,6 @@
 # Glass Markdown Benchmark
 
-This file is a visual and interaction benchmark for Glass. It intentionally mixes
-Markdown that Glass supports today with Markdown that should stay readable even
-before dedicated rendering support exists.
+This file is a visual and interaction benchmark for Glass. It intentionally mixes Markdown that Glass supports today with Markdown that should stay readable even before dedicated rendering support exists.
 
 Use it to check:
 
@@ -27,11 +25,7 @@ Indented headings should stay plain:
 
 ## Paragraphs And Wrapping
 
-This paragraph is intentionally long so it wraps across several visual rows in a
-normal terminal width. It includes plain words, punctuation, and a useful search
-target: glass benchmark needle. Cursor movement should preserve the intended
-visual column when moving through this wrapped paragraph, and selection should
-copy the selected text immediately.
+This paragraph is intentionally long so it wraps across several visual rows in a normal terminal width. It includes plain words, punctuation, and a useful search target: glass benchmark needle. Cursor movement should preserve the intended visual column when moving through this wrapped paragraph, and selection should copy the selected text immediately.
 
 This query is split across a physical line break for search testing:
 multi
@@ -39,13 +33,10 @@ line needle
 
 ## Inline Formatting
 
-Plain text with *emphasis*, _alternate emphasis_, **strong text**, and
-`inline code`. Glass conceals some inline syntax on inactive rows while keeping
-the active row editable as source Markdown.
+Plain text with *emphasis*, _alternate emphasis_, **strong text**, and `inline code`. Glass conceals some inline syntax on inactive rows while keeping the active row editable as source Markdown.
 
 Wrapped inline formatting should not leak delimiters between visual rows:
-This sentence has **bold text that keeps going for a while so the wrapped row
-still looks clean** and then returns to normal text.
+This sentence has **bold text that keeps going for a while so the wrapped row still looks clean** and then returns to normal text.
 
 Known gap: ~~strikethrough is not rendered yet~~.
 
@@ -73,15 +64,13 @@ Wiki links:
 - [[ISSUES.md]]
 - [[Projects/Glass Benchmark]]
 
-Known gap: wiki links are navigable, but their visual treatment is still not as
-distinct as it should be.
+Known gap: wiki links are navigable, but their visual treatment is still not as distinct as it should be.
 
 ## Blockquotes
 
 > A simple quote should render with a quiet quote marker.
 
-> A longer quote should wrap without turning into noisy syntax. It should keep
-> the quote style across wrapped rows and still feel like a calm reading surface.
+> A longer quote should wrap without turning into noisy syntax. It should keep the quote style across wrapped rows and still feel like a calm reading surface.
 
 Nested blockquote benchmark:
 
@@ -96,8 +85,7 @@ Bullets:
 - Second bullet item with `inline code`
 - Third bullet item with [a link](README.md)
   - Nested bullet item
-  - Another nested bullet item that wraps for a while so continuation indentation
-    can be checked visually
+  - Another nested bullet item that wraps for a while so continuation indentation can be checked visually
 
 Alternate bullet markers:
 
@@ -161,8 +149,7 @@ Markdown inside table cells:
 | Link | [README](README.md) |
 | Emphasis | **bold** and *italic* |
 
-Known gap: inline Markdown inside inactive table cells is aligned, but not yet
-fully concealed or styled per cell.
+Known gap: inline Markdown inside inactive table cells is aligned, but not yet fully concealed or styled per cell.
 
 ## Code
 
@@ -185,8 +172,7 @@ cargo test --locked
 cargo build --release --locked
 ```
 
-Known gap: fenced code blocks render as code fences, but the language marker is
-not specially highlighted yet.
+Known gap: fenced code blocks render as code fences, but the language marker is not specially highlighted yet.
 
 ## Rules And Separators
 
@@ -268,6 +254,4 @@ Try these command-ish strings without accidentally executing them while editing:
 | Code | `glass benchmark.md` | should align |
 | Text | long plain text that needs fitting in smaller windows | should not break the table |
 
-Final long wrapped line with many constructs: **bold words**, `inline code`,
-[a link](README.md), a bare URL https://example.com/final-check, and enough
-plain text to wrap several times in a narrow viewport.
+Final long wrapped line with many constructs: **bold words**, `inline code`, [a link](README.md), a bare URL https://example.com/final-check, and enough plain text to wrap several times in a narrow viewport.
