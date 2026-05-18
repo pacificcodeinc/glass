@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.6] - 2026-05-18
+
+Full commit range: [`v0.1.5...v0.1.6`](https://github.com/pacificcodeinc/glass/compare/v0.1.5...v0.1.6)
+
+### Added
+
+- Bottom-attached command and search sheet for `:` and `/`, with shared fuzzy suggestions for files, commands, and in-document search results.
+- Search result highlighting across visible rows, including wrapped and multi-line matches.
+- Normal-mode `n` and `N` navigation through active search results, with the current result index shown in the status bar.
+- Mouse support for click-to-move cursor, drag text selection, immediate clipboard copy, Command-click link opening, and wheel scrolling.
+
+### Changed
+
+- File suggestions appear before commands and are labeled as `FILE navigate <path>`.
+- Command/search sheet styling now follows the status bar colors and attaches at the same full width.
+- Temporary status labels such as opened-link and copied-selection messages disappear after 3 seconds.
+- Dark terminal URL accents are lighter for better contrast.
+- The status bar stays one row tall when the command/search sheet has no results.
+
+### Fixed
+
+- Mouse wheel scrolling now moves through visual rows in the editor without snapping the viewport back unexpectedly.
+- Search commands now find text across line breaks instead of only within a single physical line.
+
 ## [0.1.5] - 2026-05-13
 
 Full commit range: [`v0.1.4...v0.1.5`](https://github.com/pacificcodeinc/glass/compare/v0.1.4...v0.1.5)
@@ -110,7 +134,8 @@ Full commit range: [`v0.1.0...v0.1.1`](https://github.com/pacificcodeinc/glass/c
 - Live Markdown rendering with concealed syntax markers.
 - Checkbox (`- [ ]` / `- [x]`) rendering.
 
-[Unreleased]: https://github.com/pacificcodeinc/glass/compare/v0.1.5...HEAD
+[Unreleased]: https://github.com/pacificcodeinc/glass/compare/v0.1.6...HEAD
+[0.1.6]: https://github.com/pacificcodeinc/glass/compare/v0.1.5...v0.1.6
 [0.1.5]: https://github.com/pacificcodeinc/glass/compare/v0.1.4...v0.1.5
 [0.1.4]: https://github.com/pacificcodeinc/glass/compare/v0.1.3...v0.1.4
 [0.1.3]: https://github.com/pacificcodeinc/glass/compare/v0.1.2...v0.1.3
