@@ -44,6 +44,12 @@ pub struct RenderedTableLine {
     pub source_map: Vec<Option<usize>>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TableBorder {
+    Top,
+    Bottom,
+}
+
 impl TableLayout {
     pub fn new(buffer: &DocumentBuffer) -> Self {
         let mut blocks = Vec::new();
@@ -198,6 +204,34 @@ impl TableLayout {
 
         Some(RenderedTableLine {
             line: Line::from(spans),
+            source_map,
+        })
+    }
+
+    pub fn render_border_for_line(
+        &self,
+        line_number: usize,
+        available_width: usize,
+        theme: Theme,
+        border: TableBorder,
+    ) -> Option<RenderedTableLine> {
+        let block = self.block_for_line(line_number)?;
+        let is_target_line = match border {
+            TableBorder::Top => line_number == block.start_line,
+            TableBorder::Bottom => line_number + 1 == block.end_line,
+        };
+        if !is_target_line {
+            return None;
+        }
+
+        let widths = block.fitted_widths(available_width);
+        let text = match border {
+            TableBorder::Top => border_line(&widths, "┌", "┬", "┐"),
+            TableBorder::Bottom => border_line(&widths, "└", "┴", "┘"),
+        };
+        let source_map = std::iter::repeat_n(None, text.chars().count()).collect();
+        Some(RenderedTableLine {
+            line: Line::from(Span::styled(text, Style::default().fg(theme.muted))),
             source_map,
         })
     }
@@ -443,6 +477,19 @@ fn append_span(
     spans.push(Span::styled(text, style));
 }
 
+fn border_line(widths: &[usize], left: &str, joint: &str, right: &str) -> String {
+    let mut text = String::from(left);
+    for (index, width) in widths.iter().enumerate() {
+        text.push_str(&"─".repeat(width + 2));
+        if index + 1 == widths.len() {
+            text.push_str(right);
+        } else {
+            text.push_str(joint);
+        }
+    }
+    text
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -512,6 +559,23 @@ mod tests {
             .expect("rendered table delimiter");
 
         assert_eq!(line_text(&rendered.line), "├──────┼───────┤");
+    }
+
+    #[test]
+    fn renders_top_and_bottom_borders() {
+        let buffer = buffer_with("| Name | Count |\n| --- | ---: |\n| Ada | 12 |\n");
+        let layout = TableLayout::new(&buffer);
+        let top = layout
+            .render_border_for_line(0, 80, Theme::monochrome_for_tests(), TableBorder::Top)
+            .expect("top border");
+        let bottom = layout
+            .render_border_for_line(2, 80, Theme::monochrome_for_tests(), TableBorder::Bottom)
+            .expect("bottom border");
+
+        assert_eq!(line_text(&top.line), "┌──────┬───────┐");
+        assert_eq!(line_text(&bottom.line), "└──────┴───────┘");
+        assert!(top.source_map.iter().all(Option::is_none));
+        assert!(bottom.source_map.iter().all(Option::is_none));
     }
 
     #[test]
