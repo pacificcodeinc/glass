@@ -131,7 +131,7 @@ Narrow-width pressure table:
 
 | Column | Long content | Number |
 | --- | --- | ---: |
-| Alpha | This cell is intentionally long enough to force fitting or truncation in a narrow terminal | 1200 |
+| Alpha | This cell is intentionally long enough to force wrapping in a narrow terminal | 1200 |
 | Beta | Short value | 7 |
 
 Escaped pipe table:

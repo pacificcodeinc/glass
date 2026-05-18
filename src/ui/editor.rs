@@ -14,7 +14,7 @@ use crate::{
     },
     markdown::{
         highlight::{concealed_wrap_line, render_markdown_segment_with_completion},
-        table::{TableBorder, TableLayout, table_wrap_line},
+        table::TableLayout,
     },
 };
 
@@ -56,7 +56,7 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App, theme: Theme) {
             if line_num == app.cursor.line {
                 wrap_line(text, w)
             } else if table_layout.is_table_row(line_num) {
-                table_wrap_line(text, w)
+                table_layout.wrap_line(line_num, text, w)
             } else {
                 concealed_wrap_line(text, w)
             }
@@ -76,28 +76,21 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App, theme: Theme) {
 
     let height = page.height as usize;
     let mut lines = Vec::new();
-    for (index, row) in rows.iter().enumerate() {
+    for row in &rows {
         let is_cursor_row =
             row.line_number == app.cursor.line && row.wrap_index == wrap_index_of_cursor;
         let active = row.line_number == app.cursor.line;
 
-        if row.wrap_index == 0
-            && let Some(rendered) = table_layout.render_border_for_line(
-                row.line_number,
-                text_width,
-                theme,
-                TableBorder::Top,
-            )
-        {
-            push_line(
-                &mut lines,
-                add_gutter(rendered.line, gutter_width, None, app, theme),
-                height,
-            );
-        }
-
-        let table_row = (!active && row.wrap_index == 0)
-            .then(|| table_layout.render_row(row.line_number, &row.full_text, text_width, theme))
+        let table_row = (!active)
+            .then(|| {
+                table_layout.render_row_segment(
+                    row.line_number,
+                    &row.full_text,
+                    text_width,
+                    theme,
+                    row.wrap_index,
+                )
+            })
             .flatten();
 
         let (mut line, source_map) = if let Some(rendered) = table_row {
@@ -171,25 +164,7 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App, theme: Theme) {
             cursor_found = true;
         }
 
-        let row_was_visible = push_line(&mut lines, line, height);
-        let is_last_wrap_for_source_line = rows
-            .get(index + 1)
-            .is_none_or(|next| next.line_number != row.line_number);
-        if row_was_visible
-            && is_last_wrap_for_source_line
-            && let Some(rendered) = table_layout.render_border_for_line(
-                row.line_number,
-                text_width,
-                theme,
-                TableBorder::Bottom,
-            )
-        {
-            push_line(
-                &mut lines,
-                add_gutter(rendered.line, gutter_width, None, app, theme),
-                height,
-            );
-        }
+        push_line(&mut lines, line, height);
     }
 
     let paragraph = Paragraph::new(Text::from(lines))

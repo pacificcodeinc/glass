@@ -44,12 +44,6 @@ pub struct RenderedTableLine {
     pub source_map: Vec<Option<usize>>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TableBorder {
-    Top,
-    Bottom,
-}
-
 impl TableLayout {
     pub fn new(buffer: &DocumentBuffer) -> Self {
         let mut blocks = Vec::new();
@@ -111,129 +105,97 @@ impl TableLayout {
         self.block_for_line(line).is_some()
     }
 
-    pub fn render_row(
+    pub fn render_row_segment(
         &self,
         line_number: usize,
         source: &str,
         available_width: usize,
         theme: Theme,
+        wrap_index: usize,
     ) -> Option<RenderedTableLine> {
+        self.render_row_lines(line_number, source, available_width, theme)?
+            .into_iter()
+            .nth(wrap_index)
+    }
+
+    pub fn wrap_line(
+        &self,
+        line_number: usize,
+        source: &str,
+        available_width: usize,
+    ) -> (Vec<(usize, usize)>, usize) {
+        let line_len = source.chars().count();
+        let Some(block) = self.block_for_line(line_number) else {
+            return (vec![(0, line_len)], 0);
+        };
+        if line_number == block.delimiter_line {
+            return (vec![(0, line_len)], 0);
+        }
+
+        let widths = block.fitted_widths(available_width);
+        let cells = parse_table_cells(source.trim_end_matches(['\r', '\n']));
+        let empty_cell = TableCell {
+            text: String::new(),
+            source_indices: Vec::new(),
+        };
+        let row_height = (0..block.column_count())
+            .map(|column| {
+                let cell = cells.get(column).unwrap_or(&empty_cell);
+                wrap_cell(cell, widths[column], block.alignments[column]).len()
+            })
+            .max()
+            .unwrap_or(1);
+
+        (std::iter::repeat_n((0, line_len), row_height).collect(), 0)
+    }
+
+    fn render_row_lines(
+        &self,
+        line_number: usize,
+        source: &str,
+        available_width: usize,
+        theme: Theme,
+    ) -> Option<Vec<RenderedTableLine>> {
         let block = self.block_for_line(line_number)?;
         let widths = block.fitted_widths(available_width);
         let is_delimiter = line_number == block.delimiter_line;
         let is_header = line_number == block.start_line;
         let cells = parse_table_cells(source.trim_end_matches(['\r', '\n']));
-        let mut spans = Vec::new();
-        let mut source_map = Vec::new();
 
-        append_span(
-            &mut spans,
-            &mut source_map,
-            if is_delimiter { "├" } else { "│" }.to_string(),
-            Style::default().fg(theme.muted),
-            std::iter::once(None),
-        );
-
-        for column in 0..block.column_count() {
-            if is_delimiter {
-                let separator = "─".repeat(widths[column] + 2);
-                append_span(
-                    &mut spans,
-                    &mut source_map,
-                    separator.clone(),
-                    Style::default().fg(theme.muted),
-                    std::iter::repeat_n(None, separator.chars().count()),
-                );
-                let joint = if column + 1 == block.column_count() {
-                    "┤"
-                } else {
-                    "┼"
-                };
-                append_span(
-                    &mut spans,
-                    &mut source_map,
-                    joint.to_string(),
-                    Style::default().fg(theme.muted),
-                    std::iter::once(None),
-                );
-                continue;
-            }
-
-            let alignment = block.alignments[column];
-            let style = if is_header {
-                theme.heading.add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(theme.text)
-            };
-            let empty_cell = TableCell {
-                text: String::new(),
-                source_indices: Vec::new(),
-            };
-            let cell = cells.get(column).unwrap_or(&empty_cell);
-            let fitted = fit_cell(cell, widths[column], alignment);
-
-            append_span(
-                &mut spans,
-                &mut source_map,
-                " ".to_string(),
-                style,
-                std::iter::once(None),
-            );
-            append_span(
-                &mut spans,
-                &mut source_map,
-                fitted.text,
-                style,
-                fitted.source_map.into_iter(),
-            );
-            append_span(
-                &mut spans,
-                &mut source_map,
-                " ".to_string(),
-                style,
-                std::iter::once(None),
-            );
-            append_span(
-                &mut spans,
-                &mut source_map,
-                "│".to_string(),
-                Style::default().fg(theme.muted),
-                std::iter::once(None),
-            );
+        if is_delimiter {
+            return Some(vec![render_delimiter_row(block, &widths, theme)]);
         }
 
-        Some(RenderedTableLine {
-            line: Line::from(spans),
-            source_map,
-        })
-    }
-
-    pub fn render_border_for_line(
-        &self,
-        line_number: usize,
-        available_width: usize,
-        theme: Theme,
-        border: TableBorder,
-    ) -> Option<RenderedTableLine> {
-        let block = self.block_for_line(line_number)?;
-        let is_target_line = match border {
-            TableBorder::Top => line_number == block.start_line,
-            TableBorder::Bottom => line_number + 1 == block.end_line,
+        let empty_cell = TableCell {
+            text: String::new(),
+            source_indices: Vec::new(),
         };
-        if !is_target_line {
-            return None;
+        let wrapped_cells = (0..block.column_count())
+            .map(|column| {
+                let cell = cells.get(column).unwrap_or(&empty_cell);
+                wrap_cell(cell, widths[column], block.alignments[column])
+            })
+            .collect::<Vec<_>>();
+        let row_height = wrapped_cells.iter().map(Vec::len).max().unwrap_or(1).max(1);
+        let style = if is_header {
+            theme.heading.add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(theme.text)
+        };
+
+        let mut rows = Vec::new();
+        for visual_row in 0..row_height {
+            rows.push(render_content_row(
+                block,
+                &widths,
+                &wrapped_cells,
+                visual_row,
+                style,
+                theme,
+            ));
         }
 
-        let widths = block.fitted_widths(available_width);
-        let text = match border {
-            TableBorder::Top => border_line(&widths, "┌", "┬", "┐"),
-            TableBorder::Bottom => border_line(&widths, "└", "┴", "┘"),
-        };
-        let source_map = std::iter::repeat_n(None, text.chars().count()).collect();
-        Some(RenderedTableLine {
-            line: Line::from(Span::styled(text, Style::default().fg(theme.muted))),
-            source_map,
-        })
+        Some(rows)
     }
 }
 
@@ -263,14 +225,113 @@ impl TableBlock {
     }
 }
 
+fn render_delimiter_row(block: &TableBlock, widths: &[usize], theme: Theme) -> RenderedTableLine {
+    let mut spans = Vec::new();
+    let mut source_map = Vec::new();
+
+    append_span(
+        &mut spans,
+        &mut source_map,
+        "├".to_string(),
+        Style::default().fg(theme.muted),
+        std::iter::once(None),
+    );
+
+    for (column, width) in widths.iter().enumerate().take(block.column_count()) {
+        let separator = "─".repeat(width + 2);
+        append_span(
+            &mut spans,
+            &mut source_map,
+            separator.clone(),
+            Style::default().fg(theme.muted),
+            std::iter::repeat_n(None, separator.chars().count()),
+        );
+        let joint = if column + 1 == block.column_count() {
+            "┤"
+        } else {
+            "┼"
+        };
+        append_span(
+            &mut spans,
+            &mut source_map,
+            joint.to_string(),
+            Style::default().fg(theme.muted),
+            std::iter::once(None),
+        );
+    }
+
+    RenderedTableLine {
+        line: Line::from(spans),
+        source_map,
+    }
+}
+
+fn render_content_row(
+    block: &TableBlock,
+    widths: &[usize],
+    wrapped_cells: &[Vec<FittedCell>],
+    visual_row: usize,
+    style: Style,
+    theme: Theme,
+) -> RenderedTableLine {
+    let mut spans = Vec::new();
+    let mut source_map = Vec::new();
+
+    append_span(
+        &mut spans,
+        &mut source_map,
+        "│".to_string(),
+        Style::default().fg(theme.muted),
+        std::iter::once(None),
+    );
+
+    for column in 0..block.column_count() {
+        let fitted = wrapped_cells
+            .get(column)
+            .and_then(|cell_lines| cell_lines.get(visual_row))
+            .cloned()
+            .unwrap_or_else(|| blank_cell(widths[column]));
+
+        append_span(
+            &mut spans,
+            &mut source_map,
+            " ".to_string(),
+            style,
+            std::iter::once(None),
+        );
+        append_span(
+            &mut spans,
+            &mut source_map,
+            fitted.text,
+            style,
+            fitted.source_map.into_iter(),
+        );
+        append_span(
+            &mut spans,
+            &mut source_map,
+            " ".to_string(),
+            style,
+            std::iter::once(None),
+        );
+        append_span(
+            &mut spans,
+            &mut source_map,
+            "│".to_string(),
+            Style::default().fg(theme.muted),
+            std::iter::once(None),
+        );
+    }
+
+    RenderedTableLine {
+        line: Line::from(spans),
+        source_map,
+    }
+}
+
 #[derive(Debug, Clone)]
 struct FittedCell {
     text: String,
     source_map: Vec<Option<usize>>,
-}
-
-pub fn table_wrap_line(text: &str, _width: usize) -> (Vec<(usize, usize)>, usize) {
-    (vec![(0, text.chars().count())], 0)
 }
 
 fn column_count(buffer: &DocumentBuffer, start: usize, end: usize) -> usize {
@@ -422,27 +483,70 @@ fn is_escaped(chars: &[char], index: usize) -> bool {
     backslashes % 2 == 1
 }
 
-fn fit_cell(cell: &TableCell, width: usize, alignment: TableAlignment) -> FittedCell {
-    let mut chars = cell.text.chars().collect::<Vec<_>>();
-    let mut source_map = cell
-        .source_indices
-        .iter()
-        .copied()
-        .map(Some)
-        .collect::<Vec<_>>();
+fn wrap_cell(cell: &TableCell, width: usize, alignment: TableAlignment) -> Vec<FittedCell> {
+    cell_wrap_segments(cell, width.max(1))
+        .into_iter()
+        .map(|(start, end)| {
+            let chars = cell.text.chars().skip(start).take(end - start);
+            let source_map = cell.source_indices[start..end]
+                .iter()
+                .copied()
+                .map(Some)
+                .collect::<Vec<_>>();
+            fit_cell_segment(chars, source_map, width, alignment)
+        })
+        .collect()
+}
 
-    if chars.len() > width {
-        if width == 1 {
-            chars = vec!['…'];
-            source_map = vec![None];
+fn cell_wrap_segments(cell: &TableCell, width: usize) -> Vec<(usize, usize)> {
+    let chars = cell.text.chars().collect::<Vec<_>>();
+    if chars.is_empty() {
+        return vec![(0, 0)];
+    }
+
+    let mut segments = Vec::new();
+    let mut pos = 0;
+    while pos < chars.len() {
+        while pos < chars.len() && chars[pos].is_whitespace() {
+            pos += 1;
+        }
+        if pos >= chars.len() {
+            break;
+        }
+
+        let end = (pos + width).min(chars.len());
+        if end >= chars.len() {
+            segments.push((pos, chars.len()));
+            break;
+        }
+
+        let slice = &chars[pos..end];
+        if let Some(rel_pos) = slice.iter().rposition(|ch| ch.is_whitespace())
+            && rel_pos > 0
+        {
+            let break_at = pos + rel_pos;
+            segments.push((pos, break_at));
+            pos = break_at + 1;
         } else {
-            chars.truncate(width - 1);
-            source_map.truncate(width - 1);
-            chars.push('…');
-            source_map.push(None);
+            segments.push((pos, end));
+            pos = end;
         }
     }
 
+    if segments.is_empty() {
+        vec![(0, 0)]
+    } else {
+        segments
+    }
+}
+
+fn fit_cell_segment(
+    chars: impl IntoIterator<Item = char>,
+    source_map: Vec<Option<usize>>,
+    width: usize,
+    alignment: TableAlignment,
+) -> FittedCell {
+    let chars = chars.into_iter().collect::<Vec<_>>();
     let content_width = chars.len();
     let padding = width.saturating_sub(content_width);
     let (left_padding, right_padding) = match alignment {
@@ -466,6 +570,13 @@ fn fit_cell(cell: &TableCell, width: usize, alignment: TableAlignment) -> Fitted
     }
 }
 
+fn blank_cell(width: usize) -> FittedCell {
+    FittedCell {
+        text: " ".repeat(width),
+        source_map: std::iter::repeat_n(None, width).collect(),
+    }
+}
+
 fn append_span(
     spans: &mut Vec<Span<'static>>,
     source_map: &mut Vec<Option<usize>>,
@@ -475,19 +586,6 @@ fn append_span(
 ) {
     source_map.extend(map);
     spans.push(Span::styled(text, style));
-}
-
-fn border_line(widths: &[usize], left: &str, joint: &str, right: &str) -> String {
-    let mut text = String::from(left);
-    for (index, width) in widths.iter().enumerate() {
-        text.push_str(&"─".repeat(width + 2));
-        if index + 1 == widths.len() {
-            text.push_str(right);
-        } else {
-            text.push_str(joint);
-        }
-    }
-    text
 }
 
 #[cfg(test)]
@@ -542,7 +640,7 @@ mod tests {
         let buffer = buffer_with("| Name | Count |\n| --- | ---: |\n| Ada | 12 |\n");
         let layout = TableLayout::new(&buffer);
         let rendered = layout
-            .render_row(2, "| Ada | 12 |", 80, Theme::monochrome_for_tests())
+            .render_row_segment(2, "| Ada | 12 |", 80, Theme::monochrome_for_tests(), 0)
             .expect("rendered table row");
 
         assert_eq!(line_text(&rendered.line), "│ Ada  │    12 │");
@@ -555,43 +653,80 @@ mod tests {
         let buffer = buffer_with("| Name | Count |\n| --- | ---: |\n| Ada | 12 |\n");
         let layout = TableLayout::new(&buffer);
         let rendered = layout
-            .render_row(1, "| --- | ---: |", 80, Theme::monochrome_for_tests())
+            .render_row_segment(1, "| --- | ---: |", 80, Theme::monochrome_for_tests(), 0)
             .expect("rendered table delimiter");
 
         assert_eq!(line_text(&rendered.line), "├──────┼───────┤");
     }
 
     #[test]
-    fn renders_top_and_bottom_borders() {
-        let buffer = buffer_with("| Name | Count |\n| --- | ---: |\n| Ada | 12 |\n");
+    fn wraps_wide_cells_across_row_segments() {
+        let buffer =
+            buffer_with("| Name | Description |\n| --- | --- |\n| Ada | long description |\n");
         let layout = TableLayout::new(&buffer);
-        let top = layout
-            .render_border_for_line(0, 80, Theme::monochrome_for_tests(), TableBorder::Top)
-            .expect("top border");
-        let bottom = layout
-            .render_border_for_line(2, 80, Theme::monochrome_for_tests(), TableBorder::Bottom)
-            .expect("bottom border");
+        let (segments, _) = layout.wrap_line(2, "| Ada | long description |", 18);
+        let rendered = (0..segments.len())
+            .map(|wrap_index| {
+                layout
+                    .render_row_segment(
+                        2,
+                        "| Ada | long description |",
+                        18,
+                        Theme::monochrome_for_tests(),
+                        wrap_index,
+                    )
+                    .expect("rendered table row segment")
+            })
+            .collect::<Vec<_>>();
 
-        assert_eq!(line_text(&top.line), "┌──────┬───────┐");
-        assert_eq!(line_text(&bottom.line), "└──────┴───────┘");
-        assert!(top.source_map.iter().all(Option::is_none));
-        assert!(bottom.source_map.iter().all(Option::is_none));
+        assert_eq!(segments.len(), 3);
+        assert_eq!(line_text(&rendered[0].line), "│ Ada  │ long    │");
+        assert_eq!(line_text(&rendered[1].line), "│      │ descrip │");
+        assert_eq!(line_text(&rendered[2].line), "│      │ tion    │");
     }
 
     #[test]
-    fn narrows_wide_columns_with_ellipsis() {
+    fn wraps_wide_cells_inside_single_character_columns() {
+        let buffer = buffer_with("| A | B |\n| --- | --- |\n| x | abc |\n");
+        let layout = TableLayout::new(&buffer);
+        let (segments, _) = layout.wrap_line(2, "| x | abc |", 7);
+        let rendered = (0..segments.len())
+            .map(|wrap_index| {
+                layout
+                    .render_row_segment(
+                        2,
+                        "| x | abc |",
+                        7,
+                        Theme::monochrome_for_tests(),
+                        wrap_index,
+                    )
+                    .expect("rendered narrow table row segment")
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(segments.len(), 3);
+        assert_eq!(line_text(&rendered[0].line), "│ x │ a │");
+        assert_eq!(line_text(&rendered[1].line), "│   │ b │");
+        assert_eq!(line_text(&rendered[2].line), "│   │ c │");
+    }
+
+    #[test]
+    fn keeps_source_maps_on_wrapped_cell_segments() {
         let buffer =
             buffer_with("| Name | Description |\n| --- | --- |\n| Ada | long description |\n");
         let layout = TableLayout::new(&buffer);
         let rendered = layout
-            .render_row(
+            .render_row_segment(
                 2,
                 "| Ada | long description |",
                 18,
                 Theme::monochrome_for_tests(),
+                1,
             )
-            .expect("rendered table row");
+            .expect("rendered table row segment");
 
-        assert_eq!(line_text(&rendered.line), "│ Ada  │ long d… │");
+        assert_eq!(line_text(&rendered.line), "│      │ descrip │");
+        assert!(rendered.source_map.contains(&Some(13)));
+        assert!(!line_text(&rendered.line).contains('…'));
     }
 }

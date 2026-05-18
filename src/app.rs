@@ -23,10 +23,7 @@ use crate::{
     },
     fs::tree::FileTree,
     markdown::inline::{LinkKind, link_at_column},
-    markdown::{
-        highlight::concealed_wrap_line,
-        table::{TableLayout, table_wrap_line},
-    },
+    markdown::{highlight::concealed_wrap_line, table::TableLayout},
 };
 
 const STATUS_MESSAGE_TTL: Duration = Duration::from_secs(3);
@@ -1238,7 +1235,7 @@ impl App {
                 if line_num == self.cursor.line {
                     wrap_line(text, width)
                 } else if table_layout.is_table_row(line_num) {
-                    table_wrap_line(text, width)
+                    table_layout.wrap_line(line_num, text, width)
                 } else {
                     concealed_wrap_line(text, width)
                 }
@@ -1857,7 +1854,7 @@ impl App {
         let (segments, _) = if line == self.cursor.line {
             wrap_line(trimmed, width)
         } else if table_layout.is_table_row(line) {
-            table_wrap_line(trimmed, width)
+            table_layout.wrap_line(line, trimmed, width)
         } else {
             concealed_wrap_line(trimmed, width)
         };
