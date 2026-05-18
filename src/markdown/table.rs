@@ -145,8 +145,14 @@ impl TableLayout {
             })
             .max()
             .unwrap_or(1);
+        let separator_height = usize::from(block.has_body_row_after(line_number));
 
-        (std::iter::repeat_n((0, line_len), row_height).collect(), 0)
+        (
+            std::iter::repeat_n((0, line_len), row_height)
+                .chain(std::iter::repeat_n((line_len, line_len), separator_height))
+                .collect(),
+            0,
+        )
     }
 
     fn render_row_lines(
@@ -194,6 +200,9 @@ impl TableLayout {
                 theme,
             ));
         }
+        if block.has_body_row_after(line_number) {
+            rows.push(render_delimiter_row(block, &widths, theme));
+        }
 
         Some(rows)
     }
@@ -222,6 +231,10 @@ impl TableBlock {
         }
 
         widths
+    }
+
+    fn has_body_row_after(&self, line_number: usize) -> bool {
+        line_number > self.delimiter_line && line_number + 1 < self.end_line
     }
 }
 
@@ -657,6 +670,22 @@ mod tests {
             .expect("rendered table delimiter");
 
         assert_eq!(line_text(&rendered.line), "├──────┼───────┤");
+    }
+
+    #[test]
+    fn renders_internal_separators_between_body_rows() {
+        let buffer = buffer_with("| A | B |\n| --- | --- |\n| x | y |\n| z | q |\n");
+        let layout = TableLayout::new(&buffer);
+        let (first_row_segments, _) = layout.wrap_line(2, "| x | y |", 80);
+        let (last_row_segments, _) = layout.wrap_line(3, "| z | q |", 80);
+        let separator = layout
+            .render_row_segment(2, "| x | y |", 80, Theme::monochrome_for_tests(), 1)
+            .expect("rendered table row separator");
+
+        assert_eq!(first_row_segments.len(), 2);
+        assert_eq!(last_row_segments.len(), 1);
+        assert_eq!(line_text(&separator.line), "├─────┼─────┤");
+        assert!(separator.source_map.iter().all(Option::is_none));
     }
 
     #[test]
