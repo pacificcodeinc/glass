@@ -263,6 +263,9 @@ mod tests {
 
         assert_eq!(rows[0].line_number, 0);
         assert_eq!(rows[0].wrap_index, 1);
-        assert_eq!(&rows[0].full_text[rows[0].source_start..rows[0].source_end], "three");
+        assert_eq!(
+            &rows[0].full_text[rows[0].source_start..rows[0].source_end],
+            "three"
+        );
     }
 }

@@ -16,14 +16,14 @@ use crate::{
     config::theme::Theme,
     editor::{
         buffer::DocumentBuffer,
-        commands::{parse_command, Command},
+        commands::{Command, parse_command},
         cursor::Cursor,
         motions,
         render::{visible_rows, visual_line_bounds, wrap_index_for_column, wrap_line},
     },
     fs::tree::FileTree,
     markdown::highlight::concealed_wrap_line,
-    markdown::inline::{link_at_column, LinkKind},
+    markdown::inline::{LinkKind, link_at_column},
 };
 
 const STATUS_MESSAGE_TTL: Duration = Duration::from_secs(3);
