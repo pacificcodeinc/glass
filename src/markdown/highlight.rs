@@ -61,12 +61,15 @@ pub fn render_markdown_line_with_completion(
         ]);
     }
 
-    if allow_block_element && let Some(quote_text) = trimmed.strip_prefix("> ") {
-        let mut spans = vec![
-            Span::raw(leading.to_string()),
-            Span::styled("│ ".to_string(), theme.quote),
-        ];
-        spans.extend(conceal_inline(quote_text, theme, theme.quote));
+    if allow_block_element && let Some(quote) = quote_prefix(trimmed) {
+        let mut spans = vec![Span::raw(leading.to_string())];
+        spans.extend(render_quote_segment(
+            trimmed,
+            quote,
+            0,
+            trimmed.chars().count(),
+            theme,
+        ));
         return Line::from(spans);
     }
 
@@ -111,7 +114,7 @@ pub fn render_markdown_line_with_completion(
             let marker_len = trimmed.len() - item_text.len();
             let mut spans = vec![
                 Span::raw(leading.to_string()),
-                Span::styled("• ".to_string(), theme.list_marker),
+                Span::styled(bullet_marker(leading_width).to_string(), theme.list_marker),
             ];
             spans.extend(conceal_inline(
                 &trimmed[marker_len..],
@@ -145,6 +148,16 @@ pub fn render_markdown_segment_with_completion(
 
     if active {
         return highlight_source_segment(source, segment_start, segment_end, theme, wrap_index);
+    }
+
+    if let Some(quote) = quote_prefix(source) {
+        return Line::from(render_quote_segment(
+            source,
+            quote,
+            segment_start,
+            segment_end,
+            theme,
+        ));
     }
 
     if has_split_concealed_inline(source, segment_start, segment_end) {
@@ -340,6 +353,21 @@ pub fn concealed_wrap_segments(source: &str, width: usize) -> Vec<(usize, usize)
 }
 
 pub fn concealed_wrap_line(text: &str, width: usize) -> (Vec<(usize, usize)>, usize) {
+    if let Some(quote) = quote_prefix(text) {
+        let marker_width = quote.visual_marker.chars().count();
+        let content_width = width.saturating_sub(marker_width).max(1);
+        let content = &text[quote.source_len..];
+        if content.is_empty() {
+            return (vec![(0, text.chars().count())], 0);
+        }
+
+        let segments = concealed_wrap_segments(content, content_width)
+            .into_iter()
+            .map(|(start, end)| (quote.source_len + start, quote.source_len + end))
+            .collect();
+        return (segments, 0);
+    }
+
     let marker_len = detect_list_marker(text);
 
     if marker_len == 0 || marker_len >= width {
@@ -648,6 +676,54 @@ fn numbered_list_prefix(trimmed: &str) -> Option<(&str, &str)> {
     } else {
         None
     }
+}
+
+#[derive(Debug, Clone)]
+struct QuotePrefix {
+    source_len: usize,
+    visual_marker: String,
+}
+
+fn quote_prefix(source: &str) -> Option<QuotePrefix> {
+    let chars = source.chars().collect::<Vec<_>>();
+    let mut index = 0;
+    let mut depth = 0;
+
+    while chars.get(index) == Some(&'>') {
+        depth += 1;
+        index += 1;
+        if chars.get(index) == Some(&' ') {
+            index += 1;
+        }
+    }
+
+    (depth > 0).then(|| QuotePrefix {
+        source_len: index,
+        visual_marker: "│ ".repeat(depth),
+    })
+}
+
+fn render_quote_segment(
+    source: &str,
+    quote: QuotePrefix,
+    segment_start: usize,
+    segment_end: usize,
+    theme: Theme,
+) -> Vec<Span<'static>> {
+    let source_len = source.chars().count();
+    let content_start = segment_start.max(quote.source_len).min(source_len);
+    let content_end = segment_end.min(source_len).max(content_start);
+    let mut spans = vec![Span::styled(quote.visual_marker, theme.quote)];
+    if content_start < content_end {
+        let content = slice_chars(source, content_start, content_end);
+        spans.extend(conceal_inline(&content, theme, theme.quote));
+    }
+    spans
+}
+
+fn bullet_marker(leading_width: usize) -> &'static str {
+    let level = leading_width / 2;
+    if level % 2 == 0 { "• " } else { "◦ " }
 }
 
 fn list_item_text(trimmed: &str) -> Option<&str> {
@@ -1110,6 +1186,36 @@ mod tests {
     }
 
     #[test]
+    fn wrapped_quote_segments_keep_quote_marker() {
+        let source =
+            "> A longer quote should wrap without dropping the quote marker on continuation rows";
+        let (segments, _) = concealed_wrap_line(source, 28);
+        assert!(segments.len() > 1);
+
+        for (index, (start, end)) in segments.into_iter().enumerate() {
+            let line = render_markdown_segment_with_completion(
+                source,
+                start,
+                end,
+                Theme::monochrome_for_tests(),
+                false,
+                index,
+                false,
+            );
+
+            assert!(line_text(&line).starts_with("│ "));
+            assert_eq!(line.spans[0].style, Theme::monochrome_for_tests().quote);
+        }
+    }
+
+    #[test]
+    fn nested_blockquote_renders_nested_markers() {
+        let line = render_markdown_line("> > Inner quote", Theme::monochrome_for_tests(), false, 0);
+
+        assert_eq!(line_text(&line), "│ │ Inner quote");
+    }
+
+    #[test]
     fn inactive_checkbox_renders_full_marker() {
         let line = render_markdown_line("- [ ] todo", Theme::monochrome_for_tests(), false, 0);
         assert_eq!(line_text(&line), "- [ ] todo");
@@ -1196,6 +1302,19 @@ mod tests {
     fn inactive_numbered_list_multi_digit() {
         let line = render_markdown_line("10. tenth item", Theme::monochrome_for_tests(), false, 0);
         assert_eq!(line_text(&line), "10. tenth item");
+    }
+
+    #[test]
+    fn nested_bullets_alternate_marker_shape() {
+        let top = render_markdown_line("- top", Theme::monochrome_for_tests(), false, 0);
+        let nested = render_markdown_line("  - nested", Theme::monochrome_for_tests(), false, 0);
+
+        assert_eq!(line_text(&top), "• top");
+        assert_eq!(line_text(&nested), "  ◦ nested");
+        assert_eq!(
+            nested.spans[1].style,
+            Theme::monochrome_for_tests().list_marker
+        );
     }
 
     #[test]
