@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.7] - 2026-05-18
+
+Full commit range: [`v0.1.6...v0.1.7`](https://github.com/pacificcodeinc/glass/compare/v0.1.6...v0.1.7)
+
+### Added
+
+- Markdown table rendering with aligned columns, styled headers, escaped pipe support, and source mapping for search and selection highlights.
+- Table cells wrap into additional visual rows instead of truncating long content.
+- A broad `benchmark.md` fixture covering implemented Markdown behavior, known gaps, and renderer stress cases.
+- GitHub Actions CI for formatting, tests, and release build checks.
+
+### Changed
+
+- Table body rows now use internal separators so wrapped rows remain visually distinct without adding an outside top or bottom border.
+- Wrapped blockquotes keep their quiet quote marker and styling across visual rows.
+- Nested bullets alternate between filled and hollow markers by indentation level.
+
+### Fixed
+
+- Nested blockquotes render repeated quote markers instead of falling back toward plain Markdown source.
+- Long inactive table cells no longer collapse into ellipsized text in narrow article widths.
+- Long benchmark prose now exercises the renderer's wrapping behavior instead of relying on manual hard wraps in the fixture.
+
 ## [0.1.6] - 2026-05-18
 
 Full commit range: [`v0.1.5...v0.1.6`](https://github.com/pacificcodeinc/glass/compare/v0.1.5...v0.1.6)
@@ -134,7 +157,8 @@ Full commit range: [`v0.1.0...v0.1.1`](https://github.com/pacificcodeinc/glass/c
 - Live Markdown rendering with concealed syntax markers.
 - Checkbox (`- [ ]` / `- [x]`) rendering.
 
-[Unreleased]: https://github.com/pacificcodeinc/glass/compare/v0.1.6...HEAD
+[Unreleased]: https://github.com/pacificcodeinc/glass/compare/v0.1.7...HEAD
+[0.1.7]: https://github.com/pacificcodeinc/glass/compare/v0.1.6...v0.1.7
 [0.1.6]: https://github.com/pacificcodeinc/glass/compare/v0.1.5...v0.1.6
 [0.1.5]: https://github.com/pacificcodeinc/glass/compare/v0.1.4...v0.1.5
 [0.1.4]: https://github.com/pacificcodeinc/glass/compare/v0.1.3...v0.1.4

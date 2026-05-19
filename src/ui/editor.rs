@@ -12,7 +12,10 @@ use crate::{
     editor::render::{
         column_in_wrap_segment, detect_list_marker, visible_rows, wrap_index_for_column, wrap_line,
     },
-    markdown::highlight::{concealed_wrap_line, render_markdown_segment_with_completion},
+    markdown::{
+        highlight::{concealed_wrap_line, render_markdown_segment_with_completion},
+        table::TableLayout,
+    },
 };
 
 const ARTICLE_WIDTH: u16 = 82;
@@ -32,6 +35,7 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App, theme: Theme) {
     let line_count = app.buffer.line_count();
     let gutter_width: u16 = (line_count.to_string().len() + 1) as u16;
     let text_width = page.width.saturating_sub(gutter_width).max(1) as usize;
+    let table_layout = TableLayout::new(&app.buffer);
 
     frame.render_widget(
         ratatui::widgets::Clear,
@@ -51,6 +55,8 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App, theme: Theme) {
         |line_num, text, w| {
             if line_num == app.cursor.line {
                 wrap_line(text, w)
+            } else if table_layout.is_table_row(line_num) {
+                table_layout.wrap_line(line_num, text, w)
             } else {
                 concealed_wrap_line(text, w)
             }
@@ -68,82 +74,98 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App, theme: Theme) {
     let mut cursor_visual_y: usize = 0;
     let mut cursor_found = false;
 
-    let lines = rows
-        .iter()
-        .enumerate()
-        .map(|(i, row)| {
-            let is_cursor_row =
-                row.line_number == app.cursor.line && row.wrap_index == wrap_index_of_cursor;
-            let active = row.line_number == app.cursor.line;
+    let height = page.height as usize;
+    let mut lines = Vec::new();
+    for row in &rows {
+        let is_cursor_row =
+            row.line_number == app.cursor.line && row.wrap_index == wrap_index_of_cursor;
+        let active = row.line_number == app.cursor.line;
 
-            let mut line = render_markdown_segment_with_completion(
-                &row.full_text,
+        let table_row = (!active)
+            .then(|| {
+                table_layout.render_row_segment(
+                    row.line_number,
+                    &row.full_text,
+                    text_width,
+                    theme,
+                    row.wrap_index,
+                )
+            })
+            .flatten();
+
+        let (mut line, source_map) = if let Some(rendered) = table_row {
+            (rendered.line, Some(rendered.source_map))
+        } else {
+            (
+                render_markdown_segment_with_completion(
+                    &row.full_text,
+                    row.source_start,
+                    row.source_end,
+                    theme,
+                    active,
+                    row.wrap_index,
+                    row.completed && row.wrap_index > 0,
+                ),
+                None,
+            )
+        };
+
+        if !app.search.query.is_empty() {
+            let mut ranges = search_ranges_for_row(
+                &app.search.matches,
+                row.line_number,
                 row.source_start,
                 row.source_end,
-                theme,
-                active,
-                row.wrap_index,
-                row.completed && row.wrap_index > 0,
             );
-
-            if !app.search.query.is_empty() {
-                let ranges = search_ranges_for_row(
-                    &app.search.matches,
-                    row.line_number,
-                    row.source_start,
-                    row.source_end,
-                );
-                line = highlight_search_ranges(line, &ranges, theme);
+            if let Some(source_map) = &source_map {
+                ranges = source_ranges_to_visual_ranges(source_map, row.source_start, &ranges);
             }
+            line = highlight_search_ranges(line, &ranges, theme);
+        }
 
-            if let Some(selection) = app.text_selection {
-                let ranges = selection_ranges_for_row(
-                    selection,
-                    row.line_number,
-                    row.source_start,
-                    row.source_end,
-                );
-                line = highlight_search_ranges(line, &ranges, theme);
+        if let Some(selection) = app.text_selection {
+            let mut ranges = selection_ranges_for_row(
+                selection,
+                row.line_number,
+                row.source_start,
+                row.source_end,
+            );
+            if let Some(source_map) = &source_map {
+                ranges = source_ranges_to_visual_ranges(source_map, row.source_start, &ranges);
             }
+            line = highlight_search_ranges(line, &ranges, theme);
+        }
 
-            if row.continuation_indent > 0 {
-                let indent = Span::raw(" ".repeat(row.continuation_indent));
-                line.spans.insert(0, indent);
-            }
+        if row.continuation_indent > 0 {
+            let indent = Span::raw(" ".repeat(row.continuation_indent));
+            line.spans.insert(0, indent);
+        }
 
-            if visual_range
-                .as_ref()
-                .is_some_and(|range| range.contains(&row.line_number))
-            {
-                line = selected_line(line, theme);
-            }
-            if is_cursor_row && app.mode != Mode::Visual {
-                line.style = line.style.bg(theme.background);
-            }
+        if visual_range
+            .as_ref()
+            .is_some_and(|range| range.contains(&row.line_number))
+        {
+            line = selected_line(line, theme);
+        }
+        if is_cursor_row && app.mode != Mode::Visual {
+            line.style = line.style.bg(theme.background);
+        }
 
-            if gutter_width > 0 {
-                let gutter = if row.wrap_index == 0 && app.mode == Mode::Visual {
-                    format!(
-                        "{:>w$} ",
-                        row.line_number + 1,
-                        w = gutter_width as usize - 1
-                    )
-                } else {
-                    " ".repeat(gutter_width as usize)
-                };
-                let mut spans = vec![Span::styled(gutter, Style::default().fg(theme.muted))];
-                spans.extend(line.spans);
-                line = Line::from(spans);
-            }
+        line = add_gutter(
+            line,
+            gutter_width,
+            Some((row.line_number, row.wrap_index)),
+            app,
+            theme,
+        );
 
-            if is_cursor_row && !cursor_found {
-                cursor_visual_y = i;
-                cursor_found = true;
-            }
+        if is_cursor_row && !cursor_found && lines.len() < height {
+            cursor_visual_y = lines.len();
+            cursor_found = true;
+        }
 
-            line
-        })
-        .collect::<Vec<_>>();
+        push_line(&mut lines, line, height);
+    }
 
     let paragraph = Paragraph::new(Text::from(lines))
         .style(Style::default().bg(theme.background).fg(theme.text));
@@ -169,6 +191,39 @@ fn selected_line(mut line: Line<'static>, theme: Theme) -> Line<'static> {
         span.style = theme.selection;
     }
     line
+}
+
+fn push_line(lines: &mut Vec<Line<'static>>, line: Line<'static>, height: usize) -> bool {
+    if lines.len() >= height {
+        return false;
+    }
+
+    lines.push(line);
+    true
+}
+
+fn add_gutter(
+    line: Line<'static>,
+    gutter_width: u16,
+    source_position: Option<(usize, usize)>,
+    app: &App,
+    theme: Theme,
+) -> Line<'static> {
+    if gutter_width == 0 {
+        return line;
+    }
+
+    let show_visual_line_number =
+        source_position.is_some_and(|(_, wrap_index)| wrap_index == 0 && app.mode == Mode::Visual);
+    let gutter = if show_visual_line_number {
+        let (line_number, _) = source_position.expect("source position checked above");
+        format!("{:>w$} ", line_number + 1, w = gutter_width as usize - 1)
+    } else {
+        " ".repeat(gutter_width as usize)
+    };
+    let mut spans = vec![Span::styled(gutter, Style::default().fg(theme.muted))];
+    spans.extend(line.spans);
+    Line::from(spans)
 }
 
 fn highlight_search_ranges(
@@ -294,6 +349,40 @@ fn selection_ranges_for_row(
     }
 }
 
+fn source_ranges_to_visual_ranges(
+    source_map: &[Option<usize>],
+    source_start: usize,
+    source_ranges: &[(usize, usize)],
+) -> Vec<(usize, usize)> {
+    let mut ranges = Vec::new();
+    let mut active_start = None;
+
+    for (visual_index, source_index) in source_map.iter().copied().enumerate() {
+        let selected = source_index
+            .and_then(|source_index| source_index.checked_sub(source_start))
+            .is_some_and(|local_source| {
+                source_ranges
+                    .iter()
+                    .any(|(start, end)| local_source >= *start && local_source < *end)
+            });
+
+        match (active_start, selected) {
+            (None, true) => active_start = Some(visual_index),
+            (Some(start), false) => {
+                ranges.push((start, visual_index));
+                active_start = None;
+            }
+            _ => {}
+        }
+    }
+
+    if let Some(start) = active_start {
+        ranges.push((start, source_map.len()));
+    }
+
+    ranges
+}
+
 fn merged_ranges(ranges: &[(usize, usize)]) -> Vec<(usize, usize)> {
     let mut ranges = ranges
         .iter()
@@ -371,5 +460,24 @@ mod tests {
 
         assert_eq!(selection_ranges_for_row(selection, 0, 0, 6), vec![(2, 6)]);
         assert_eq!(selection_ranges_for_row(selection, 0, 6, 12), vec![(0, 3)]);
+    }
+
+    #[test]
+    fn source_ranges_map_to_table_visual_ranges() {
+        let source_map = vec![
+            None,
+            Some(2),
+            Some(3),
+            None,
+            None,
+            Some(8),
+            Some(9),
+            Some(10),
+        ];
+
+        assert_eq!(
+            source_ranges_to_visual_ranges(&source_map, 0, &[(2, 4), (9, 11)]),
+            vec![(1, 3), (6, 8)]
+        );
     }
 }

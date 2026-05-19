@@ -3,3 +3,4 @@ pub mod highlight;
 pub mod inline;
 pub mod mapping;
 pub mod parse;
+pub mod table;
