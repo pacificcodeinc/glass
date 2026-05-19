@@ -466,13 +466,17 @@ impl App {
                 self.mode = Mode::Insert;
             }
             KeyCode::Char('h') | KeyCode::Left => {
-                motions::left(&mut self.cursor);
+                if !self.move_table_cursor_horizontally(-1) {
+                    motions::left(&mut self.cursor);
+                }
                 self.reset_preferred_column();
             }
             KeyCode::Char('j') | KeyCode::Down => self.visual_line_down(),
             KeyCode::Char('k') | KeyCode::Up => self.visual_line_up(),
             KeyCode::Char('l') | KeyCode::Right => {
-                motions::right(&self.buffer, &mut self.cursor);
+                if !self.move_table_cursor_horizontally(1) {
+                    motions::right(&self.buffer, &mut self.cursor);
+                }
                 self.reset_preferred_column();
             }
             KeyCode::Char('w') => {
@@ -650,13 +654,17 @@ impl App {
                 self.delete_visual_lines();
             }
             KeyCode::Char('h') | KeyCode::Left => {
-                motions::left(&mut self.cursor);
+                if !self.move_table_cursor_horizontally(-1) {
+                    motions::left(&mut self.cursor);
+                }
                 self.reset_preferred_column();
             }
             KeyCode::Char('j') | KeyCode::Down => self.visual_line_down(),
             KeyCode::Char('k') | KeyCode::Up => self.visual_line_up(),
             KeyCode::Char('l') | KeyCode::Right => {
-                motions::right(&self.buffer, &mut self.cursor);
+                if !self.move_table_cursor_horizontally(1) {
+                    motions::right(&self.buffer, &mut self.cursor);
+                }
                 self.reset_preferred_column();
             }
             KeyCode::Char('w') => {
@@ -1321,6 +1329,12 @@ impl App {
     }
 
     fn current_visual_column(&self, width: usize) -> usize {
+        if let Some((_, column)) =
+            self.table_visual_position(self.cursor.line, self.cursor.column, width)
+        {
+            return column;
+        }
+
         let (segment_start, _) =
             self.visual_line_bounds(self.cursor.line, self.cursor.column, width);
         self.cursor.column.saturating_sub(segment_start)
@@ -1347,6 +1361,12 @@ impl App {
         preferred_column: usize,
     ) -> Cursor {
         let line = line.min(self.buffer.line_count().saturating_sub(1));
+        if let Some(column) =
+            self.table_source_column_for_visual_position(line, wrap_index, preferred_column, width)
+        {
+            return Cursor { line, column };
+        }
+
         let (segments, _) = self.line_wrap_segments(line, width);
         let segment_index = wrap_index.min(segments.len().saturating_sub(1));
         let Some(&(start, end)) = segments.get(segment_index) else {
@@ -1367,12 +1387,31 @@ impl App {
 
     fn visual_line_start(&mut self) {
         let width = self.wrap_width();
+        if let Some(column) = self.table_source_column_for_visual_position(
+            self.cursor.line,
+            self.wrap_index_for_column(self.cursor.line, self.cursor.column, width),
+            0,
+            width,
+        ) {
+            self.cursor.column = column;
+            return;
+        }
+
         let (seg_start, _) = self.visual_line_bounds(self.cursor.line, self.cursor.column, width);
         self.cursor.column = seg_start;
     }
 
     fn visual_line_end(&mut self) {
         let width = self.wrap_width();
+        if let Some(column) = self.table_source_column_for_visual_end(
+            self.cursor.line,
+            self.wrap_index_for_column(self.cursor.line, self.cursor.column, width),
+            width,
+        ) {
+            self.cursor.column = column;
+            return;
+        }
+
         let (_, seg_end) = self.visual_line_bounds(self.cursor.line, self.cursor.column, width);
         self.cursor.column = seg_end.min(self.buffer.line_len_chars(self.cursor.line));
     }
@@ -1548,24 +1587,38 @@ impl App {
         let width = self.wrap_width();
         let (segments, _) = self.line_wrap_segments(self.cursor.line, width);
         let current_seg = self.wrap_index_for_column(self.cursor.line, self.cursor.column, width);
-        let segment_start = segments
-            .get(current_seg)
-            .map(|(start, _)| *start)
-            .unwrap_or_default();
+        let visual_column = self.current_visual_column(width);
+        let segment_start = if self.is_table_row(self.cursor.line) {
+            self.cursor.column.saturating_sub(visual_column)
+        } else {
+            segments
+                .get(current_seg)
+                .map(|(start, _)| *start)
+                .unwrap_or_default()
+        };
         let rel = self.preferred_visual_column(segment_start);
         if current_seg + 1 < segments.len() {
-            let (next_start, next_end) = segments[current_seg + 1];
-            let max_col = visual_segment_max_column(
-                &segments,
+            if let Some(column) = self.table_source_column_for_visual_position(
+                self.cursor.line,
                 current_seg + 1,
-                self.buffer.line_len_chars(self.cursor.line),
-                next_end,
-            );
-            self.cursor.column = if next_start + rel > max_col {
-                max_col
+                rel,
+                width,
+            ) {
+                self.cursor.column = column;
             } else {
-                next_start + rel
-            };
+                let (next_start, next_end) = segments[current_seg + 1];
+                let max_col = visual_segment_max_column(
+                    &segments,
+                    current_seg + 1,
+                    self.buffer.line_len_chars(self.cursor.line),
+                    next_end,
+                );
+                self.cursor.column = if next_start + rel > max_col {
+                    max_col
+                } else {
+                    next_start + rel
+                };
+            }
         } else if self.cursor.line + 1 < self.buffer.line_count() {
             self.move_to_visual_segment_preserving_column(self.cursor.line + 1, 0, width);
         }
@@ -1575,24 +1628,38 @@ impl App {
         let width = self.wrap_width();
         let (segments, _) = self.line_wrap_segments(self.cursor.line, width);
         let current_seg = self.wrap_index_for_column(self.cursor.line, self.cursor.column, width);
-        let segment_start = segments
-            .get(current_seg)
-            .map(|(start, _)| *start)
-            .unwrap_or_default();
+        let visual_column = self.current_visual_column(width);
+        let segment_start = if self.is_table_row(self.cursor.line) {
+            self.cursor.column.saturating_sub(visual_column)
+        } else {
+            segments
+                .get(current_seg)
+                .map(|(start, _)| *start)
+                .unwrap_or_default()
+        };
         let rel = self.preferred_visual_column(segment_start);
         if current_seg > 0 {
-            let (prev_start, prev_end) = segments[current_seg - 1];
-            let max_col = visual_segment_max_column(
-                &segments,
+            if let Some(column) = self.table_source_column_for_visual_position(
+                self.cursor.line,
                 current_seg - 1,
-                self.buffer.line_len_chars(self.cursor.line),
-                prev_end,
-            );
-            self.cursor.column = if prev_start + rel > max_col {
-                max_col
+                rel,
+                width,
+            ) {
+                self.cursor.column = column;
             } else {
-                prev_start + rel
-            };
+                let (prev_start, prev_end) = segments[current_seg - 1];
+                let max_col = visual_segment_max_column(
+                    &segments,
+                    current_seg - 1,
+                    self.buffer.line_len_chars(self.cursor.line),
+                    prev_end,
+                );
+                self.cursor.column = if prev_start + rel > max_col {
+                    max_col
+                } else {
+                    prev_start + rel
+                };
+            }
         } else if self.cursor.line > 0 {
             let previous_line = self.cursor.line - 1;
             let (previous_segments, _) = self.line_wrap_segments(previous_line, width);
@@ -1823,6 +1890,158 @@ impl App {
         (line, wrap)
     }
 
+    fn is_table_row(&self, line: usize) -> bool {
+        TableLayout::new(&self.buffer).is_table_row(line)
+    }
+
+    fn table_visual_position(
+        &self,
+        line: usize,
+        column: usize,
+        width: usize,
+    ) -> Option<(usize, usize)> {
+        let layout = TableLayout::new(&self.buffer);
+        if !layout.is_table_row(line) {
+            return None;
+        }
+
+        let source = self.buffer.line(line);
+        let trimmed = source.trim_end_matches(['\r', '\n']);
+        let wrap_count = self.line_wrap_count(line, width);
+        let mut fallback = None;
+        for wrap_index in 0..wrap_count {
+            let Some(rendered) =
+                layout.render_row_segment(line, trimmed, width, self.theme, wrap_index)
+            else {
+                continue;
+            };
+
+            let first_source = rendered.source_map.iter().flatten().copied().min();
+            let last_source = rendered.source_map.iter().flatten().copied().max();
+            if let (Some(first), Some(last)) = (first_source, last_source) {
+                if column >= first && column <= last.saturating_add(1) {
+                    let visual_column = rendered
+                        .source_map
+                        .iter()
+                        .position(|source_index| source_index.is_some_and(|index| index >= column))
+                        .or_else(|| rendered.source_map.iter().rposition(Option::is_some))
+                        .unwrap_or_default();
+                    return Some((wrap_index, visual_column));
+                }
+
+                if fallback.is_none() && column < first {
+                    fallback = rendered
+                        .source_map
+                        .iter()
+                        .position(Option::is_some)
+                        .map(|visual_column| (wrap_index, visual_column));
+                }
+            }
+        }
+
+        fallback.or_else(|| {
+            (0..wrap_count).rev().find_map(|wrap_index| {
+                layout
+                    .render_row_segment(line, trimmed, width, self.theme, wrap_index)
+                    .and_then(|rendered| {
+                        rendered
+                            .source_map
+                            .iter()
+                            .rposition(Option::is_some)
+                            .map(|visual_column| (wrap_index, visual_column))
+                    })
+            })
+        })
+    }
+
+    fn table_source_column_for_visual_position(
+        &self,
+        line: usize,
+        wrap_index: usize,
+        visual_column: usize,
+        width: usize,
+    ) -> Option<usize> {
+        let layout = TableLayout::new(&self.buffer);
+        if !layout.is_table_row(line) {
+            return None;
+        }
+
+        let source = self.buffer.line(line);
+        let trimmed = source.trim_end_matches(['\r', '\n']);
+        let rendered = layout.render_row_segment(line, trimmed, width, self.theme, wrap_index)?;
+        rendered
+            .source_map
+            .get(visual_column)
+            .copied()
+            .flatten()
+            .or_else(|| {
+                rendered
+                    .source_map
+                    .iter()
+                    .skip(visual_column)
+                    .flatten()
+                    .copied()
+                    .next()
+            })
+            .or_else(|| {
+                rendered
+                    .source_map
+                    .iter()
+                    .take(visual_column.saturating_add(1))
+                    .rev()
+                    .flatten()
+                    .copied()
+                    .next()
+            })
+    }
+
+    fn table_source_column_for_visual_end(
+        &self,
+        line: usize,
+        wrap_index: usize,
+        width: usize,
+    ) -> Option<usize> {
+        let layout = TableLayout::new(&self.buffer);
+        if !layout.is_table_row(line) {
+            return None;
+        }
+
+        let source = self.buffer.line(line);
+        let trimmed = source.trim_end_matches(['\r', '\n']);
+        let rendered = layout.render_row_segment(line, trimmed, width, self.theme, wrap_index)?;
+        rendered.source_map.iter().flatten().copied().last()
+    }
+
+    fn move_table_cursor_horizontally(&mut self, delta: isize) -> bool {
+        if delta == 0 {
+            return false;
+        }
+
+        let width = self.wrap_width();
+        let Some((wrap_index, visual_column)) =
+            self.table_visual_position(self.cursor.line, self.cursor.column, width)
+        else {
+            return false;
+        };
+
+        let target_column = if delta > 0 {
+            visual_column.saturating_add(1)
+        } else {
+            visual_column.saturating_sub(1)
+        };
+        if let Some(column) = self.table_source_column_for_visual_position(
+            self.cursor.line,
+            wrap_index,
+            target_column,
+            width,
+        ) {
+            self.cursor.column = column;
+            return true;
+        }
+
+        false
+    }
+
     fn line_wrap_count(&self, line: usize, width: usize) -> usize {
         let (segments, _) = self.line_wrap_segments(line, width);
         segments.len().max(1)
@@ -1840,6 +2059,10 @@ impl App {
     }
 
     fn wrap_index_for_column(&self, line: usize, column: usize, width: usize) -> usize {
+        if let Some((wrap_index, _)) = self.table_visual_position(line, column, width) {
+            return wrap_index;
+        }
+
         let (segments, _) = self.line_wrap_segments(line, width);
         for (index, &(start, end)) in segments.iter().enumerate() {
             if column >= start && column < end {
@@ -1850,6 +2073,17 @@ impl App {
     }
 
     fn visual_line_bounds(&self, line: usize, column: usize, width: usize) -> (usize, usize) {
+        if let Some((wrap_index, _)) = self.table_visual_position(line, column, width) {
+            let start = self
+                .table_source_column_for_visual_position(line, wrap_index, 0, width)
+                .unwrap_or_default();
+            let end = self
+                .table_source_column_for_visual_end(line, wrap_index, width)
+                .map(|column| column.saturating_add(1))
+                .unwrap_or(start);
+            return (start, end);
+        }
+
         let (segments, _) = self.line_wrap_segments(line, width);
         for &(start, end) in &segments {
             if column >= start && column < end {
@@ -3470,6 +3704,43 @@ mod tests {
 
         assert!(facade_wraps < raw_wraps);
         assert_eq!(app.line_wrap_count(0, 20), facade_wraps);
+    }
+
+    #[test]
+    fn hjkl_moves_through_rendered_table_rows() {
+        let mut app =
+            test_app("| Name | Notes |\n| --- | --- |\n| Ada | one two three four five six |");
+        app.resize_viewport(10, 28);
+        app.cursor = Cursor { line: 2, column: 8 };
+
+        let width = app.wrap_width();
+        let start = app.table_visual_position(app.cursor.line, app.cursor.column, width);
+        assert_eq!(start, Some((0, 9)));
+
+        press(&mut app, KeyCode::Char('l'));
+        assert_eq!(
+            app.table_visual_position(app.cursor.line, app.cursor.column, width),
+            Some((0, 10))
+        );
+
+        press(&mut app, KeyCode::Char('j'));
+        assert_eq!(app.cursor.line, 2);
+        assert_eq!(
+            app.table_visual_position(app.cursor.line, app.cursor.column, width),
+            Some((1, 10))
+        );
+
+        press(&mut app, KeyCode::Char('k'));
+        assert_eq!(
+            app.table_visual_position(app.cursor.line, app.cursor.column, width),
+            Some((0, 10))
+        );
+
+        press(&mut app, KeyCode::Char('h'));
+        assert_eq!(
+            app.table_visual_position(app.cursor.line, app.cursor.column, width),
+            Some((0, 9))
+        );
     }
 
     #[test]
