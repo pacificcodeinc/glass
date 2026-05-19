@@ -8,7 +8,10 @@ use crate::{
         Block, DocLink, DocRange, Document, Inline, MarkdownCodec, TableAlignment, TableCell,
         TableRow,
     },
-    editor::cursor::Cursor,
+    editor::{
+        commands::{TableColumnPlacement, TableRowPlacement},
+        cursor::Cursor,
+    },
     fs::persistence,
     markdown::parse::parse_markdown,
 };
@@ -372,6 +375,121 @@ impl DocumentBuffer {
         self.update_dirty();
     }
 
+    pub fn insert_table_row_at_cursor(
+        &mut self,
+        cursor: &mut Cursor,
+        placement: TableRowPlacement,
+    ) -> bool {
+        let Some(location) = self.table_location_at_cursor(*cursor) else {
+            return false;
+        };
+
+        self.push_undo_snapshot(*cursor);
+        let Block::Table { rows, .. } = &mut self.document.blocks[location.block_index] else {
+            return false;
+        };
+
+        let column_count = rows
+            .iter()
+            .map(|row| row.cells.len())
+            .max()
+            .unwrap_or(location.column_index + 1)
+            .max(1);
+        let insert_at = match placement {
+            TableRowPlacement::Above => location.row_index,
+            TableRowPlacement::Below => location.row_index + 1,
+        }
+        .min(rows.len());
+        rows.insert(
+            insert_at,
+            TableRow {
+                cells: empty_table_cells(column_count),
+            },
+        );
+
+        self.rebuild_facade_preserving_cursor(cursor);
+        cursor.line = (location.block_start + table_source_line_for_row(insert_at))
+            .min(self.line_count().saturating_sub(1));
+        cursor.column = table_cell_ranges(&self.line(cursor.line))
+            .get(location.column_index.min(column_count.saturating_sub(1)))
+            .map(|(start, _)| *start)
+            .unwrap_or_default();
+        self.update_dirty();
+        true
+    }
+
+    pub fn insert_table_column_at_cursor(
+        &mut self,
+        cursor: &mut Cursor,
+        placement: TableColumnPlacement,
+    ) -> bool {
+        let Some(location) = self.table_location_at_cursor(*cursor) else {
+            return false;
+        };
+
+        self.push_undo_snapshot(*cursor);
+        let Block::Table { alignments, rows } = &mut self.document.blocks[location.block_index]
+        else {
+            return false;
+        };
+
+        let column_count = rows.iter().map(|row| row.cells.len()).max().unwrap_or(0);
+        let insert_at = match placement {
+            TableColumnPlacement::Left => location.column_index,
+            TableColumnPlacement::Right => location.column_index + 1,
+        }
+        .min(column_count);
+
+        for (row_index, row) in rows.iter_mut().enumerate() {
+            while row.cells.len() < column_count {
+                row.cells.push(empty_table_cell());
+            }
+            row.cells.insert(
+                insert_at,
+                TableCell {
+                    content: vec![Inline::Text(if row_index == 0 {
+                        format!("Column {}", insert_at + 1)
+                    } else {
+                        String::new()
+                    })],
+                },
+            );
+        }
+        alignments.resize(column_count, TableAlignment::Left);
+        alignments.insert(insert_at, TableAlignment::Left);
+
+        self.rebuild_facade_preserving_cursor(cursor);
+        cursor.line = (location.block_start + table_source_line_for_row(location.row_index))
+            .min(self.line_count().saturating_sub(1));
+        cursor.column = table_cell_ranges(&self.line(cursor.line))
+            .get(insert_at)
+            .map(|(start, _)| *start)
+            .unwrap_or_default();
+        self.update_dirty();
+        true
+    }
+
+    pub fn enter_table_cell(&mut self, cursor: &mut Cursor) -> bool {
+        let Some(location) = self.table_location_at_cursor(*cursor) else {
+            return false;
+        };
+        let Some(Block::Table { rows, .. }) = self.document.blocks.get(location.block_index) else {
+            return false;
+        };
+
+        if location.row_index + 1 >= rows.len() {
+            return self.insert_table_row_at_cursor(cursor, TableRowPlacement::Below);
+        }
+
+        cursor.line = (location.block_start + table_source_line_for_row(location.row_index + 1))
+            .min(self.line_count().saturating_sub(1));
+        cursor.column = table_cell_ranges(&self.line(cursor.line))
+            .get(location.column_index)
+            .map(|(start, _)| *start)
+            .unwrap_or_default();
+        true
+    }
+
     pub fn move_table_cell(&self, cursor: &mut Cursor, delta: isize) -> bool {
         if delta == 0 || !is_table_content_line(&self.line(cursor.line)) {
             return false;
@@ -495,6 +613,43 @@ impl DocumentBuffer {
         self.document.blocks.len()
     }
 
+    fn table_location_at_cursor(&self, cursor: Cursor) -> Option<TableCursorLocation> {
+        let mut plain_line = 0usize;
+        for (block_index, block) in self.document.blocks.iter().enumerate() {
+            let line_count = block.plain_line_count();
+            let next = plain_line + line_count;
+            if cursor.line >= plain_line && cursor.line < next {
+                let Block::Table { rows, .. } = block else {
+                    return None;
+                };
+                let local_line = cursor.line - plain_line;
+                let row_index =
+                    table_row_for_source_line(local_line).min(rows.len().saturating_sub(1));
+                let column_index = table_cell_ranges(&self.line(cursor.line))
+                    .iter()
+                    .position(|(start, end)| cursor.column >= *start && cursor.column <= *end)
+                    .unwrap_or_else(|| {
+                        table_cell_ranges(&self.line(cursor.line))
+                            .iter()
+                            .position(|(start, _)| cursor.column < *start)
+                            .unwrap_or_else(|| {
+                                rows.get(row_index)
+                                    .map(|row| row.cells.len().saturating_sub(1))
+                                    .unwrap_or_default()
+                            })
+                    });
+                return Some(TableCursorLocation {
+                    block_index,
+                    block_start: plain_line,
+                    row_index,
+                    column_index,
+                });
+            }
+            plain_line = next;
+        }
+        None
+    }
+
     fn visible_len_lines(&self) -> usize {
         let len_chars = self.text.len_chars();
         if len_chars == 0 {
@@ -508,6 +663,35 @@ impl DocumentBuffer {
             len_lines.max(1)
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TableCursorLocation {
+    block_index: usize,
+    block_start: usize,
+    row_index: usize,
+    column_index: usize,
+}
+
+fn empty_table_cell() -> TableCell {
+    TableCell {
+        content: vec![Inline::Text(String::new())],
+    }
+}
+
+fn empty_table_cells(count: usize) -> Vec<TableCell> {
+    (0..count).map(|_| empty_table_cell()).collect()
+}
+
+fn table_row_for_source_line(local_line: usize) -> usize {
+    match local_line {
+        0 | 1 => 0,
+        line => line - 1,
+    }
+}
+
+fn table_source_line_for_row(row_index: usize) -> usize {
+    if row_index == 0 { 0 } else { row_index + 1 }
 }
 
 fn reconcile_facade_document(old: &Document, parsed: Document) -> Document {
@@ -735,6 +919,53 @@ mod tests {
 
         assert!(buffer.move_table_cell(&mut cursor, -1));
         assert_eq!(cursor, Cursor { line: 0, column: 8 });
+    }
+
+    #[test]
+    fn inserts_table_row_below_current_row() {
+        let mut buffer = DocumentBuffer::empty();
+        let mut cursor = Cursor::default();
+        buffer.insert_str(&mut cursor, "| A | B |\n| --- | --- |\n| x | y |");
+        cursor = Cursor { line: 2, column: 2 };
+
+        assert!(buffer.insert_table_row_at_cursor(&mut cursor, TableRowPlacement::Below));
+
+        assert_eq!(
+            buffer.markdown_string(),
+            "| A   | B   |\n| --- | --- |\n| x   | y   |\n|     |     |"
+        );
+        assert_eq!(cursor.line, 3);
+    }
+
+    #[test]
+    fn inserts_table_column_right_of_current_cell() {
+        let mut buffer = DocumentBuffer::empty();
+        let mut cursor = Cursor::default();
+        buffer.insert_str(&mut cursor, "| A | B |\n| --- | --- |\n| x | y |");
+        cursor = Cursor { line: 2, column: 2 };
+
+        assert!(buffer.insert_table_column_at_cursor(&mut cursor, TableColumnPlacement::Right));
+
+        assert_eq!(
+            buffer.markdown_string(),
+            "| A   | Column 2 | B   |\n| --- | -------- | --- |\n| x   |          | y   |"
+        );
+        assert_eq!(cursor.line, 2);
+    }
+
+    #[test]
+    fn enter_moves_to_next_table_row_or_adds_one() {
+        let mut buffer = DocumentBuffer::empty();
+        let mut cursor = Cursor::default();
+        buffer.insert_str(&mut cursor, "| A | B |\n| --- | --- |\n| x | y |");
+        cursor = Cursor { line: 0, column: 2 };
+
+        assert!(buffer.enter_table_cell(&mut cursor));
+        assert_eq!(cursor.line, 2);
+
+        assert!(buffer.enter_table_cell(&mut cursor));
+        assert_eq!(cursor.line, 3);
+        assert!(buffer.markdown_string().ends_with("\n|     |     |"));
     }
 
     #[test]
