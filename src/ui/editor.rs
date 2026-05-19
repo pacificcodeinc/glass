@@ -10,9 +10,7 @@ use crate::{
     app::{App, Mode, SearchMatch, TextSelection},
     config::theme::Theme,
     document::Block,
-    editor::render::{
-        column_in_wrap_segment, detect_list_marker, visible_rows, wrap_index_for_column, wrap_line,
-    },
+    editor::render::{detect_list_marker, visible_rows},
     markdown::{
         highlight::{concealed_wrap_line, render_markdown_segment_with_completion},
         table::TableLayout,
@@ -54,9 +52,7 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App, theme: Theme) {
         page.height as usize,
         text_width,
         |line_num, text, w| {
-            if line_num == app.cursor.line {
-                wrap_line(text, w)
-            } else if table_layout.is_table_row(line_num) {
+            if table_layout.is_table_row(line_num) {
                 table_layout.wrap_line(line_num, text, w)
             } else {
                 concealed_wrap_line(text, w)
@@ -70,8 +66,13 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App, theme: Theme) {
     });
 
     let cursor_line_text = app.buffer.line(app.cursor.line);
-    let wrap_index_of_cursor =
-        wrap_index_for_column(&cursor_line_text, app.cursor.column, text_width);
+    let (cursor_segments, _) = facade_wrap_line(
+        &table_layout,
+        app.cursor.line,
+        &cursor_line_text,
+        text_width,
+    );
+    let wrap_index_of_cursor = wrap_index_for_segments(&cursor_segments, app.cursor.column);
     let mut cursor_visual_y: usize = 0;
     let mut cursor_visual_x: Option<u16> = None;
     let mut cursor_found = false;
@@ -197,13 +198,50 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App, theme: Theme) {
             0
         };
         let x = cursor_visual_x.unwrap_or_else(|| {
-            column_in_wrap_segment(&cursor_line_text, app.cursor.column, text_width) as u16
+            column_in_segments(&cursor_segments, app.cursor.column) as u16
                 + gutter_width
                 + cursor_indent as u16
         });
         let y = cursor_visual_y as u16;
         frame.set_cursor_position(Position::new(page.x + x, page.y + y));
     }
+}
+
+fn facade_wrap_line(
+    table_layout: &TableLayout,
+    line_number: usize,
+    text: &str,
+    width: usize,
+) -> (Vec<(usize, usize)>, usize) {
+    let trimmed = text.trim_end_matches(['\r', '\n']);
+    if table_layout.is_table_row(line_number) {
+        table_layout.wrap_line(line_number, trimmed, width)
+    } else {
+        concealed_wrap_line(trimmed, width)
+    }
+}
+
+fn wrap_index_for_segments(segments: &[(usize, usize)], column: usize) -> usize {
+    for (index, &(start, end)) in segments.iter().enumerate() {
+        if column >= start && column < end {
+            return index;
+        }
+    }
+    segments.len().saturating_sub(1)
+}
+
+fn column_in_segments(segments: &[(usize, usize)], column: usize) -> usize {
+    for &(start, end) in segments {
+        if column >= start && column < end {
+            return column.saturating_sub(start);
+        }
+    }
+
+    if let Some(&(start, end)) = segments.last() {
+        return (end - start).min(column.saturating_sub(start));
+    }
+
+    0
 }
 
 fn render_document_segment(
