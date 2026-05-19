@@ -40,6 +40,8 @@ pub enum Mode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CommandPrompt {
     Command,
+    File,
+    Palette,
     Search,
 }
 
@@ -253,8 +255,13 @@ impl App {
             return Ok(());
         }
 
-        if self.mode != Mode::CommandLine && is_command_sheet_shortcut(key) {
-            self.enter_command_sheet(CommandPrompt::Command);
+        if self.mode != Mode::CommandLine && is_file_picker_shortcut(key) {
+            self.enter_command_sheet(CommandPrompt::File);
+            return Ok(());
+        }
+
+        if self.mode != Mode::CommandLine && is_command_palette_shortcut(key) {
+            self.enter_command_sheet(CommandPrompt::Palette);
             return Ok(());
         }
 
@@ -984,6 +991,33 @@ impl App {
             return self.execute_search_query(&input, selected);
         }
 
+        if matches!(self.sheet.prompt, CommandPrompt::File) {
+            if let Some(item) = selected {
+                return self.execute_sheet_item(item);
+            }
+            if let Some(path) = resolve_command_path_input(&input, &self.notes_dir) {
+                self.finish_command_sheet();
+                return self.open_path(&path);
+            }
+            self.finish_command_sheet();
+            self.set_status(format!("No file match: {input}"));
+            return Ok(());
+        }
+
+        if matches!(self.sheet.prompt, CommandPrompt::Palette) {
+            let command = parse_command(&input);
+            if !matches!(command, Command::Unknown(_)) {
+                self.finish_command_sheet();
+                return self.execute_command(command);
+            }
+            if let Some(item) = selected {
+                return self.execute_sheet_item(item);
+            }
+            self.finish_command_sheet();
+            self.set_status(format!("No command match: {input}"));
+            return Ok(());
+        }
+
         if let Some(search_query) = input.strip_prefix('/') {
             return self.execute_search_query(search_query.trim(), selected);
         }
@@ -1654,16 +1688,29 @@ impl App {
 
     fn refresh_sheet_items(&mut self) {
         let input = self.command_line.trim().to_string();
-        let mut items = if matches!(self.sheet.prompt, CommandPrompt::Search) {
-            self.preview_search(&input);
-            search_sheet_items(&self.buffer, &input)
-        } else if let Some(search_query) = input.strip_prefix('/') {
-            let query = search_query.trim();
-            self.preview_search(query);
-            search_sheet_items(&self.buffer, query)
-        } else {
-            self.clear_search();
-            command_sheet_items(&input, &self.notes_dir, &self.file_tree)
+        let mut items = match self.sheet.prompt {
+            CommandPrompt::Search => {
+                self.preview_search(&input);
+                search_sheet_items(&self.buffer, &input)
+            }
+            CommandPrompt::File => {
+                self.clear_search();
+                file_sheet_items(&input, &self.notes_dir, &self.file_tree)
+            }
+            CommandPrompt::Palette => {
+                self.clear_search();
+                palette_sheet_items(&input)
+            }
+            CommandPrompt::Command => {
+                if let Some(search_query) = input.strip_prefix('/') {
+                    let query = search_query.trim();
+                    self.preview_search(query);
+                    search_sheet_items(&self.buffer, query)
+                } else {
+                    self.clear_search();
+                    command_sheet_items(&input, &self.notes_dir, &self.file_tree)
+                }
+            }
         };
 
         items.truncate(128);
@@ -1900,17 +1947,30 @@ fn is_text_input_key(key: KeyEvent) -> bool {
         .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER)
 }
 
-fn is_command_sheet_shortcut(key: KeyEvent) -> bool {
+fn is_file_picker_shortcut(key: KeyEvent) -> bool {
+    is_primary_p_shortcut(key) && !key.modifiers.contains(KeyModifiers::SHIFT) && !is_upper_p(key)
+}
+
+fn is_command_palette_shortcut(key: KeyEvent) -> bool {
+    is_primary_p_shortcut(key) && (key.modifiers.contains(KeyModifiers::SHIFT) || is_upper_p(key))
+}
+
+fn is_primary_p_shortcut(key: KeyEvent) -> bool {
     matches!(key.code, KeyCode::Char('p') | KeyCode::Char('P'))
         && key
             .modifiers
             .intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER)
 }
 
+fn is_upper_p(key: KeyEvent) -> bool {
+    matches!(key.code, KeyCode::Char('P'))
+}
+
 #[derive(Debug, Clone, Copy)]
 struct CommandCandidate {
     replacement: &'static str,
     label: &'static str,
+    command_label: &'static str,
     detail: &'static str,
     aliases: &'static [&'static str],
     action: CommandCandidateAction,
@@ -1926,51 +1986,58 @@ enum CommandCandidateAction {
 const COMMAND_CANDIDATES: &[CommandCandidate] = &[
     CommandCandidate {
         replacement: "w",
-        label: "write",
+        label: "Save File",
+        command_label: ":w",
         detail: "Save current file",
         aliases: &["w", "write", "save"],
         action: CommandCandidateAction::Command("w"),
     },
     CommandCandidate {
         replacement: "q",
-        label: "quit",
+        label: "Quit",
+        command_label: ":q",
         detail: "Quit if there are no unsaved changes",
         aliases: &["q", "quit", "close"],
         action: CommandCandidateAction::Command("q"),
     },
     CommandCandidate {
         replacement: "q!",
-        label: "quit!",
+        label: "Force Quit",
+        command_label: ":q!",
         detail: "Quit and discard unsaved changes",
         aliases: &["q!", "quit!", "force quit"],
         action: CommandCandidateAction::Command("q!"),
     },
     CommandCandidate {
         replacement: "wq",
-        label: "write quit",
+        label: "Save And Quit",
+        command_label: ":wq",
         detail: "Save current file and quit",
         aliases: &["wq", "x", "write quit", "save quit"],
         action: CommandCandidateAction::Command("wq"),
     },
     CommandCandidate {
         replacement: "e ",
-        label: "edit",
+        label: "Open File",
+        command_label: ":edit",
         detail: "Open a file path",
         aliases: &["e", "edit", "open", "file"],
         action: CommandCandidateAction::Complete("e "),
     },
     CommandCandidate {
         replacement: "/",
-        label: "search",
+        label: "Find In Document",
+        command_label: "/",
         detail: "Find text in the current document",
         aliases: &["/", "search", "find"],
         action: CommandCandidateAction::BeginSearch,
     },
     CommandCandidate {
         replacement: "table",
-        label: "table",
-        detail: "Insert a Markdown table",
-        aliases: &["table", "grid"],
+        label: "Insert Table",
+        command_label: ":table",
+        detail: "Insert a 2x2 table",
+        aliases: &["table", "insert table", "grid"],
         action: CommandCandidateAction::Command("table"),
     },
 ];
@@ -1981,29 +2048,90 @@ fn command_sheet_items(
     file_tree: &FileTree,
 ) -> Vec<(usize, SheetItem)> {
     let mut items = Vec::new();
+    let is_editing_path = is_edit_command_input(input);
 
-    for candidate in COMMAND_CANDIDATES {
-        if let Some(score) = score_command_candidate(input, candidate) {
-            items.push((1_000 + score, command_sheet_item(candidate)));
+    if !is_editing_path {
+        for candidate in COMMAND_CANDIDATES {
+            if let Some(score) = score_command_candidate(input, candidate) {
+                items.push((score, command_sheet_item(candidate, false)));
+            }
         }
     }
 
     let file_query = file_query_for_command_input(input);
+    if is_editing_path {
+        for (score, mut item) in file_sheet_items(file_query, notes_dir, file_tree) {
+            item.replacement = edit_replacement(input, &item.replacement);
+            items.push((score, item));
+        }
+    }
+
+    items.sort_by(|left, right| {
+        left.0
+            .cmp(&right.0)
+            .then_with(|| left.1.label.cmp(&right.1.label))
+            .then_with(|| left.1.detail.cmp(&right.1.detail))
+    });
+    items
+}
+
+fn palette_sheet_items(input: &str) -> Vec<(usize, SheetItem)> {
+    let mut items = Vec::new();
+    for candidate in COMMAND_CANDIDATES {
+        if matches!(candidate.action, CommandCandidateAction::Complete(_)) {
+            continue;
+        }
+        if let Some(score) = score_command_candidate(input, candidate) {
+            items.push((score, command_sheet_item(candidate, true)));
+        }
+    }
+
+    items.sort_by(|left, right| {
+        left.0
+            .cmp(&right.0)
+            .then_with(|| left.1.label.cmp(&right.1.label))
+    });
+    items
+}
+
+fn file_sheet_items(
+    input: &str,
+    notes_dir: &Path,
+    file_tree: &FileTree,
+) -> Vec<(usize, SheetItem)> {
+    let mut items = Vec::new();
+    let query = input.trim();
+
     for entry in file_tree.entries.iter().filter(|entry| !entry.is_dir) {
-        if let Some(score) = score_file_entry(file_query, notes_dir, entry) {
+        if let Some(score) = score_file_entry(query, notes_dir, entry) {
             let relative = relative_path_label(notes_dir, &entry.path);
             items.push((
                 score,
                 SheetItem {
                     kind: SheetItemKind::File,
                     label: entry.display_name.clone(),
-                    detail: relative.clone(),
-                    replacement: if input.starts_with("e ") || input.starts_with("edit ") {
-                        format!("e {relative}")
-                    } else {
-                        relative
-                    },
+                    detail: file_detail(notes_dir, entry, &relative),
+                    replacement: relative,
                     action: SheetAction::File(entry.path.clone()),
+                },
+            ));
+        }
+    }
+
+    if let Some(path) = resolve_command_path_input(query, notes_dir) {
+        let already_listed = items
+            .iter()
+            .any(|(_, item)| item.action == SheetAction::File(path.clone()));
+        if !already_listed {
+            let relative = relative_path_label(notes_dir, &path);
+            items.push((
+                0,
+                SheetItem {
+                    kind: SheetItemKind::File,
+                    label: relative.clone(),
+                    detail: "Create new file".to_string(),
+                    replacement: relative,
+                    action: SheetAction::File(path),
                 },
             ));
         }
@@ -2018,7 +2146,7 @@ fn command_sheet_items(
     items
 }
 
-fn command_sheet_item(candidate: &CommandCandidate) -> SheetItem {
+fn command_sheet_item(candidate: &CommandCandidate, palette: bool) -> SheetItem {
     let action = match candidate.action {
         CommandCandidateAction::Command(command) => SheetAction::Command(command.to_string()),
         CommandCandidateAction::Complete(value) => SheetAction::Complete(value.to_string()),
@@ -2027,7 +2155,12 @@ fn command_sheet_item(candidate: &CommandCandidate) -> SheetItem {
 
     SheetItem {
         kind: SheetItemKind::Command,
-        label: candidate.label.to_string(),
+        label: if palette {
+            candidate.label
+        } else {
+            candidate.command_label
+        }
+        .to_string(),
         detail: candidate.detail.to_string(),
         replacement: candidate.replacement.to_string(),
         action,
@@ -2055,6 +2188,37 @@ fn file_query_for_command_input(input: &str) -> &str {
         }
     }
     input
+}
+
+fn is_edit_command_input(input: &str) -> bool {
+    let input = input.trim();
+    if input == "e" || input == "edit" {
+        return true;
+    }
+
+    input
+        .split_once(' ')
+        .is_some_and(|(command, _)| matches!(command, "e" | "edit"))
+}
+
+fn edit_replacement(input: &str, path: &str) -> String {
+    let command = input
+        .trim()
+        .split_once(' ')
+        .map(|(command, _)| command)
+        .filter(|command| matches!(*command, "e" | "edit"))
+        .unwrap_or("e");
+    format!("{command} {path}")
+}
+
+fn file_detail(notes_dir: &Path, entry: &crate::fs::tree::TreeEntry, relative: &str) -> String {
+    entry
+        .path
+        .parent()
+        .and_then(|parent| parent.strip_prefix(notes_dir).ok())
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .map(|parent| parent.display().to_string())
+        .unwrap_or_else(|| relative.to_string())
 }
 
 fn resolve_command_path_input(input: &str, notes_dir: &Path) -> Option<PathBuf> {
@@ -3200,16 +3364,15 @@ mod tests {
     }
 
     #[test]
-    fn primary_p_opens_command_sheet_and_esc_closes_it() {
+    fn primary_p_opens_file_picker_and_esc_closes_it() {
         let mut app = test_app("text");
         app.status_message = "ready".to_string();
 
         press_modified(&mut app, KeyCode::Char('p'), KeyModifiers::SUPER);
 
         assert_eq!(app.mode, Mode::CommandLine);
-        assert_eq!(app.sheet.prompt, CommandPrompt::Command);
+        assert_eq!(app.sheet.prompt, CommandPrompt::File);
         assert_eq!(app.command_line, "");
-        assert!(!app.sheet.items.is_empty());
 
         press(&mut app, KeyCode::Esc);
 
@@ -3219,7 +3382,27 @@ mod tests {
     }
 
     #[test]
-    fn command_sheet_filters_matches_and_opens_selected_file() {
+    fn shifted_primary_p_opens_command_palette() {
+        let mut app = test_app("text");
+
+        press_modified(
+            &mut app,
+            KeyCode::Char('P'),
+            KeyModifiers::SUPER | KeyModifiers::SHIFT,
+        );
+
+        assert_eq!(app.mode, Mode::CommandLine);
+        assert_eq!(app.sheet.prompt, CommandPrompt::Palette);
+        assert!(
+            app.sheet
+                .items
+                .iter()
+                .any(|item| item.label == "Insert Table")
+        );
+    }
+
+    #[test]
+    fn file_picker_filters_matches_and_opens_selected_file() {
         let mut app = test_app("text");
         app.notes_dir = PathBuf::from("/notes");
         app.file_tree.entries = vec![
@@ -3248,7 +3431,7 @@ mod tests {
     }
 
     #[test]
-    fn command_sheet_lists_files_before_commands() {
+    fn command_line_lists_files_only_after_edit_command() {
         let mut app = test_app("text");
         app.notes_dir = PathBuf::from("/notes");
         app.file_tree.entries = vec![TreeEntry {
@@ -3258,6 +3441,16 @@ mod tests {
         }];
 
         press(&mut app, KeyCode::Char(':'));
+
+        assert!(
+            app.sheet
+                .items
+                .iter()
+                .all(|item| item.kind == SheetItemKind::Command)
+        );
+
+        press(&mut app, KeyCode::Char('e'));
+        press(&mut app, KeyCode::Char(' '));
 
         assert_eq!(app.sheet.items[0].kind, SheetItemKind::File);
         assert_eq!(app.sheet.items[0].label, "CHANGELOG.md");
@@ -3317,7 +3510,7 @@ mod tests {
     }
 
     #[test]
-    fn command_sheet_can_complete_selected_files_into_the_input() {
+    fn command_line_can_complete_selected_files_after_edit_command() {
         let mut app = test_app("text");
         app.notes_dir = PathBuf::from("/notes");
         app.file_tree.entries = vec![TreeEntry {
@@ -3327,12 +3520,14 @@ mod tests {
         }];
 
         press(&mut app, KeyCode::Char(':'));
+        press(&mut app, KeyCode::Char('e'));
+        press(&mut app, KeyCode::Char(' '));
         for ch in "gla".chars() {
             press(&mut app, KeyCode::Char(ch));
         }
         press(&mut app, KeyCode::Right);
 
-        assert_eq!(app.command_line, "projects/glass.md");
+        assert_eq!(app.command_line, "e projects/glass.md");
     }
 
     #[test]

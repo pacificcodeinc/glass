@@ -6,7 +6,7 @@ use ratatui::{
 };
 
 use crate::{
-    app::{App, SheetItemKind},
+    app::{App, CommandPrompt, SheetItemKind},
     config::theme::Theme,
 };
 
@@ -40,23 +40,51 @@ fn sheet_items(app: &App, theme: Theme, start: usize, end: usize) -> Vec<ListIte
     app.sheet.items[start..end]
         .iter()
         .map(|item| {
-            let kind = match item.kind {
-                SheetItemKind::Command => "CMD",
-                SheetItemKind::File => "FILE",
-                SheetItemKind::Search => "FIND",
+            let line = match app.sheet.prompt {
+                CommandPrompt::File => file_item_line(item, theme),
+                CommandPrompt::Palette => action_item_line(item, theme),
+                CommandPrompt::Search => search_item_line(item, theme),
+                CommandPrompt::Command => command_item_line(item, theme),
             };
-            let action = match item.kind {
-                SheetItemKind::Command => item.label.clone(),
-                SheetItemKind::File => "navigate".to_string(),
-                SheetItemKind::Search => item.label.clone(),
-            };
-            ListItem::new(Line::from(vec![
-                Span::styled(format!("{kind:<4} "), theme.status),
-                Span::styled(action, theme.status),
-                Span::styled(format!("  {}", item.detail), theme.status),
-            ]))
+            ListItem::new(line)
         })
         .collect()
+}
+
+fn file_item_line(item: &crate::app::SheetItem, theme: Theme) -> Line<'static> {
+    if item.detail.is_empty() || item.detail == item.label {
+        return Line::from(Span::styled(item.label.clone(), theme.status));
+    }
+
+    Line::from(vec![
+        Span::styled(item.label.clone(), theme.status),
+        Span::styled(format!("  {}", item.detail), theme.status),
+    ])
+}
+
+fn action_item_line(item: &crate::app::SheetItem, theme: Theme) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(item.label.clone(), theme.status),
+        Span::styled(format!("  {}", item.detail), theme.status),
+    ])
+}
+
+fn search_item_line(item: &crate::app::SheetItem, theme: Theme) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(item.label.clone(), theme.status),
+        Span::styled(format!("  {}", item.detail), theme.status),
+    ])
+}
+
+fn command_item_line(item: &crate::app::SheetItem, theme: Theme) -> Line<'static> {
+    match item.kind {
+        SheetItemKind::Command => Line::from(vec![
+            Span::styled(item.label.clone(), theme.status),
+            Span::styled(format!("  {}", item.detail), theme.status),
+        ]),
+        SheetItemKind::File => file_item_line(item, theme),
+        SheetItemKind::Search => search_item_line(item, theme),
+    }
 }
 
 fn sheet_window(app: &App, visible_height: usize) -> (usize, usize) {
@@ -76,9 +104,14 @@ fn sheet_window(app: &App, visible_height: usize) -> (usize, usize) {
 }
 
 fn empty_message(app: &App) -> &'static str {
-    if app.command_line.trim().is_empty() {
-        "Type a command, file, or search query"
-    } else {
-        "No matches"
+    if !app.command_line.trim().is_empty() {
+        return "No matches";
+    }
+
+    match app.sheet.prompt {
+        CommandPrompt::Command => "Type a command",
+        CommandPrompt::File => "Type a file name",
+        CommandPrompt::Palette => "Type an action",
+        CommandPrompt::Search => "Type a search query",
     }
 }
