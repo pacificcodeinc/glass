@@ -22,7 +22,7 @@ use crate::{
         render::{visible_rows, visual_line_bounds, wrap_index_for_column, wrap_line},
     },
     fs::tree::FileTree,
-    markdown::inline::{LinkKind, link_at_column},
+    markdown::inline::LinkKind,
     markdown::{highlight::concealed_wrap_line, table::TableLayout},
 };
 
@@ -387,20 +387,7 @@ impl App {
     fn selected_text(&self) -> Option<String> {
         let selection = self.text_selection?;
         let (start, end) = selection.ordered();
-        let start = self.buffer.char_index(start);
-        let end = self.buffer.char_index(end);
-        if start == end {
-            return None;
-        }
-
-        Some(
-            self.buffer
-                .as_string()
-                .chars()
-                .skip(start)
-                .take(end.saturating_sub(start))
-                .collect(),
-        )
+        self.buffer.selected_markdown(start, end)
     }
 
     fn handle_normal_key(&mut self, key: KeyEvent) -> Result<()> {
@@ -583,7 +570,13 @@ impl App {
                 self.reset_preferred_column();
             }
             KeyCode::Tab => {
-                self.buffer.insert_str(&mut self.cursor, "    ");
+                if !self.buffer.move_table_cell(&mut self.cursor, 1) {
+                    self.buffer.insert_str(&mut self.cursor, "    ");
+                }
+                self.reset_preferred_column();
+            }
+            KeyCode::BackTab => {
+                self.buffer.move_table_cell(&mut self.cursor, -1);
                 self.reset_preferred_column();
             }
             KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -1105,6 +1098,10 @@ impl App {
                 self.should_quit = true;
             }
             Command::Edit(path) => self.open_path(&path)?,
+            Command::Table { rows, columns } => {
+                self.buffer.insert_table(rows, columns, &mut self.cursor);
+                self.set_status(format!("Inserted {rows}x{columns} table"));
+            }
             Command::Unknown(value) => {
                 self.set_status(format!("Unknown command: {value}"));
             }
@@ -1684,9 +1681,7 @@ impl App {
     }
 
     fn follow_link_under_cursor(&mut self) -> Result<()> {
-        let line = self.buffer.line(self.cursor.line);
-        let source = line.trim_end_matches(['\r', '\n']);
-        let Some(link) = link_at_column(source, self.cursor.column) else {
+        let Some(link) = self.buffer.link_at_cursor(self.cursor) else {
             self.set_status("No link under cursor");
             return Ok(());
         };
@@ -1862,27 +1857,14 @@ impl App {
     }
 
     fn toggle_checkbox(&mut self) -> bool {
-        let original_cursor = self.cursor;
-        let line = self.buffer.line(original_cursor.line);
-        let trimmed = line.trim_end_matches(['\r', '\n']);
-        let leading_ws_len = trimmed.len() - trimmed.trim_start().len();
-        let content = &trimmed[leading_ws_len..];
-
-        let col = leading_ws_len + 3;
-
-        if content.starts_with("- [ ] ") || content.starts_with("- [x] ") {
-            let unchecked = content.starts_with("- [ ] ");
-            let start = self.buffer.char_index(Cursor {
-                line: original_cursor.line,
-                column: col,
-            });
-            let replacement = if unchecked { "x" } else { " " };
-            self.buffer
-                .replace_range(start, start + 1, replacement, &mut self.cursor);
-            self.cursor = original_cursor;
+        let mut cursor = self.cursor;
+        if self
+            .buffer
+            .toggle_checkbox_at_line(self.cursor.line, &mut cursor)
+        {
+            self.cursor = cursor;
             return true;
         }
-
         false
     }
 }
@@ -1983,6 +1965,13 @@ const COMMAND_CANDIDATES: &[CommandCandidate] = &[
         detail: "Find text in the current document",
         aliases: &["/", "search", "find"],
         action: CommandCandidateAction::BeginSearch,
+    },
+    CommandCandidate {
+        replacement: "table",
+        label: "table",
+        detail: "Insert a Markdown table",
+        aliases: &["table", "grid"],
+        action: CommandCandidateAction::Command("table"),
     },
 ];
 
@@ -2500,7 +2489,7 @@ fn list_continuation_after_enter(line: &str, column: usize) -> ListContinuation 
     }
 
     let prefix = match item.kind {
-        ListItemKind::Checkbox => format!("{leading_ws}- [ ] "),
+        ListItemKind::Checkbox => format!("{leading_ws}[ ] "),
         ListItemKind::Bullet(marker) => format!("{leading_ws}{marker} "),
         ListItemKind::Numbered(number) => format!("{leading_ws}{}. ", number + 1),
     };
@@ -2522,6 +2511,22 @@ struct ListItem<'a> {
 }
 
 fn parse_list_item(content: &str) -> Option<ListItem<'_>> {
+    if let Some(rest) = content
+        .strip_prefix("[ ]")
+        .or_else(|| content.strip_prefix("[x]"))
+    {
+        if let Some(item_content) = rest
+            .strip_prefix(' ')
+            .or_else(|| rest.is_empty().then_some(""))
+        {
+            return Some(ListItem {
+                kind: ListItemKind::Checkbox,
+                marker_len: content.len() - item_content.len(),
+                content: item_content,
+            });
+        }
+    }
+
     if let Some(rest) = content
         .strip_prefix("- [ ]")
         .or_else(|| content.strip_prefix("- [x]"))
@@ -2546,7 +2551,7 @@ fn parse_list_item(content: &str) -> Option<ListItem<'_>> {
         });
     }
 
-    for marker in ['-', '*', '+'] {
+    for marker in ['•', '◦', '-', '*', '+'] {
         let prefix = [marker, ' '].iter().collect::<String>();
         if let Some(item_content) = content.strip_prefix(&prefix) {
             return Some(ListItem {
@@ -3468,10 +3473,12 @@ mod tests {
         app.cursor = Cursor { line: 0, column: 0 };
 
         press(&mut app, KeyCode::Enter);
-        assert_eq!(app.buffer.as_string(), "- [x] todo");
+        assert_eq!(app.buffer.as_string(), "[x] todo");
+        assert_eq!(app.buffer.markdown_string(), "- [x] todo");
 
         press(&mut app, KeyCode::Char('u'));
-        assert_eq!(app.buffer.as_string(), "- [ ] todo");
+        assert_eq!(app.buffer.as_string(), "[ ] todo");
+        assert_eq!(app.buffer.markdown_string(), "- [ ] todo");
     }
 
     #[test]
@@ -3538,11 +3545,11 @@ mod tests {
     fn enter_continues_checkbox_items_at_end_and_middle() {
         assert_eq!(
             list_continuation_after_enter("- [ ] todo", 10),
-            ListContinuation::Continue("- [ ] ".to_string())
+            ListContinuation::Continue("[ ] ".to_string())
         );
         assert_eq!(
             list_continuation_after_enter("- [x] todo", 6),
-            ListContinuation::Continue("- [ ] ".to_string())
+            ListContinuation::Continue("[ ] ".to_string())
         );
     }
 
@@ -3569,13 +3576,15 @@ mod tests {
         buffer.insert_str(&mut cursor, "- [ ] todo");
 
         insert_newline_with_list_continuation(&mut buffer, &mut cursor);
-        assert_eq!(buffer.as_string(), "- [ ] todo\n- [ ] ");
-        assert_eq!(cursor, Cursor { line: 1, column: 6 });
+        assert_eq!(buffer.as_string(), "[ ] todo\n[ ] ");
+        assert_eq!(buffer.markdown_string(), "- [ ] todo\n- [ ] ");
+        assert_eq!(cursor, Cursor { line: 1, column: 4 });
 
         insert_newline_with_list_continuation(&mut buffer, &mut cursor);
         buffer.clamp_cursor(&mut cursor);
 
-        assert_eq!(buffer.as_string(), "- [ ] todo\n\n");
+        assert_eq!(buffer.as_string(), "[ ] todo\n\n");
+        assert_eq!(buffer.markdown_string(), "- [ ] todo\n\n");
         assert_eq!(cursor, Cursor { line: 1, column: 0 });
     }
 
@@ -3588,7 +3597,8 @@ mod tests {
 
         insert_newline_with_list_continuation(&mut buffer, &mut cursor);
 
-        assert_eq!(buffer.as_string(), "- [ ] todo\n\nafter");
+        assert_eq!(buffer.as_string(), "[ ] todo\n\nafter");
+        assert_eq!(buffer.markdown_string(), "- [ ] todo\n\nafter");
         assert_eq!(cursor, Cursor { line: 1, column: 0 });
     }
 

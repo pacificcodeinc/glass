@@ -1,5 +1,6 @@
 mod app;
 mod config;
+mod document;
 mod editor;
 mod fs;
 mod markdown;

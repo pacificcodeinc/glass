@@ -68,7 +68,8 @@ pub fn visible_rows(
 }
 
 fn is_checked_checkbox(text: &str) -> bool {
-    text.trim_start().starts_with("- [x] ")
+    let text = text.trim_start();
+    text.starts_with("- [x] ") || text.starts_with("[x] ")
 }
 
 /// Returns the wrap segment index (0-based) that contains the given column.
@@ -130,6 +131,9 @@ pub fn detect_list_marker(text: &str) -> usize {
 
     if trimmed.starts_with("- [ ] ") || trimmed.starts_with("- [x] ") {
         return ws + 6;
+    }
+    if trimmed.starts_with("[ ] ") || trimmed.starts_with("[x] ") {
+        return ws + 4;
     }
     if trimmed.starts_with("- ") || trimmed.starts_with("* ") || trimmed.starts_with("+ ") {
         return ws + 2;
@@ -226,7 +230,7 @@ mod tests {
 
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[1].line_number, 1);
-        assert_eq!(rows[1].full_text, "- [ ] ");
+        assert_eq!(rows[1].full_text, "[ ] ");
         assert_eq!(rows[1].wrap_index, 0);
         assert!(!rows[1].completed);
     }

@@ -9,6 +9,7 @@ use ratatui::{
 use crate::{
     app::{App, Mode, SearchMatch, TextSelection},
     config::theme::Theme,
+    document::Block,
     editor::render::{
         column_in_wrap_segment, detect_list_marker, visible_rows, wrap_index_for_column, wrap_line,
     },
@@ -72,6 +73,7 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App, theme: Theme) {
     let wrap_index_of_cursor =
         wrap_index_for_column(&cursor_line_text, app.cursor.column, text_width);
     let mut cursor_visual_y: usize = 0;
+    let mut cursor_visual_x: Option<u16> = None;
     let mut cursor_found = false;
 
     let height = page.height as usize;
@@ -81,20 +83,27 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App, theme: Theme) {
             row.line_number == app.cursor.line && row.wrap_index == wrap_index_of_cursor;
         let active = row.line_number == app.cursor.line;
 
-        let table_row = (!active)
-            .then(|| {
-                table_layout.render_row_segment(
-                    row.line_number,
-                    &row.full_text,
-                    text_width,
-                    theme,
-                    row.wrap_index,
-                )
-            })
-            .flatten();
+        let table_row = table_layout.render_row_segment(
+            row.line_number,
+            &row.full_text,
+            text_width,
+            theme,
+            row.wrap_index,
+        );
 
         let (mut line, source_map) = if let Some(rendered) = table_row {
             (rendered.line, Some(rendered.source_map))
+        } else if let Some(block) = app.buffer.block_for_line(row.line_number) {
+            (
+                render_document_segment(
+                    block,
+                    &row.full_text,
+                    row.source_start,
+                    row.source_end,
+                    theme,
+                ),
+                None,
+            )
         } else {
             (
                 render_markdown_segment_with_completion(
@@ -161,6 +170,16 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App, theme: Theme) {
 
         if is_cursor_row && !cursor_found && lines.len() < height {
             cursor_visual_y = lines.len();
+            if let Some(source_map) = &source_map {
+                let source_column = app.cursor.column;
+                let mapped_column = source_map
+                    .iter()
+                    .position(|source_index| {
+                        source_index.is_some_and(|index| index >= source_column)
+                    })
+                    .unwrap_or(source_map.len());
+                cursor_visual_x = Some(gutter_width + mapped_column as u16);
+            }
             cursor_found = true;
         }
 
@@ -177,11 +196,42 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App, theme: Theme) {
         } else {
             0
         };
-        let x = column_in_wrap_segment(&cursor_line_text, app.cursor.column, text_width) as u16
-            + gutter_width
-            + cursor_indent as u16;
+        let x = cursor_visual_x.unwrap_or_else(|| {
+            column_in_wrap_segment(&cursor_line_text, app.cursor.column, text_width) as u16
+                + gutter_width
+                + cursor_indent as u16
+        });
         let y = cursor_visual_y as u16;
         frame.set_cursor_position(Position::new(page.x + x, page.y + y));
+    }
+}
+
+fn render_document_segment(
+    block: &Block,
+    source: &str,
+    segment_start: usize,
+    segment_end: usize,
+    theme: Theme,
+) -> Line<'static> {
+    let text = char_slice(source, segment_start, segment_end);
+    match block {
+        Block::Heading { .. } => Line::from(Span::styled(text, theme.heading)),
+        Block::Quote { .. } => Line::from(Span::styled(text, theme.quote)),
+        Block::CodeFence { .. } => Line::from(Span::styled(text, theme.inline_code)),
+        Block::RawMarkdown(_) => Line::from(Span::styled(text, theme.muted)),
+        Block::ListItem { .. } | Block::ChecklistItem { .. } => {
+            let marker_len = text
+                .find(' ')
+                .map(|index| index + 1)
+                .unwrap_or_else(|| text.chars().count());
+            let marker = char_slice(&text, 0, marker_len);
+            let body = char_slice(&text, marker_len, text.chars().count());
+            Line::from(vec![
+                Span::styled(marker, theme.list_marker),
+                Span::styled(body, Style::default().fg(theme.text)),
+            ])
+        }
+        _ => Line::from(Span::styled(text, Style::default().fg(theme.text))),
     }
 }
 
