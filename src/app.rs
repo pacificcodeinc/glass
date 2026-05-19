@@ -19,10 +19,10 @@ use crate::{
         commands::{Command, parse_command},
         cursor::Cursor,
         motions,
-        render::{visible_rows, visual_line_bounds, wrap_index_for_column, wrap_line},
+        render::visible_rows,
     },
     fs::tree::FileTree,
-    markdown::inline::{LinkKind, link_at_column},
+    markdown::inline::LinkKind,
     markdown::{highlight::concealed_wrap_line, table::TableLayout},
 };
 
@@ -387,20 +387,7 @@ impl App {
     fn selected_text(&self) -> Option<String> {
         let selection = self.text_selection?;
         let (start, end) = selection.ordered();
-        let start = self.buffer.char_index(start);
-        let end = self.buffer.char_index(end);
-        if start == end {
-            return None;
-        }
-
-        Some(
-            self.buffer
-                .as_string()
-                .chars()
-                .skip(start)
-                .take(end.saturating_sub(start))
-                .collect(),
-        )
+        self.buffer.selected_markdown(start, end)
     }
 
     fn handle_normal_key(&mut self, key: KeyEvent) -> Result<()> {
@@ -479,13 +466,17 @@ impl App {
                 self.mode = Mode::Insert;
             }
             KeyCode::Char('h') | KeyCode::Left => {
-                motions::left(&mut self.cursor);
+                if !self.move_table_cursor_horizontally(-1) {
+                    motions::left(&mut self.cursor);
+                }
                 self.reset_preferred_column();
             }
             KeyCode::Char('j') | KeyCode::Down => self.visual_line_down(),
             KeyCode::Char('k') | KeyCode::Up => self.visual_line_up(),
             KeyCode::Char('l') | KeyCode::Right => {
-                motions::right(&self.buffer, &mut self.cursor);
+                if !self.move_table_cursor_horizontally(1) {
+                    motions::right(&self.buffer, &mut self.cursor);
+                }
                 self.reset_preferred_column();
             }
             KeyCode::Char('w') => {
@@ -561,7 +552,9 @@ impl App {
         match key.code {
             KeyCode::Esc => self.mode = Mode::Normal,
             KeyCode::Enter => {
-                insert_newline_with_list_continuation(&mut self.buffer, &mut self.cursor);
+                if !self.buffer.enter_table_cell(&mut self.cursor) {
+                    insert_newline_with_list_continuation(&mut self.buffer, &mut self.cursor);
+                }
                 self.reset_preferred_column();
             }
             KeyCode::Backspace => {
@@ -583,7 +576,13 @@ impl App {
                 self.reset_preferred_column();
             }
             KeyCode::Tab => {
-                self.buffer.insert_str(&mut self.cursor, "    ");
+                if !self.buffer.move_table_cell(&mut self.cursor, 1) {
+                    self.buffer.insert_str(&mut self.cursor, "    ");
+                }
+                self.reset_preferred_column();
+            }
+            KeyCode::BackTab => {
+                self.buffer.move_table_cell(&mut self.cursor, -1);
                 self.reset_preferred_column();
             }
             KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -657,13 +656,17 @@ impl App {
                 self.delete_visual_lines();
             }
             KeyCode::Char('h') | KeyCode::Left => {
-                motions::left(&mut self.cursor);
+                if !self.move_table_cursor_horizontally(-1) {
+                    motions::left(&mut self.cursor);
+                }
                 self.reset_preferred_column();
             }
             KeyCode::Char('j') | KeyCode::Down => self.visual_line_down(),
             KeyCode::Char('k') | KeyCode::Up => self.visual_line_up(),
             KeyCode::Char('l') | KeyCode::Right => {
-                motions::right(&self.buffer, &mut self.cursor);
+                if !self.move_table_cursor_horizontally(1) {
+                    motions::right(&self.buffer, &mut self.cursor);
+                }
                 self.reset_preferred_column();
             }
             KeyCode::Char('w') => {
@@ -1105,6 +1108,32 @@ impl App {
                 self.should_quit = true;
             }
             Command::Edit(path) => self.open_path(&path)?,
+            Command::Table { rows, columns } => {
+                self.buffer.insert_table(rows, columns, &mut self.cursor);
+                self.set_status(format!("Inserted {rows}x{columns} table"));
+            }
+            Command::TableRow { placement } => {
+                if self
+                    .buffer
+                    .insert_table_row_at_cursor(&mut self.cursor, placement)
+                {
+                    self.set_status("Inserted table row");
+                    self.reset_preferred_column();
+                } else {
+                    self.set_status("Not in a table");
+                }
+            }
+            Command::TableColumn { placement } => {
+                if self
+                    .buffer
+                    .insert_table_column_at_cursor(&mut self.cursor, placement)
+                {
+                    self.set_status("Inserted table column");
+                    self.reset_preferred_column();
+                } else {
+                    self.set_status("Not in a table");
+                }
+            }
             Command::Unknown(value) => {
                 self.set_status(format!("Unknown command: {value}"));
             }
@@ -1232,9 +1261,7 @@ impl App {
             self.viewport.visible_height,
             width,
             |line_num, text, width| {
-                if line_num == self.cursor.line {
-                    wrap_line(text, width)
-                } else if table_layout.is_table_row(line_num) {
+                if table_layout.is_table_row(line_num) {
                     table_layout.wrap_line(line_num, text, width)
                 } else {
                     concealed_wrap_line(text, width)
@@ -1296,11 +1323,7 @@ impl App {
     }
 
     fn keep_cursor_in_scrolled_viewport(&mut self, width: usize) {
-        let cursor_wrap = wrap_index_for_column(
-            &self.buffer.line(self.cursor.line),
-            self.cursor.column,
-            width,
-        );
+        let cursor_wrap = self.wrap_index_for_column(self.cursor.line, self.cursor.column, width);
         let preferred_column = self.current_visual_column(width);
 
         if visual_position_before(
@@ -1330,8 +1353,14 @@ impl App {
     }
 
     fn current_visual_column(&self, width: usize) -> usize {
-        let line_text = self.buffer.line(self.cursor.line);
-        let (segment_start, _) = visual_line_bounds(&line_text, self.cursor.column, width);
+        if let Some((_, column)) =
+            self.table_visual_position(self.cursor.line, self.cursor.column, width)
+        {
+            return column;
+        }
+
+        let (segment_start, _) =
+            self.visual_line_bounds(self.cursor.line, self.cursor.column, width);
         self.cursor.column.saturating_sub(segment_start)
     }
 
@@ -1356,9 +1385,13 @@ impl App {
         preferred_column: usize,
     ) -> Cursor {
         let line = line.min(self.buffer.line_count().saturating_sub(1));
-        let line_text = self.buffer.line(line);
-        let trimmed = line_text.trim_end_matches(['\r', '\n']);
-        let (segments, _) = wrap_line(trimmed, width);
+        if let Some(column) =
+            self.table_source_column_for_visual_position(line, wrap_index, preferred_column, width)
+        {
+            return Cursor { line, column };
+        }
+
+        let (segments, _) = self.line_wrap_segments(line, width);
         let segment_index = wrap_index.min(segments.len().saturating_sub(1));
         let Some(&(start, end)) = segments.get(segment_index) else {
             return Cursor { line, column: 0 };
@@ -1377,16 +1410,33 @@ impl App {
     }
 
     fn visual_line_start(&mut self) {
-        let line_text = self.buffer.line(self.cursor.line);
         let width = self.wrap_width();
-        let (seg_start, _) = visual_line_bounds(&line_text, self.cursor.column, width);
+        if let Some(column) = self.table_source_column_for_visual_position(
+            self.cursor.line,
+            self.wrap_index_for_column(self.cursor.line, self.cursor.column, width),
+            0,
+            width,
+        ) {
+            self.cursor.column = column;
+            return;
+        }
+
+        let (seg_start, _) = self.visual_line_bounds(self.cursor.line, self.cursor.column, width);
         self.cursor.column = seg_start;
     }
 
     fn visual_line_end(&mut self) {
-        let line_text = self.buffer.line(self.cursor.line);
         let width = self.wrap_width();
-        let (_, seg_end) = visual_line_bounds(&line_text, self.cursor.column, width);
+        if let Some(column) = self.table_source_column_for_visual_end(
+            self.cursor.line,
+            self.wrap_index_for_column(self.cursor.line, self.cursor.column, width),
+            width,
+        ) {
+            self.cursor.column = column;
+            return;
+        }
+
+        let (_, seg_end) = self.visual_line_bounds(self.cursor.line, self.cursor.column, width);
         self.cursor.column = seg_end.min(self.buffer.line_len_chars(self.cursor.line));
     }
 
@@ -1539,8 +1589,7 @@ impl App {
         width: usize,
     ) {
         let line = line.min(self.buffer.line_count().saturating_sub(1));
-        let line_text = self.buffer.line(line);
-        let (segments, _) = wrap_line(line_text.trim_end_matches(['\r', '\n']), width);
+        let (segments, _) = self.line_wrap_segments(line, width);
         let Some(&(start, end)) = segments.get(segment_index) else {
             self.cursor.line = line;
             self.cursor.column = self.buffer.line_len_chars(line);
@@ -1559,61 +1608,85 @@ impl App {
     }
 
     fn visual_line_down(&mut self) {
-        let line_text = self.buffer.line(self.cursor.line);
         let width = self.wrap_width();
-        let (segments, _) = wrap_line(line_text.trim_end_matches(['\r', '\n']), width);
-        let current_seg = wrap_index_for_column(&line_text, self.cursor.column, width);
-        let segment_start = segments
-            .get(current_seg)
-            .map(|(start, _)| *start)
-            .unwrap_or_default();
+        let (segments, _) = self.line_wrap_segments(self.cursor.line, width);
+        let current_seg = self.wrap_index_for_column(self.cursor.line, self.cursor.column, width);
+        let visual_column = self.current_visual_column(width);
+        let segment_start = if self.is_table_row(self.cursor.line) {
+            self.cursor.column.saturating_sub(visual_column)
+        } else {
+            segments
+                .get(current_seg)
+                .map(|(start, _)| *start)
+                .unwrap_or_default()
+        };
         let rel = self.preferred_visual_column(segment_start);
         if current_seg + 1 < segments.len() {
-            let (next_start, next_end) = segments[current_seg + 1];
-            let max_col = visual_segment_max_column(
-                &segments,
+            if let Some(column) = self.table_source_column_for_visual_position(
+                self.cursor.line,
                 current_seg + 1,
-                self.buffer.line_len_chars(self.cursor.line),
-                next_end,
-            );
-            self.cursor.column = if next_start + rel > max_col {
-                max_col
+                rel,
+                width,
+            ) {
+                self.cursor.column = column;
             } else {
-                next_start + rel
-            };
+                let (next_start, next_end) = segments[current_seg + 1];
+                let max_col = visual_segment_max_column(
+                    &segments,
+                    current_seg + 1,
+                    self.buffer.line_len_chars(self.cursor.line),
+                    next_end,
+                );
+                self.cursor.column = if next_start + rel > max_col {
+                    max_col
+                } else {
+                    next_start + rel
+                };
+            }
         } else if self.cursor.line + 1 < self.buffer.line_count() {
             self.move_to_visual_segment_preserving_column(self.cursor.line + 1, 0, width);
         }
     }
 
     fn visual_line_up(&mut self) {
-        let line_text = self.buffer.line(self.cursor.line);
         let width = self.wrap_width();
-        let (segments, _) = wrap_line(line_text.trim_end_matches(['\r', '\n']), width);
-        let current_seg = wrap_index_for_column(&line_text, self.cursor.column, width);
-        let segment_start = segments
-            .get(current_seg)
-            .map(|(start, _)| *start)
-            .unwrap_or_default();
+        let (segments, _) = self.line_wrap_segments(self.cursor.line, width);
+        let current_seg = self.wrap_index_for_column(self.cursor.line, self.cursor.column, width);
+        let visual_column = self.current_visual_column(width);
+        let segment_start = if self.is_table_row(self.cursor.line) {
+            self.cursor.column.saturating_sub(visual_column)
+        } else {
+            segments
+                .get(current_seg)
+                .map(|(start, _)| *start)
+                .unwrap_or_default()
+        };
         let rel = self.preferred_visual_column(segment_start);
         if current_seg > 0 {
-            let (prev_start, prev_end) = segments[current_seg - 1];
-            let max_col = visual_segment_max_column(
-                &segments,
+            if let Some(column) = self.table_source_column_for_visual_position(
+                self.cursor.line,
                 current_seg - 1,
-                self.buffer.line_len_chars(self.cursor.line),
-                prev_end,
-            );
-            self.cursor.column = if prev_start + rel > max_col {
-                max_col
+                rel,
+                width,
+            ) {
+                self.cursor.column = column;
             } else {
-                prev_start + rel
-            };
+                let (prev_start, prev_end) = segments[current_seg - 1];
+                let max_col = visual_segment_max_column(
+                    &segments,
+                    current_seg - 1,
+                    self.buffer.line_len_chars(self.cursor.line),
+                    prev_end,
+                );
+                self.cursor.column = if prev_start + rel > max_col {
+                    max_col
+                } else {
+                    prev_start + rel
+                };
+            }
         } else if self.cursor.line > 0 {
             let previous_line = self.cursor.line - 1;
-            let previous_text = self.buffer.line(previous_line);
-            let (previous_segments, _) =
-                wrap_line(previous_text.trim_end_matches(['\r', '\n']), width);
+            let (previous_segments, _) = self.line_wrap_segments(previous_line, width);
             self.move_to_visual_segment_preserving_column(
                 previous_line,
                 previous_segments.len().saturating_sub(1),
@@ -1684,9 +1757,7 @@ impl App {
     }
 
     fn follow_link_under_cursor(&mut self) -> Result<()> {
-        let line = self.buffer.line(self.cursor.line);
-        let source = line.trim_end_matches(['\r', '\n']);
-        let Some(link) = link_at_column(source, self.cursor.column) else {
+        let Some(link) = self.buffer.link_at_cursor(self.cursor) else {
             self.set_status("No link under cursor");
             return Ok(());
         };
@@ -1736,11 +1807,7 @@ impl App {
         let width = self.wrap_width();
         self.normalize_viewport(width);
 
-        let cursor_wrap = wrap_index_for_column(
-            &self.buffer.line(self.cursor.line),
-            self.cursor.column,
-            width,
-        );
+        let cursor_wrap = self.wrap_index_for_column(self.cursor.line, self.cursor.column, width);
         if visual_position_before(
             self.cursor.line,
             cursor_wrap,
@@ -1847,42 +1914,218 @@ impl App {
         (line, wrap)
     }
 
-    fn line_wrap_count(&self, line: usize, width: usize) -> usize {
-        let line_text = self.buffer.line(line);
-        let trimmed = line_text.trim_end_matches(['\r', '\n']);
-        let table_layout = TableLayout::new(&self.buffer);
-        let (segments, _) = if line == self.cursor.line {
-            wrap_line(trimmed, width)
-        } else if table_layout.is_table_row(line) {
-            table_layout.wrap_line(line, trimmed, width)
-        } else {
-            concealed_wrap_line(trimmed, width)
-        };
-        segments.len().max(1)
+    fn is_table_row(&self, line: usize) -> bool {
+        TableLayout::new(&self.buffer).is_table_row(line)
     }
 
-    fn toggle_checkbox(&mut self) -> bool {
-        let original_cursor = self.cursor;
-        let line = self.buffer.line(original_cursor.line);
-        let trimmed = line.trim_end_matches(['\r', '\n']);
-        let leading_ws_len = trimmed.len() - trimmed.trim_start().len();
-        let content = &trimmed[leading_ws_len..];
+    fn table_visual_position(
+        &self,
+        line: usize,
+        column: usize,
+        width: usize,
+    ) -> Option<(usize, usize)> {
+        let layout = TableLayout::new(&self.buffer);
+        if !layout.is_table_row(line) {
+            return None;
+        }
 
-        let col = leading_ws_len + 3;
+        let source = self.buffer.line(line);
+        let trimmed = source.trim_end_matches(['\r', '\n']);
+        let wrap_count = self.line_wrap_count(line, width);
+        let mut fallback = None;
+        for wrap_index in 0..wrap_count {
+            let Some(rendered) =
+                layout.render_row_segment(line, trimmed, width, self.theme, wrap_index)
+            else {
+                continue;
+            };
 
-        if content.starts_with("- [ ] ") || content.starts_with("- [x] ") {
-            let unchecked = content.starts_with("- [ ] ");
-            let start = self.buffer.char_index(Cursor {
-                line: original_cursor.line,
-                column: col,
-            });
-            let replacement = if unchecked { "x" } else { " " };
-            self.buffer
-                .replace_range(start, start + 1, replacement, &mut self.cursor);
-            self.cursor = original_cursor;
+            let first_source = rendered.source_map.iter().flatten().copied().min();
+            let last_source = rendered.source_map.iter().flatten().copied().max();
+            if let (Some(first), Some(last)) = (first_source, last_source) {
+                if column >= first && column <= last.saturating_add(1) {
+                    let visual_column = rendered
+                        .source_map
+                        .iter()
+                        .position(|source_index| source_index.is_some_and(|index| index >= column))
+                        .or_else(|| rendered.source_map.iter().rposition(Option::is_some))
+                        .unwrap_or_default();
+                    return Some((wrap_index, visual_column));
+                }
+
+                if fallback.is_none() && column < first {
+                    fallback = rendered
+                        .source_map
+                        .iter()
+                        .position(Option::is_some)
+                        .map(|visual_column| (wrap_index, visual_column));
+                }
+            }
+        }
+
+        fallback.or_else(|| {
+            (0..wrap_count).rev().find_map(|wrap_index| {
+                layout
+                    .render_row_segment(line, trimmed, width, self.theme, wrap_index)
+                    .and_then(|rendered| {
+                        rendered
+                            .source_map
+                            .iter()
+                            .rposition(Option::is_some)
+                            .map(|visual_column| (wrap_index, visual_column))
+                    })
+            })
+        })
+    }
+
+    fn table_source_column_for_visual_position(
+        &self,
+        line: usize,
+        wrap_index: usize,
+        visual_column: usize,
+        width: usize,
+    ) -> Option<usize> {
+        let layout = TableLayout::new(&self.buffer);
+        if !layout.is_table_row(line) {
+            return None;
+        }
+
+        let source = self.buffer.line(line);
+        let trimmed = source.trim_end_matches(['\r', '\n']);
+        let rendered = layout.render_row_segment(line, trimmed, width, self.theme, wrap_index)?;
+        rendered
+            .source_map
+            .get(visual_column)
+            .copied()
+            .flatten()
+            .or_else(|| {
+                rendered
+                    .source_map
+                    .iter()
+                    .skip(visual_column)
+                    .flatten()
+                    .copied()
+                    .next()
+            })
+            .or_else(|| {
+                rendered
+                    .source_map
+                    .iter()
+                    .take(visual_column.saturating_add(1))
+                    .rev()
+                    .flatten()
+                    .copied()
+                    .next()
+            })
+    }
+
+    fn table_source_column_for_visual_end(
+        &self,
+        line: usize,
+        wrap_index: usize,
+        width: usize,
+    ) -> Option<usize> {
+        let layout = TableLayout::new(&self.buffer);
+        if !layout.is_table_row(line) {
+            return None;
+        }
+
+        let source = self.buffer.line(line);
+        let trimmed = source.trim_end_matches(['\r', '\n']);
+        let rendered = layout.render_row_segment(line, trimmed, width, self.theme, wrap_index)?;
+        rendered.source_map.iter().flatten().copied().last()
+    }
+
+    fn move_table_cursor_horizontally(&mut self, delta: isize) -> bool {
+        if delta == 0 {
+            return false;
+        }
+
+        let width = self.wrap_width();
+        let Some((wrap_index, visual_column)) =
+            self.table_visual_position(self.cursor.line, self.cursor.column, width)
+        else {
+            return false;
+        };
+
+        let target_column = if delta > 0 {
+            visual_column.saturating_add(1)
+        } else {
+            visual_column.saturating_sub(1)
+        };
+        if let Some(column) = self.table_source_column_for_visual_position(
+            self.cursor.line,
+            wrap_index,
+            target_column,
+            width,
+        ) {
+            self.cursor.column = column;
             return true;
         }
 
+        false
+    }
+
+    fn line_wrap_count(&self, line: usize, width: usize) -> usize {
+        let (segments, _) = self.line_wrap_segments(line, width);
+        segments.len().max(1)
+    }
+
+    fn line_wrap_segments(&self, line: usize, width: usize) -> (Vec<(usize, usize)>, usize) {
+        let line_text = self.buffer.line(line);
+        let trimmed = line_text.trim_end_matches(['\r', '\n']);
+        let table_layout = TableLayout::new(&self.buffer);
+        if table_layout.is_table_row(line) {
+            table_layout.wrap_line(line, trimmed, width)
+        } else {
+            concealed_wrap_line(trimmed, width)
+        }
+    }
+
+    fn wrap_index_for_column(&self, line: usize, column: usize, width: usize) -> usize {
+        if let Some((wrap_index, _)) = self.table_visual_position(line, column, width) {
+            return wrap_index;
+        }
+
+        let (segments, _) = self.line_wrap_segments(line, width);
+        for (index, &(start, end)) in segments.iter().enumerate() {
+            if column >= start && column < end {
+                return index;
+            }
+        }
+        segments.len().saturating_sub(1)
+    }
+
+    fn visual_line_bounds(&self, line: usize, column: usize, width: usize) -> (usize, usize) {
+        if let Some((wrap_index, _)) = self.table_visual_position(line, column, width) {
+            let start = self
+                .table_source_column_for_visual_position(line, wrap_index, 0, width)
+                .unwrap_or_default();
+            let end = self
+                .table_source_column_for_visual_end(line, wrap_index, width)
+                .map(|column| column.saturating_add(1))
+                .unwrap_or(start);
+            return (start, end);
+        }
+
+        let (segments, _) = self.line_wrap_segments(line, width);
+        for &(start, end) in &segments {
+            if column >= start && column < end {
+                return (start, end);
+            }
+        }
+        segments.last().copied().unwrap_or((0, 0))
+    }
+
+    fn toggle_checkbox(&mut self) -> bool {
+        let mut cursor = self.cursor;
+        if self
+            .buffer
+            .toggle_checkbox_at_line(self.cursor.line, &mut cursor)
+        {
+            self.cursor = cursor;
+            return true;
+        }
         false
     }
 }
@@ -1983,6 +2226,27 @@ const COMMAND_CANDIDATES: &[CommandCandidate] = &[
         detail: "Find text in the current document",
         aliases: &["/", "search", "find"],
         action: CommandCandidateAction::BeginSearch,
+    },
+    CommandCandidate {
+        replacement: "table",
+        label: "table",
+        detail: "Insert a Markdown table",
+        aliases: &["table", "grid"],
+        action: CommandCandidateAction::Command("table"),
+    },
+    CommandCandidate {
+        replacement: "row",
+        label: "row",
+        detail: "Insert a row below the current table row",
+        aliases: &["row", "table row", "insert row"],
+        action: CommandCandidateAction::Command("row"),
+    },
+    CommandCandidate {
+        replacement: "column",
+        label: "column",
+        detail: "Insert a column right of the current table cell",
+        aliases: &["column", "col", "table column", "insert column"],
+        action: CommandCandidateAction::Command("column"),
     },
 ];
 
@@ -2500,7 +2764,7 @@ fn list_continuation_after_enter(line: &str, column: usize) -> ListContinuation 
     }
 
     let prefix = match item.kind {
-        ListItemKind::Checkbox => format!("{leading_ws}- [ ] "),
+        ListItemKind::Checkbox => format!("{leading_ws}[ ] "),
         ListItemKind::Bullet(marker) => format!("{leading_ws}{marker} "),
         ListItemKind::Numbered(number) => format!("{leading_ws}{}. ", number + 1),
     };
@@ -2522,6 +2786,22 @@ struct ListItem<'a> {
 }
 
 fn parse_list_item(content: &str) -> Option<ListItem<'_>> {
+    if let Some(rest) = content
+        .strip_prefix("[ ]")
+        .or_else(|| content.strip_prefix("[x]"))
+    {
+        if let Some(item_content) = rest
+            .strip_prefix(' ')
+            .or_else(|| rest.is_empty().then_some(""))
+        {
+            return Some(ListItem {
+                kind: ListItemKind::Checkbox,
+                marker_len: content.len() - item_content.len(),
+                content: item_content,
+            });
+        }
+    }
+
     if let Some(rest) = content
         .strip_prefix("- [ ]")
         .or_else(|| content.strip_prefix("- [x]"))
@@ -2546,7 +2826,7 @@ fn parse_list_item(content: &str) -> Option<ListItem<'_>> {
         });
     }
 
-    for marker in ['-', '*', '+'] {
+    for marker in ['•', '◦', '-', '*', '+'] {
         let prefix = [marker, ' '].iter().collect::<String>();
         if let Some(item_content) = content.strip_prefix(&prefix) {
             return Some(ListItem {
@@ -3449,6 +3729,59 @@ mod tests {
     }
 
     #[test]
+    fn active_line_uses_facade_wrapping() {
+        let mut app = test_app("visit https://github.com/pacificcodeinc/glass/issues/123.");
+        app.cursor = Cursor { line: 0, column: 0 };
+
+        let raw_wraps = crate::editor::render::wrap_line(&app.buffer.line(0), 20)
+            .0
+            .len();
+        let facade_wraps = crate::markdown::highlight::concealed_wrap_line(&app.buffer.line(0), 20)
+            .0
+            .len();
+
+        assert!(facade_wraps < raw_wraps);
+        assert_eq!(app.line_wrap_count(0, 20), facade_wraps);
+    }
+
+    #[test]
+    fn hjkl_moves_through_rendered_table_rows() {
+        let mut app =
+            test_app("| Name | Notes |\n| --- | --- |\n| Ada | one two three four five six |");
+        app.resize_viewport(10, 28);
+        app.cursor = Cursor { line: 2, column: 8 };
+
+        let width = app.wrap_width();
+        let start = app.table_visual_position(app.cursor.line, app.cursor.column, width);
+        assert_eq!(start, Some((0, 9)));
+
+        press(&mut app, KeyCode::Char('l'));
+        assert_eq!(
+            app.table_visual_position(app.cursor.line, app.cursor.column, width),
+            Some((0, 10))
+        );
+
+        press(&mut app, KeyCode::Char('j'));
+        assert_eq!(app.cursor.line, 2);
+        assert_eq!(
+            app.table_visual_position(app.cursor.line, app.cursor.column, width),
+            Some((1, 10))
+        );
+
+        press(&mut app, KeyCode::Char('k'));
+        assert_eq!(
+            app.table_visual_position(app.cursor.line, app.cursor.column, width),
+            Some((0, 10))
+        );
+
+        press(&mut app, KeyCode::Char('h'));
+        assert_eq!(
+            app.table_visual_position(app.cursor.line, app.cursor.column, width),
+            Some((0, 9))
+        );
+    }
+
+    #[test]
     fn normal_mode_u_undoes_last_insert() {
         let mut app = test_app("");
         app.mode = Mode::Insert;
@@ -3468,10 +3801,12 @@ mod tests {
         app.cursor = Cursor { line: 0, column: 0 };
 
         press(&mut app, KeyCode::Enter);
-        assert_eq!(app.buffer.as_string(), "- [x] todo");
+        assert_eq!(app.buffer.as_string(), "[x] todo");
+        assert_eq!(app.buffer.markdown_string(), "- [x] todo");
 
         press(&mut app, KeyCode::Char('u'));
-        assert_eq!(app.buffer.as_string(), "- [ ] todo");
+        assert_eq!(app.buffer.as_string(), "[ ] todo");
+        assert_eq!(app.buffer.markdown_string(), "- [ ] todo");
     }
 
     #[test]
@@ -3538,11 +3873,11 @@ mod tests {
     fn enter_continues_checkbox_items_at_end_and_middle() {
         assert_eq!(
             list_continuation_after_enter("- [ ] todo", 10),
-            ListContinuation::Continue("- [ ] ".to_string())
+            ListContinuation::Continue("[ ] ".to_string())
         );
         assert_eq!(
             list_continuation_after_enter("- [x] todo", 6),
-            ListContinuation::Continue("- [ ] ".to_string())
+            ListContinuation::Continue("[ ] ".to_string())
         );
     }
 
@@ -3569,13 +3904,15 @@ mod tests {
         buffer.insert_str(&mut cursor, "- [ ] todo");
 
         insert_newline_with_list_continuation(&mut buffer, &mut cursor);
-        assert_eq!(buffer.as_string(), "- [ ] todo\n- [ ] ");
-        assert_eq!(cursor, Cursor { line: 1, column: 6 });
+        assert_eq!(buffer.as_string(), "[ ] todo\n[ ] ");
+        assert_eq!(buffer.markdown_string(), "- [ ] todo\n- [ ] ");
+        assert_eq!(cursor, Cursor { line: 1, column: 4 });
 
         insert_newline_with_list_continuation(&mut buffer, &mut cursor);
         buffer.clamp_cursor(&mut cursor);
 
-        assert_eq!(buffer.as_string(), "- [ ] todo\n\n");
+        assert_eq!(buffer.as_string(), "[ ] todo\n\n");
+        assert_eq!(buffer.markdown_string(), "- [ ] todo\n\n");
         assert_eq!(cursor, Cursor { line: 1, column: 0 });
     }
 
@@ -3588,7 +3925,8 @@ mod tests {
 
         insert_newline_with_list_continuation(&mut buffer, &mut cursor);
 
-        assert_eq!(buffer.as_string(), "- [ ] todo\n\nafter");
+        assert_eq!(buffer.as_string(), "[ ] todo\n\nafter");
+        assert_eq!(buffer.markdown_string(), "- [ ] todo\n\nafter");
         assert_eq!(cursor, Cursor { line: 1, column: 0 });
     }
 

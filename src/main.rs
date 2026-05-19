@@ -1,5 +1,7 @@
 mod app;
 mod config;
+mod debug_render;
+mod document;
 mod editor;
 mod fs;
 mod markdown;
@@ -10,18 +12,54 @@ use std::{env, path::PathBuf};
 
 use anyhow::{Context, Result, bail};
 
-use crate::{app::App, terminal::TerminalSession};
+use crate::{app::App, debug_render::render_path_to_ansi, terminal::TerminalSession};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 fn main() -> Result<()> {
-    let (notes_dir, initial_file) = parse_args()?;
-    let app = App::new(notes_dir, initial_file)?;
-    TerminalSession::run(app)
+    match parse_args()? {
+        LaunchMode::App {
+            notes_dir,
+            initial_file,
+        } => {
+            let app = App::new(notes_dir, initial_file)?;
+            TerminalSession::run(app)
+        }
+        LaunchMode::Render {
+            notes_dir,
+            initial_file,
+            width,
+            height,
+        } => {
+            print!(
+                "{}",
+                render_path_to_ansi(notes_dir, initial_file, width, height)?
+            );
+            Ok(())
+        }
+    }
 }
 
-fn parse_args() -> Result<(PathBuf, Option<PathBuf>)> {
-    let mut args = env::args_os();
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum LaunchMode {
+    App {
+        notes_dir: PathBuf,
+        initial_file: Option<PathBuf>,
+    },
+    Render {
+        notes_dir: PathBuf,
+        initial_file: Option<PathBuf>,
+        width: u16,
+        height: u16,
+    },
+}
+
+fn parse_args() -> Result<LaunchMode> {
+    parse_args_os(env::args_os().collect())
+}
+
+fn parse_args_os(args: Vec<std::ffi::OsString>) -> Result<LaunchMode> {
+    let mut args = args.into_iter();
     let program = args
         .next()
         .and_then(|arg| arg.into_string().ok())
@@ -31,17 +69,55 @@ fn parse_args() -> Result<(PathBuf, Option<PathBuf>)> {
         bail!("usage: {program} <path>");
     };
 
-    if args.next().is_some() {
-        bail!("usage: {program} <path>");
-    }
-
     let arg_str = arg.to_string_lossy();
     if arg_str == "--version" || arg_str == "-v" {
         println!("glass {VERSION}");
         std::process::exit(0);
     }
 
-    parse_path_arg(PathBuf::from(arg))
+    if arg_str == "--render" || arg_str == "--dump-render" {
+        let mut width = terminal_size_from_env("COLUMNS").unwrap_or(100);
+        let mut height = terminal_size_from_env("LINES").unwrap_or(40);
+        let mut path = None;
+        let rest = args.collect::<Vec<_>>();
+        let mut index = 0usize;
+        while index < rest.len() {
+            let value = rest[index].to_string_lossy();
+            match value.as_ref() {
+                "--width" => {
+                    index += 1;
+                    width = parse_u16_arg(rest.get(index), "--width")?;
+                }
+                "--height" => {
+                    index += 1;
+                    height = parse_u16_arg(rest.get(index), "--height")?;
+                }
+                _ if path.is_none() => path = Some(PathBuf::from(&rest[index])),
+                _ => bail!("usage: {program} --render [--width n] [--height n] <path>"),
+            }
+            index += 1;
+        }
+        let Some(path) = path else {
+            bail!("usage: {program} --render [--width n] [--height n] <path>");
+        };
+        let (notes_dir, initial_file) = parse_path_arg(path)?;
+        return Ok(LaunchMode::Render {
+            notes_dir,
+            initial_file,
+            width,
+            height,
+        });
+    }
+
+    if args.next().is_some() {
+        bail!("usage: {program} <path>");
+    }
+
+    let (notes_dir, initial_file) = parse_path_arg(PathBuf::from(arg))?;
+    Ok(LaunchMode::App {
+        notes_dir,
+        initial_file,
+    })
 }
 
 fn parse_path_arg(path: PathBuf) -> Result<(PathBuf, Option<PathBuf>)> {
@@ -57,6 +133,25 @@ fn parse_path_arg(path: PathBuf) -> Result<(PathBuf, Option<PathBuf>)> {
 
         Ok((parent, Some(canonical)))
     }
+}
+
+fn terminal_size_from_env(name: &str) -> Option<u16> {
+    env::var(name)
+        .ok()?
+        .parse::<u16>()
+        .ok()
+        .filter(|value| *value > 0)
+}
+
+fn parse_u16_arg(value: Option<&std::ffi::OsString>, label: &str) -> Result<u16> {
+    let Some(value) = value else {
+        bail!("missing value for {label}");
+    };
+    let parsed = value
+        .to_string_lossy()
+        .parse::<u16>()
+        .with_context(|| format!("invalid value for {label}"))?;
+    Ok(parsed.max(1))
 }
 
 #[cfg(test)]
@@ -76,5 +171,36 @@ mod tests {
 
         std::fs::remove_dir(dir)?;
         Ok(())
+    }
+
+    #[test]
+    fn render_args_parse_dimensions() -> Result<()> {
+        let mode = parse_args_from([
+            "glass",
+            "--render",
+            "--width",
+            "80",
+            "--height",
+            "24",
+            "README.md",
+        ])?;
+
+        assert!(matches!(
+            mode,
+            LaunchMode::Render {
+                width: 80,
+                height: 24,
+                ..
+            }
+        ));
+        Ok(())
+    }
+
+    fn parse_args_from<const N: usize>(args: [&str; N]) -> Result<LaunchMode> {
+        parse_args_os(
+            args.iter()
+                .map(std::ffi::OsString::from)
+                .collect::<Vec<_>>(),
+        )
     }
 }

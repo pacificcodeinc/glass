@@ -3,31 +3,46 @@ use std::path::{Path, PathBuf};
 use anyhow::Result;
 use ropey::Rope;
 
-use crate::{editor::cursor::Cursor, fs::persistence, markdown::parse::parse_markdown};
+use crate::{
+    document::{
+        Block, DocLink, DocRange, Document, Inline, MarkdownCodec, TableAlignment, TableCell,
+        TableRow,
+    },
+    editor::{
+        commands::{TableColumnPlacement, TableRowPlacement},
+        cursor::Cursor,
+    },
+    fs::persistence,
+    markdown::parse::parse_markdown,
+};
 
 #[derive(Debug, Clone)]
 pub struct DocumentBuffer {
     pub path: Option<PathBuf>,
+    document: Document,
     text: Rope,
     pub dirty: bool,
-    saved_text: Rope,
+    saved_markdown: String,
     undo_stack: Vec<BufferSnapshot>,
 }
 
 #[derive(Debug, Clone)]
 struct BufferSnapshot {
+    document: Document,
     text: Rope,
     cursor: Cursor,
 }
 
 impl DocumentBuffer {
     pub fn empty() -> Self {
-        let text = Rope::new();
+        let document = Document::default();
+        let text = Rope::from_str(&document.plain_text());
         Self {
             path: None,
-            text: text.clone(),
-            saved_text: text,
+            document,
+            text,
             dirty: false,
+            saved_markdown: String::new(),
             undo_stack: Vec::new(),
         }
     }
@@ -35,12 +50,15 @@ impl DocumentBuffer {
     pub fn from_path(path: &Path) -> Result<Self> {
         let contents = persistence::load_utf8(path)?;
         parse_markdown(&contents)?;
-        let text = Rope::from_str(&contents);
+        let document = MarkdownCodec::parse(&contents);
+        let saved_markdown = MarkdownCodec::serialize(&document);
+        let text = Rope::from_str(&document.plain_text());
         Ok(Self {
             path: Some(path.to_path_buf()),
-            saved_text: text.clone(),
+            document,
             text,
             dirty: false,
+            saved_markdown,
             undo_stack: Vec::new(),
         })
     }
@@ -51,9 +69,10 @@ impl DocumentBuffer {
         } else {
             Ok(Self {
                 path: Some(path.to_path_buf()),
-                saved_text: Rope::new(),
+                document: Document::default(),
                 text: Rope::new(),
                 dirty: false,
+                saved_markdown: String::new(),
                 undo_stack: Vec::new(),
             })
         }
@@ -64,8 +83,9 @@ impl DocumentBuffer {
             return Ok(());
         };
 
-        persistence::save_atomic(path, &self.text.to_string())?;
-        self.saved_text = self.text.clone();
+        let markdown = self.markdown_string();
+        persistence::save_atomic(path, &markdown)?;
+        self.saved_markdown = markdown;
         self.dirty = false;
         Ok(())
     }
@@ -100,7 +120,6 @@ impl DocumentBuffer {
     fn insert_char_raw(&mut self, cursor: &mut Cursor, ch: char) {
         let index = self.char_index(*cursor);
         self.text.insert_char(index, ch);
-        self.update_dirty();
 
         if ch == '\n' {
             cursor.line += 1;
@@ -108,6 +127,7 @@ impl DocumentBuffer {
         } else {
             cursor.column += 1;
         }
+        self.sync_document_from_facade(cursor);
     }
 
     pub fn insert_str(&mut self, cursor: &mut Cursor, value: &str) {
@@ -116,9 +136,17 @@ impl DocumentBuffer {
         }
 
         self.push_undo_snapshot(*cursor);
+        let index = self.char_index(*cursor);
+        self.text.insert(index, value);
         for ch in value.chars() {
-            self.insert_char_raw(cursor, ch);
+            if ch == '\n' {
+                cursor.line += 1;
+                cursor.column = 0;
+            } else {
+                cursor.column += 1;
+            }
         }
+        self.sync_document_from_facade(cursor);
     }
 
     pub fn delete_previous_char(&mut self, cursor: &mut Cursor) {
@@ -139,7 +167,6 @@ impl DocumentBuffer {
             None
         };
         self.text.remove(previous..end);
-        self.update_dirty();
 
         if cursor.column > 0 {
             cursor.column -= 1;
@@ -147,6 +174,7 @@ impl DocumentBuffer {
             cursor.line = cursor.line.saturating_sub(1);
             cursor.column = previous_line_len.unwrap_or_default();
         }
+        self.sync_document_from_facade(cursor);
     }
 
     pub fn delete_char(&mut self, cursor: &mut Cursor) {
@@ -157,7 +185,7 @@ impl DocumentBuffer {
 
         self.push_undo_snapshot(*cursor);
         self.text.remove(start..start + 1);
-        self.update_dirty();
+        self.sync_document_from_facade(cursor);
         self.clamp_cursor(cursor);
     }
 
@@ -188,8 +216,8 @@ impl DocumentBuffer {
             self.push_undo_snapshot(*cursor);
         }
         self.text.remove(start..end);
-        self.update_dirty();
         *cursor = self.cursor_from_char_index(start);
+        self.sync_document_from_facade(cursor);
         self.clamp_cursor(cursor);
     }
 
@@ -218,8 +246,8 @@ impl DocumentBuffer {
         if !replacement.is_empty() {
             self.text.insert(start, replacement);
         }
-        self.update_dirty();
         *cursor = self.cursor_from_char_index(start + replacement.chars().count());
+        self.sync_document_from_facade(cursor);
         self.clamp_cursor(cursor);
     }
 
@@ -269,14 +297,270 @@ impl DocumentBuffer {
         self.text.to_string()
     }
 
+    pub fn markdown_string(&self) -> String {
+        MarkdownCodec::serialize(&self.document)
+    }
+
+    pub fn selected_markdown(&self, start: Cursor, end: Cursor) -> Option<String> {
+        let start = self.char_index(start);
+        let end = self.char_index(end);
+        if start == end {
+            return None;
+        }
+
+        Some(self.document.serialize_range(DocRange { start, end }))
+    }
+
+    pub fn link_at_cursor(&self, cursor: Cursor) -> Option<DocLink> {
+        self.document
+            .link_at_plain_position(cursor.line, cursor.column)
+    }
+
+    pub fn block_for_line(&self, line: usize) -> Option<&Block> {
+        self.document.block_for_plain_line(line)
+    }
+
+    pub fn toggle_checkbox_at_line(&mut self, line: usize, cursor: &mut Cursor) -> bool {
+        let mut plain_line = 0usize;
+        for index in 0..self.document.blocks.len() {
+            let block = &self.document.blocks[index];
+            let line_count = block.plain_line_count();
+            if line >= plain_line && line < plain_line + line_count {
+                if matches!(block, Block::ChecklistItem { .. }) {
+                    self.push_undo_snapshot(*cursor);
+                    let Block::ChecklistItem { checked, .. } = &mut self.document.blocks[index]
+                    else {
+                        unreachable!();
+                    };
+                    *checked = !*checked;
+                    self.rebuild_facade_preserving_cursor(cursor);
+                    self.update_dirty();
+                    return true;
+                }
+                return false;
+            }
+            plain_line += line_count;
+        }
+        false
+    }
+
+    pub fn insert_table(&mut self, rows: usize, columns: usize, cursor: &mut Cursor) {
+        self.push_undo_snapshot(*cursor);
+        let rows = rows.max(2);
+        let columns = columns.max(2);
+        let mut table_rows = Vec::new();
+        for row in 0..rows {
+            table_rows.push(TableRow {
+                cells: (0..columns)
+                    .map(|column| TableCell {
+                        content: vec![Inline::Text(if row == 0 {
+                            format!("Column {}", column + 1)
+                        } else {
+                            String::new()
+                        })],
+                    })
+                    .collect(),
+            });
+        }
+
+        let insert_at = self.block_index_for_line(cursor.line);
+        self.document.blocks.insert(
+            insert_at,
+            Block::Table {
+                alignments: vec![TableAlignment::Left; columns],
+                rows: table_rows,
+            },
+        );
+        self.rebuild_facade_preserving_cursor(cursor);
+        self.update_dirty();
+    }
+
+    pub fn insert_table_row_at_cursor(
+        &mut self,
+        cursor: &mut Cursor,
+        placement: TableRowPlacement,
+    ) -> bool {
+        let Some(location) = self.table_location_at_cursor(*cursor) else {
+            return false;
+        };
+
+        self.push_undo_snapshot(*cursor);
+        let Block::Table { rows, .. } = &mut self.document.blocks[location.block_index] else {
+            return false;
+        };
+
+        let column_count = rows
+            .iter()
+            .map(|row| row.cells.len())
+            .max()
+            .unwrap_or(location.column_index + 1)
+            .max(1);
+        let insert_at = match placement {
+            TableRowPlacement::Above => location.row_index,
+            TableRowPlacement::Below => location.row_index + 1,
+        }
+        .min(rows.len());
+        rows.insert(
+            insert_at,
+            TableRow {
+                cells: empty_table_cells(column_count),
+            },
+        );
+
+        self.rebuild_facade_preserving_cursor(cursor);
+        cursor.line = (location.block_start + table_source_line_for_row(insert_at))
+            .min(self.line_count().saturating_sub(1));
+        cursor.column = table_cell_ranges(&self.line(cursor.line))
+            .get(location.column_index.min(column_count.saturating_sub(1)))
+            .map(|(start, _)| *start)
+            .unwrap_or_default();
+        self.update_dirty();
+        true
+    }
+
+    pub fn insert_table_column_at_cursor(
+        &mut self,
+        cursor: &mut Cursor,
+        placement: TableColumnPlacement,
+    ) -> bool {
+        let Some(location) = self.table_location_at_cursor(*cursor) else {
+            return false;
+        };
+
+        self.push_undo_snapshot(*cursor);
+        let Block::Table { alignments, rows } = &mut self.document.blocks[location.block_index]
+        else {
+            return false;
+        };
+
+        let column_count = rows.iter().map(|row| row.cells.len()).max().unwrap_or(0);
+        let insert_at = match placement {
+            TableColumnPlacement::Left => location.column_index,
+            TableColumnPlacement::Right => location.column_index + 1,
+        }
+        .min(column_count);
+
+        for (row_index, row) in rows.iter_mut().enumerate() {
+            while row.cells.len() < column_count {
+                row.cells.push(empty_table_cell());
+            }
+            row.cells.insert(
+                insert_at,
+                TableCell {
+                    content: vec![Inline::Text(if row_index == 0 {
+                        format!("Column {}", insert_at + 1)
+                    } else {
+                        String::new()
+                    })],
+                },
+            );
+        }
+        alignments.resize(column_count, TableAlignment::Left);
+        alignments.insert(insert_at, TableAlignment::Left);
+
+        self.rebuild_facade_preserving_cursor(cursor);
+        cursor.line = (location.block_start + table_source_line_for_row(location.row_index))
+            .min(self.line_count().saturating_sub(1));
+        cursor.column = table_cell_ranges(&self.line(cursor.line))
+            .get(insert_at)
+            .map(|(start, _)| *start)
+            .unwrap_or_default();
+        self.update_dirty();
+        true
+    }
+
+    pub fn enter_table_cell(&mut self, cursor: &mut Cursor) -> bool {
+        let Some(location) = self.table_location_at_cursor(*cursor) else {
+            return false;
+        };
+        let Some(Block::Table { rows, .. }) = self.document.blocks.get(location.block_index) else {
+            return false;
+        };
+
+        if location.row_index + 1 >= rows.len() {
+            return self.insert_table_row_at_cursor(cursor, TableRowPlacement::Below);
+        }
+
+        cursor.line = (location.block_start + table_source_line_for_row(location.row_index + 1))
+            .min(self.line_count().saturating_sub(1));
+        cursor.column = table_cell_ranges(&self.line(cursor.line))
+            .get(location.column_index)
+            .map(|(start, _)| *start)
+            .unwrap_or_default();
+        true
+    }
+
+    pub fn move_table_cell(&self, cursor: &mut Cursor, delta: isize) -> bool {
+        if delta == 0 || !is_table_content_line(&self.line(cursor.line)) {
+            return false;
+        }
+
+        let line = self.line(cursor.line);
+        let cells = table_cell_ranges(&line);
+        if cells.len() < 2 {
+            return false;
+        }
+
+        let current = cells
+            .iter()
+            .position(|(start, end)| cursor.column >= *start && cursor.column <= *end)
+            .unwrap_or_else(|| {
+                cells
+                    .iter()
+                    .position(|(start, _)| cursor.column < *start)
+                    .unwrap_or(cells.len() - 1)
+            });
+        let target = current as isize + delta;
+        if target >= 0 && (target as usize) < cells.len() {
+            cursor.column = cells[target as usize].0;
+            return true;
+        }
+
+        let mut next_line = cursor.line;
+        loop {
+            next_line = if delta > 0 {
+                next_line + 1
+            } else {
+                next_line.saturating_sub(1)
+            };
+            if next_line == cursor.line || next_line >= self.line_count() {
+                return false;
+            }
+            if is_table_content_line(&self.line(next_line)) {
+                break;
+            }
+            if !self.line(next_line).contains('|') {
+                return false;
+            }
+        }
+
+        let next_text = self.line(next_line);
+        if !is_table_content_line(&next_text) {
+            return false;
+        }
+        let next_cells = table_cell_ranges(&next_text);
+        if next_cells.is_empty() {
+            return false;
+        }
+
+        cursor.line = next_line;
+        cursor.column = if delta > 0 {
+            next_cells[0].0
+        } else {
+            next_cells[next_cells.len() - 1].0
+        };
+        true
+    }
+
     pub fn undo(&mut self, cursor: &mut Cursor) -> bool {
         let Some(snapshot) = self.undo_stack.pop() else {
             return false;
         };
 
+        self.document = snapshot.document;
         self.text = snapshot.text;
-        self.update_dirty();
         *cursor = snapshot.cursor;
+        self.update_dirty();
         self.clamp_cursor(cursor);
         true
     }
@@ -291,13 +575,79 @@ impl DocumentBuffer {
         }
 
         self.undo_stack.push(BufferSnapshot {
+            document: self.document.clone(),
             text: self.text.clone(),
             cursor,
         });
     }
 
     fn update_dirty(&mut self) {
-        self.dirty = self.text != self.saved_text;
+        self.dirty = self.markdown_string() != self.saved_markdown;
+    }
+
+    fn sync_document_from_facade(&mut self, cursor: &mut Cursor) {
+        let old_document = self.document.clone();
+        let parsed = MarkdownCodec::parse_plain(&self.text.to_string());
+        self.document = reconcile_facade_document(&old_document, parsed);
+        self.rebuild_facade_preserving_cursor(cursor);
+        self.update_dirty();
+    }
+
+    fn rebuild_facade_preserving_cursor(&mut self, cursor: &mut Cursor) {
+        let line = cursor.line;
+        let column = cursor.column;
+        self.text = Rope::from_str(&self.document.plain_text());
+        cursor.line = line.min(self.text.len_lines().saturating_sub(1));
+        cursor.column = column.min(self.line_len_chars(cursor.line));
+    }
+
+    fn block_index_for_line(&self, line: usize) -> usize {
+        let mut plain_line = 0usize;
+        for (index, block) in self.document.blocks.iter().enumerate() {
+            let next = plain_line + block.plain_line_count();
+            if line <= plain_line || line < next {
+                return index;
+            }
+            plain_line = next;
+        }
+        self.document.blocks.len()
+    }
+
+    fn table_location_at_cursor(&self, cursor: Cursor) -> Option<TableCursorLocation> {
+        let mut plain_line = 0usize;
+        for (block_index, block) in self.document.blocks.iter().enumerate() {
+            let line_count = block.plain_line_count();
+            let next = plain_line + line_count;
+            if cursor.line >= plain_line && cursor.line < next {
+                let Block::Table { rows, .. } = block else {
+                    return None;
+                };
+                let local_line = cursor.line - plain_line;
+                let row_index =
+                    table_row_for_source_line(local_line).min(rows.len().saturating_sub(1));
+                let column_index = table_cell_ranges(&self.line(cursor.line))
+                    .iter()
+                    .position(|(start, end)| cursor.column >= *start && cursor.column <= *end)
+                    .unwrap_or_else(|| {
+                        table_cell_ranges(&self.line(cursor.line))
+                            .iter()
+                            .position(|(start, _)| cursor.column < *start)
+                            .unwrap_or_else(|| {
+                                rows.get(row_index)
+                                    .map(|row| row.cells.len().saturating_sub(1))
+                                    .unwrap_or_default()
+                            })
+                    });
+                return Some(TableCursorLocation {
+                    block_index,
+                    block_start: plain_line,
+                    row_index,
+                    column_index,
+                });
+            }
+            plain_line = next;
+        }
+        None
     }
 
     fn visible_len_lines(&self) -> usize {
@@ -315,8 +665,144 @@ impl DocumentBuffer {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TableCursorLocation {
+    block_index: usize,
+    block_start: usize,
+    row_index: usize,
+    column_index: usize,
+}
+
+fn empty_table_cell() -> TableCell {
+    TableCell {
+        content: vec![Inline::Text(String::new())],
+    }
+}
+
+fn empty_table_cells(count: usize) -> Vec<TableCell> {
+    (0..count).map(|_| empty_table_cell()).collect()
+}
+
+fn table_row_for_source_line(local_line: usize) -> usize {
+    match local_line {
+        0 | 1 => 0,
+        line => line - 1,
+    }
+}
+
+fn table_source_line_for_row(row_index: usize) -> usize {
+    if row_index == 0 { 0 } else { row_index + 1 }
+}
+
+fn reconcile_facade_document(old: &Document, parsed: Document) -> Document {
+    if old.blocks.len() != parsed.blocks.len() {
+        return parsed;
+    }
+
+    let blocks = parsed
+        .blocks
+        .into_iter()
+        .enumerate()
+        .map(|(index, parsed_block)| {
+            let Some(old_block) = old.blocks.get(index) else {
+                return parsed_block;
+            };
+            reconcile_block(old_block, parsed_block)
+        })
+        .collect();
+
+    Document { blocks }
+}
+
+fn reconcile_block(old: &Block, parsed: Block) -> Block {
+    match (&old, parsed) {
+        (_, semantic @ Block::Heading { .. })
+        | (_, semantic @ Block::Quote { .. })
+        | (_, semantic @ Block::ListItem { .. })
+        | (_, semantic @ Block::ChecklistItem { .. })
+        | (_, semantic @ Block::CodeFence { .. })
+        | (_, semantic @ Block::Table { .. })
+        | (_, semantic @ Block::RawMarkdown(_)) => semantic,
+        (Block::Heading { level, .. }, Block::Paragraph(content)) => Block::Heading {
+            level: *level,
+            content,
+        },
+        (Block::Quote { level, .. }, Block::Paragraph(content)) => Block::Quote {
+            level: *level,
+            content,
+        },
+        (Block::ListItem { indent, marker, .. }, Block::Paragraph(content)) => Block::ListItem {
+            indent: *indent,
+            marker: *marker,
+            content,
+        },
+        (
+            Block::ChecklistItem {
+                indent, checked, ..
+            },
+            Block::Paragraph(content),
+        ) => Block::ChecklistItem {
+            indent: *indent,
+            checked: *checked,
+            content,
+        },
+        (_, block) => block,
+    }
+}
+
 fn trim_line_ending_len(line: &str) -> usize {
     line.trim_end_matches(['\r', '\n']).chars().count()
+}
+
+fn is_table_content_line(line: &str) -> bool {
+    let trimmed = line.trim_end_matches(['\r', '\n']).trim();
+    if !trimmed.contains('|') || is_table_delimiter_line(trimmed) {
+        return false;
+    }
+    table_cell_ranges(trimmed).len() >= 2
+}
+
+fn is_table_delimiter_line(line: &str) -> bool {
+    let cells = line
+        .trim_matches('|')
+        .split('|')
+        .map(str::trim)
+        .collect::<Vec<_>>();
+    !cells.is_empty()
+        && cells.iter().all(|cell| {
+            let dashes = cell.trim_matches(':');
+            dashes.len() >= 3 && dashes.chars().all(|ch| ch == '-')
+        })
+}
+
+fn table_cell_ranges(line: &str) -> Vec<(usize, usize)> {
+    let chars = line
+        .trim_end_matches(['\r', '\n'])
+        .chars()
+        .collect::<Vec<_>>();
+    let pipes = chars
+        .iter()
+        .enumerate()
+        .filter_map(|(index, ch)| (*ch == '|').then_some(index))
+        .collect::<Vec<_>>();
+    if pipes.len() < 2 {
+        return Vec::new();
+    }
+
+    pipes
+        .windows(2)
+        .filter_map(|window| {
+            let mut start = window[0] + 1;
+            let mut end = window[1];
+            while start < end && chars[start].is_whitespace() {
+                start += 1;
+            }
+            while end > start && chars[end - 1].is_whitespace() {
+                end -= 1;
+            }
+            Some((start, end))
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -382,15 +868,104 @@ mod tests {
         buffer.insert_str(&mut cursor, "- [ ] todo");
         buffer.undo_stack.clear();
         buffer.dirty = false;
-        cursor = Cursor { line: 0, column: 3 };
-        let start = buffer.char_index(cursor);
+        cursor = Cursor { line: 0, column: 0 };
 
-        buffer.replace_range(start, start + 1, "x", &mut cursor);
-        assert_eq!(buffer.as_string(), "- [x] todo");
+        assert!(buffer.toggle_checkbox_at_line(0, &mut cursor));
+        assert_eq!(buffer.as_string(), "[x] todo");
+        assert_eq!(buffer.markdown_string(), "- [x] todo");
 
         assert!(buffer.undo(&mut cursor));
-        assert_eq!(buffer.as_string(), "- [ ] todo");
-        assert_eq!(cursor, Cursor { line: 0, column: 3 });
+        assert_eq!(buffer.as_string(), "[ ] todo");
+        assert_eq!(buffer.markdown_string(), "- [ ] todo");
+        assert_eq!(cursor, Cursor { line: 0, column: 0 });
+    }
+
+    #[test]
+    fn markdown_shortcut_becomes_facade_heading() {
+        let mut buffer = DocumentBuffer::empty();
+        let mut cursor = Cursor::default();
+
+        buffer.insert_str(&mut cursor, "# Heading");
+
+        assert_eq!(buffer.as_string(), "Heading");
+        assert_eq!(buffer.markdown_string(), "# Heading");
+        assert_eq!(cursor, Cursor { line: 0, column: 7 });
+    }
+
+    #[test]
+    fn selected_range_serializes_back_to_markdown() {
+        let mut buffer = DocumentBuffer::empty();
+        let mut cursor = Cursor::default();
+        buffer.insert_str(&mut cursor, "# Heading");
+
+        let selected =
+            buffer.selected_markdown(Cursor { line: 0, column: 0 }, Cursor { line: 0, column: 7 });
+
+        assert_eq!(selected.as_deref(), Some("# Heading"));
+    }
+
+    #[test]
+    fn table_cell_navigation_moves_between_content_cells() {
+        let mut buffer = DocumentBuffer::empty();
+        let mut cursor = Cursor::default();
+        buffer.insert_str(&mut cursor, "| A | B |\n| --- | --- |\n| x | y |");
+        cursor = Cursor { line: 0, column: 2 };
+
+        assert!(buffer.move_table_cell(&mut cursor, 1));
+        assert_eq!(cursor, Cursor { line: 0, column: 8 });
+
+        assert!(buffer.move_table_cell(&mut cursor, 1));
+        assert_eq!(cursor, Cursor { line: 2, column: 2 });
+
+        assert!(buffer.move_table_cell(&mut cursor, -1));
+        assert_eq!(cursor, Cursor { line: 0, column: 8 });
+    }
+
+    #[test]
+    fn inserts_table_row_below_current_row() {
+        let mut buffer = DocumentBuffer::empty();
+        let mut cursor = Cursor::default();
+        buffer.insert_str(&mut cursor, "| A | B |\n| --- | --- |\n| x | y |");
+        cursor = Cursor { line: 2, column: 2 };
+
+        assert!(buffer.insert_table_row_at_cursor(&mut cursor, TableRowPlacement::Below));
+
+        assert_eq!(
+            buffer.markdown_string(),
+            "| A   | B   |\n| --- | --- |\n| x   | y   |\n|     |     |"
+        );
+        assert_eq!(cursor.line, 3);
+    }
+
+    #[test]
+    fn inserts_table_column_right_of_current_cell() {
+        let mut buffer = DocumentBuffer::empty();
+        let mut cursor = Cursor::default();
+        buffer.insert_str(&mut cursor, "| A | B |\n| --- | --- |\n| x | y |");
+        cursor = Cursor { line: 2, column: 2 };
+
+        assert!(buffer.insert_table_column_at_cursor(&mut cursor, TableColumnPlacement::Right));
+
+        assert_eq!(
+            buffer.markdown_string(),
+            "| A   | Column 2 | B   |\n| --- | -------- | --- |\n| x   |          | y   |"
+        );
+        assert_eq!(cursor.line, 2);
+    }
+
+    #[test]
+    fn enter_moves_to_next_table_row_or_adds_one() {
+        let mut buffer = DocumentBuffer::empty();
+        let mut cursor = Cursor::default();
+        buffer.insert_str(&mut cursor, "| A | B |\n| --- | --- |\n| x | y |");
+        cursor = Cursor { line: 0, column: 2 };
+
+        assert!(buffer.enter_table_cell(&mut cursor));
+        assert_eq!(cursor.line, 2);
+
+        assert!(buffer.enter_table_cell(&mut cursor));
+        assert_eq!(cursor.line, 3);
+        assert!(buffer.markdown_string().ends_with("\n|     |     |"));
     }
 
     #[test]

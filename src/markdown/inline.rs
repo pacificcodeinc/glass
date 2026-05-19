@@ -19,6 +19,7 @@ pub struct InlineLink {
 }
 
 impl InlineLink {
+    #[cfg(test)]
     pub fn contains_column(&self, column: usize) -> bool {
         column >= self.source_start && column < self.source_end
     }
@@ -72,6 +73,7 @@ pub fn links(source: &str) -> Vec<InlineLink> {
     links
 }
 
+#[cfg(test)]
 pub fn link_at_column(source: &str, column: usize) -> Option<InlineLink> {
     links(source)
         .into_iter()
