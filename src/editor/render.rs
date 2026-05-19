@@ -74,6 +74,7 @@ fn is_checked_checkbox(text: &str) -> bool {
 
 /// Returns the wrap segment index (0-based) that contains the given column.
 /// Uses the same word-boundary algorithm as `visible_rows`.
+#[cfg(test)]
 pub fn wrap_index_for_column(line_text: &str, column: usize, width: usize) -> usize {
     let trimmed = line_text.trim_end_matches(['\r', '\n']);
     if trimmed.is_empty() {
@@ -90,6 +91,7 @@ pub fn wrap_index_for_column(line_text: &str, column: usize, width: usize) -> us
 }
 
 /// Returns the column position within the wrap segment.
+#[cfg(test)]
 pub fn column_in_wrap_segment(line_text: &str, column: usize, width: usize) -> usize {
     let trimmed = line_text.trim_end_matches(['\r', '\n']);
     if trimmed.is_empty() {
@@ -109,6 +111,7 @@ pub fn column_in_wrap_segment(line_text: &str, column: usize, width: usize) -> u
 }
 
 /// Returns (start, end) character bounds of the wrap segment that contains `column`.
+#[cfg(test)]
 pub fn visual_line_bounds(line_text: &str, column: usize, width: usize) -> (usize, usize) {
     let trimmed = line_text.trim_end_matches(['\r', '\n']);
     if trimmed.is_empty() {
@@ -155,6 +158,7 @@ pub fn detect_list_marker(text: &str) -> usize {
 /// For list items the first segment includes the marker and subsequent
 /// segments are wrapped with a reduced width so they can be indented.
 /// Returns the segments and the marker length (0 for non-list lines).
+#[cfg(test)]
 pub fn wrap_line(text: &str, width: usize) -> (Vec<(usize, usize)>, usize) {
     let marker_len = detect_list_marker(text);
 

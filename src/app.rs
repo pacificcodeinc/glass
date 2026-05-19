@@ -19,7 +19,7 @@ use crate::{
         commands::{Command, parse_command},
         cursor::Cursor,
         motions,
-        render::{visible_rows, visual_line_bounds, wrap_index_for_column, wrap_line},
+        render::visible_rows,
     },
     fs::tree::FileTree,
     markdown::inline::LinkKind,
@@ -1229,9 +1229,7 @@ impl App {
             self.viewport.visible_height,
             width,
             |line_num, text, width| {
-                if line_num == self.cursor.line {
-                    wrap_line(text, width)
-                } else if table_layout.is_table_row(line_num) {
+                if table_layout.is_table_row(line_num) {
                     table_layout.wrap_line(line_num, text, width)
                 } else {
                     concealed_wrap_line(text, width)
@@ -1293,11 +1291,7 @@ impl App {
     }
 
     fn keep_cursor_in_scrolled_viewport(&mut self, width: usize) {
-        let cursor_wrap = wrap_index_for_column(
-            &self.buffer.line(self.cursor.line),
-            self.cursor.column,
-            width,
-        );
+        let cursor_wrap = self.wrap_index_for_column(self.cursor.line, self.cursor.column, width);
         let preferred_column = self.current_visual_column(width);
 
         if visual_position_before(
@@ -1327,8 +1321,8 @@ impl App {
     }
 
     fn current_visual_column(&self, width: usize) -> usize {
-        let line_text = self.buffer.line(self.cursor.line);
-        let (segment_start, _) = visual_line_bounds(&line_text, self.cursor.column, width);
+        let (segment_start, _) =
+            self.visual_line_bounds(self.cursor.line, self.cursor.column, width);
         self.cursor.column.saturating_sub(segment_start)
     }
 
@@ -1353,9 +1347,7 @@ impl App {
         preferred_column: usize,
     ) -> Cursor {
         let line = line.min(self.buffer.line_count().saturating_sub(1));
-        let line_text = self.buffer.line(line);
-        let trimmed = line_text.trim_end_matches(['\r', '\n']);
-        let (segments, _) = wrap_line(trimmed, width);
+        let (segments, _) = self.line_wrap_segments(line, width);
         let segment_index = wrap_index.min(segments.len().saturating_sub(1));
         let Some(&(start, end)) = segments.get(segment_index) else {
             return Cursor { line, column: 0 };
@@ -1374,16 +1366,14 @@ impl App {
     }
 
     fn visual_line_start(&mut self) {
-        let line_text = self.buffer.line(self.cursor.line);
         let width = self.wrap_width();
-        let (seg_start, _) = visual_line_bounds(&line_text, self.cursor.column, width);
+        let (seg_start, _) = self.visual_line_bounds(self.cursor.line, self.cursor.column, width);
         self.cursor.column = seg_start;
     }
 
     fn visual_line_end(&mut self) {
-        let line_text = self.buffer.line(self.cursor.line);
         let width = self.wrap_width();
-        let (_, seg_end) = visual_line_bounds(&line_text, self.cursor.column, width);
+        let (_, seg_end) = self.visual_line_bounds(self.cursor.line, self.cursor.column, width);
         self.cursor.column = seg_end.min(self.buffer.line_len_chars(self.cursor.line));
     }
 
@@ -1536,8 +1526,7 @@ impl App {
         width: usize,
     ) {
         let line = line.min(self.buffer.line_count().saturating_sub(1));
-        let line_text = self.buffer.line(line);
-        let (segments, _) = wrap_line(line_text.trim_end_matches(['\r', '\n']), width);
+        let (segments, _) = self.line_wrap_segments(line, width);
         let Some(&(start, end)) = segments.get(segment_index) else {
             self.cursor.line = line;
             self.cursor.column = self.buffer.line_len_chars(line);
@@ -1556,10 +1545,9 @@ impl App {
     }
 
     fn visual_line_down(&mut self) {
-        let line_text = self.buffer.line(self.cursor.line);
         let width = self.wrap_width();
-        let (segments, _) = wrap_line(line_text.trim_end_matches(['\r', '\n']), width);
-        let current_seg = wrap_index_for_column(&line_text, self.cursor.column, width);
+        let (segments, _) = self.line_wrap_segments(self.cursor.line, width);
+        let current_seg = self.wrap_index_for_column(self.cursor.line, self.cursor.column, width);
         let segment_start = segments
             .get(current_seg)
             .map(|(start, _)| *start)
@@ -1584,10 +1572,9 @@ impl App {
     }
 
     fn visual_line_up(&mut self) {
-        let line_text = self.buffer.line(self.cursor.line);
         let width = self.wrap_width();
-        let (segments, _) = wrap_line(line_text.trim_end_matches(['\r', '\n']), width);
-        let current_seg = wrap_index_for_column(&line_text, self.cursor.column, width);
+        let (segments, _) = self.line_wrap_segments(self.cursor.line, width);
+        let current_seg = self.wrap_index_for_column(self.cursor.line, self.cursor.column, width);
         let segment_start = segments
             .get(current_seg)
             .map(|(start, _)| *start)
@@ -1608,9 +1595,7 @@ impl App {
             };
         } else if self.cursor.line > 0 {
             let previous_line = self.cursor.line - 1;
-            let previous_text = self.buffer.line(previous_line);
-            let (previous_segments, _) =
-                wrap_line(previous_text.trim_end_matches(['\r', '\n']), width);
+            let (previous_segments, _) = self.line_wrap_segments(previous_line, width);
             self.move_to_visual_segment_preserving_column(
                 previous_line,
                 previous_segments.len().saturating_sub(1),
@@ -1731,11 +1716,7 @@ impl App {
         let width = self.wrap_width();
         self.normalize_viewport(width);
 
-        let cursor_wrap = wrap_index_for_column(
-            &self.buffer.line(self.cursor.line),
-            self.cursor.column,
-            width,
-        );
+        let cursor_wrap = self.wrap_index_for_column(self.cursor.line, self.cursor.column, width);
         if visual_position_before(
             self.cursor.line,
             cursor_wrap,
@@ -1843,17 +1824,39 @@ impl App {
     }
 
     fn line_wrap_count(&self, line: usize, width: usize) -> usize {
+        let (segments, _) = self.line_wrap_segments(line, width);
+        segments.len().max(1)
+    }
+
+    fn line_wrap_segments(&self, line: usize, width: usize) -> (Vec<(usize, usize)>, usize) {
         let line_text = self.buffer.line(line);
         let trimmed = line_text.trim_end_matches(['\r', '\n']);
         let table_layout = TableLayout::new(&self.buffer);
-        let (segments, _) = if line == self.cursor.line {
-            wrap_line(trimmed, width)
-        } else if table_layout.is_table_row(line) {
+        if table_layout.is_table_row(line) {
             table_layout.wrap_line(line, trimmed, width)
         } else {
             concealed_wrap_line(trimmed, width)
-        };
-        segments.len().max(1)
+        }
+    }
+
+    fn wrap_index_for_column(&self, line: usize, column: usize, width: usize) -> usize {
+        let (segments, _) = self.line_wrap_segments(line, width);
+        for (index, &(start, end)) in segments.iter().enumerate() {
+            if column >= start && column < end {
+                return index;
+            }
+        }
+        segments.len().saturating_sub(1)
+    }
+
+    fn visual_line_bounds(&self, line: usize, column: usize, width: usize) -> (usize, usize) {
+        let (segments, _) = self.line_wrap_segments(line, width);
+        for &(start, end) in &segments {
+            if column >= start && column < end {
+                return (start, end);
+            }
+        }
+        segments.last().copied().unwrap_or((0, 0))
     }
 
     fn toggle_checkbox(&mut self) -> bool {
@@ -3451,6 +3454,22 @@ mod tests {
             press(&mut app, KeyCode::Char(ch));
         }
         assert_eq!(app.sheet_panel_height(20), 0);
+    }
+
+    #[test]
+    fn active_line_uses_facade_wrapping() {
+        let mut app = test_app("visit https://github.com/pacificcodeinc/glass/issues/123.");
+        app.cursor = Cursor { line: 0, column: 0 };
+
+        let raw_wraps = crate::editor::render::wrap_line(&app.buffer.line(0), 20)
+            .0
+            .len();
+        let facade_wraps = crate::markdown::highlight::concealed_wrap_line(&app.buffer.line(0), 20)
+            .0
+            .len();
+
+        assert!(facade_wraps < raw_wraps);
+        assert_eq!(app.line_wrap_count(0, 20), facade_wraps);
     }
 
     #[test]
