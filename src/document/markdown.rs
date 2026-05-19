@@ -20,7 +20,13 @@ impl MarkdownCodec {
                 continue;
             }
 
-            if current.trim_start().starts_with('<') && current.trim_end().ends_with('>') {
+            if let Some((raw, next_line)) = parse_html_block(&lines, line) {
+                blocks.push(Block::RawMarkdown(raw));
+                line = next_line;
+                continue;
+            }
+
+            if is_unsupported_raw_line(current) {
                 blocks.push(Block::RawMarkdown(current.to_string()));
                 line += 1;
                 continue;
@@ -258,6 +264,63 @@ fn parse_code_fence(lines: &[&str], start: usize) -> Option<(Option<String>, Str
     ))
 }
 
+fn parse_html_block(lines: &[&str], start: usize) -> Option<(String, usize)> {
+    let current = lines.get(start)?;
+    let trimmed = current.trim_start();
+    if !trimmed.starts_with('<') || !trimmed.ends_with('>') || trimmed.starts_with("<http") {
+        return None;
+    }
+
+    let Some(tag) = html_block_tag(trimmed) else {
+        return Some((current.to_string(), start + 1));
+    };
+    let close = format!("</{tag}>");
+    if trimmed.contains(&close) {
+        return Some((current.to_string(), start + 1));
+    }
+
+    let mut raw = String::new();
+    let mut line = start;
+    while line < lines.len() {
+        if !raw.is_empty() {
+            raw.push('\n');
+        }
+        raw.push_str(lines[line]);
+        line += 1;
+        if lines[line - 1].trim_end().contains(&close) {
+            break;
+        }
+    }
+    Some((raw, line))
+}
+
+fn html_block_tag(trimmed: &str) -> Option<String> {
+    let after_open = trimmed.strip_prefix('<')?;
+    if after_open.starts_with('/') || after_open.starts_with('!') || after_open.starts_with('?') {
+        return None;
+    }
+    let tag = after_open
+        .chars()
+        .take_while(|ch| ch.is_ascii_alphanumeric())
+        .collect::<String>();
+    (!tag.is_empty()).then_some(tag)
+}
+
+fn is_unsupported_raw_line(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    trimmed.starts_with("![") || trimmed.contains("[^") || is_reference_definition(trimmed)
+}
+
+fn is_reference_definition(trimmed: &str) -> bool {
+    if !trimmed.starts_with('[') {
+        return false;
+    }
+    let Some(close) = trimmed.find("]:") else {
+        return false;
+    };
+    close > 1
+}
+
 fn parse_table(lines: &[&str], start: usize) -> Option<(Block, usize)> {
     if start + 1 >= lines.len() {
         return None;
@@ -290,9 +353,8 @@ fn parse_table_cells(line: &str) -> Option<Vec<TableCell>> {
         return None;
     }
 
-    let mut cells = trimmed
-        .trim_matches('|')
-        .split('|')
+    let mut cells = split_table_cells(trimmed)
+        .into_iter()
         .map(|cell| TableCell {
             content: parse_inlines(cell.trim()),
         })
@@ -302,6 +364,33 @@ fn parse_table_cells(line: &str) -> Option<Vec<TableCell>> {
     } else {
         Some(std::mem::take(&mut cells))
     }
+}
+
+fn split_table_cells(line: &str) -> Vec<String> {
+    let trimmed = line.trim().trim_matches('|');
+    let mut cells = Vec::new();
+    let mut current = String::new();
+    let mut escaped = false;
+    for ch in trimmed.chars() {
+        if escaped {
+            current.push(ch);
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' {
+            current.push(ch);
+            escaped = true;
+            continue;
+        }
+        if ch == '|' {
+            cells.push(current);
+            current = String::new();
+        } else {
+            current.push(ch);
+        }
+    }
+    cells.push(current);
+    cells
 }
 
 fn parse_delimiter(line: &str) -> Option<Vec<TableAlignment>> {
@@ -486,6 +575,34 @@ mod tests {
         let document = MarkdownCodec::parse(source);
 
         assert_eq!(MarkdownCodec::serialize(&document), source);
+    }
+
+    #[test]
+    fn preserves_multiline_html_blocks() {
+        let source = "<details>\n<summary>HTML details summary</summary>\n\ncontent\n</details>";
+        let document = MarkdownCodec::parse(source);
+
+        assert_eq!(MarkdownCodec::serialize(&document), source);
+    }
+
+    #[test]
+    fn preserves_unsupported_reference_lines() {
+        let source =
+            "![Alt](asset.png)\n\nFootnote[^one]\n\n[^one]: body\n[glass]: https://example.com";
+        let document = MarkdownCodec::parse(source);
+
+        assert_eq!(MarkdownCodec::serialize(&document), source);
+    }
+
+    #[test]
+    fn escaped_pipes_stay_inside_table_cells() {
+        let source = "| Pattern | Meaning |\n| --- | --- |\n| `A \\| B` | Escaped pipe |";
+        let document = MarkdownCodec::parse(source);
+
+        assert_eq!(
+            MarkdownCodec::serialize(&document),
+            "| Pattern  | Meaning      |\n| -------- | ------------ |\n| `A \\| B` | Escaped pipe |"
+        );
     }
 
     #[test]

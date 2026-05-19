@@ -258,19 +258,45 @@ fn render_document_segment(
         Block::CodeFence { .. } => Line::from(Span::styled(text, theme.inline_code)),
         Block::RawMarkdown(_) => Line::from(Span::styled(text, theme.muted)),
         Block::ListItem { .. } | Block::ChecklistItem { .. } => {
-            let marker_len = text
-                .find(' ')
-                .map(|index| index + 1)
-                .unwrap_or_else(|| text.chars().count());
-            let marker = char_slice(&text, 0, marker_len);
-            let body = char_slice(&text, marker_len, text.chars().count());
+            let marker_len = facade_list_marker_len(source);
+            if marker_len <= segment_start {
+                return Line::from(Span::styled(text, Style::default().fg(theme.text)));
+            }
+            if marker_len >= segment_end {
+                return Line::from(Span::styled(text, theme.list_marker));
+            }
+
             Line::from(vec![
-                Span::styled(marker, theme.list_marker),
-                Span::styled(body, Style::default().fg(theme.text)),
+                Span::styled(
+                    char_slice(source, segment_start, marker_len),
+                    theme.list_marker,
+                ),
+                Span::styled(
+                    char_slice(source, marker_len, segment_end),
+                    Style::default().fg(theme.text),
+                ),
             ])
         }
         _ => Line::from(Span::styled(text, Style::default().fg(theme.text))),
     }
+}
+
+fn facade_list_marker_len(source: &str) -> usize {
+    let leading = source.chars().take_while(|ch| ch.is_whitespace()).count();
+    let trimmed = char_slice(source, leading, source.chars().count());
+    if trimmed.starts_with("[ ] ") || trimmed.starts_with("[x] ") {
+        return leading + 4;
+    }
+    if trimmed.starts_with("• ") || trimmed.starts_with("◦ ") {
+        return leading + 2;
+    }
+
+    let digits = trimmed.chars().take_while(|ch| ch.is_ascii_digit()).count();
+    if digits > 0 && char_slice(&trimmed, digits, digits + 2) == ". " {
+        return leading + digits + 2;
+    }
+
+    leading
 }
 
 fn selected_line(mut line: Line<'static>, theme: Theme) -> Line<'static> {
@@ -567,5 +593,38 @@ mod tests {
             source_ranges_to_visual_ranges(&source_map, 0, &[(2, 4), (9, 11)]),
             vec![(1, 3), (6, 8)]
         );
+    }
+
+    #[test]
+    fn unicode_list_marker_does_not_style_body_prefix() {
+        let theme = Theme::monochrome_for_tests();
+        let block = Block::ListItem {
+            indent: 0,
+            marker: crate::document::model::ListMarker::Bullet,
+            content: Vec::new(),
+        };
+
+        let line = render_document_segment(&block, "• inactive", 0, 10, theme);
+
+        assert_eq!(line.spans[0].content.as_ref(), "• ");
+        assert_eq!(line.spans[0].style, theme.list_marker);
+        assert_eq!(line.spans[1].content.as_ref(), "inactive");
+        assert_eq!(line.spans[1].style, Style::default().fg(theme.text));
+    }
+
+    #[test]
+    fn checklist_marker_is_styled_as_one_unit() {
+        let theme = Theme::monochrome_for_tests();
+        let block = Block::ChecklistItem {
+            indent: 0,
+            checked: false,
+            content: Vec::new(),
+        };
+
+        let line = render_document_segment(&block, "[ ] task", 0, 8, theme);
+
+        assert_eq!(line.spans[0].content.as_ref(), "[ ] ");
+        assert_eq!(line.spans[0].style, theme.list_marker);
+        assert_eq!(line.spans[1].content.as_ref(), "task");
     }
 }

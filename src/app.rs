@@ -552,7 +552,9 @@ impl App {
         match key.code {
             KeyCode::Esc => self.mode = Mode::Normal,
             KeyCode::Enter => {
-                insert_newline_with_list_continuation(&mut self.buffer, &mut self.cursor);
+                if !self.buffer.enter_table_cell(&mut self.cursor) {
+                    insert_newline_with_list_continuation(&mut self.buffer, &mut self.cursor);
+                }
                 self.reset_preferred_column();
             }
             KeyCode::Backspace => {
@@ -1109,6 +1111,28 @@ impl App {
             Command::Table { rows, columns } => {
                 self.buffer.insert_table(rows, columns, &mut self.cursor);
                 self.set_status(format!("Inserted {rows}x{columns} table"));
+            }
+            Command::TableRow { placement } => {
+                if self
+                    .buffer
+                    .insert_table_row_at_cursor(&mut self.cursor, placement)
+                {
+                    self.set_status("Inserted table row");
+                    self.reset_preferred_column();
+                } else {
+                    self.set_status("Not in a table");
+                }
+            }
+            Command::TableColumn { placement } => {
+                if self
+                    .buffer
+                    .insert_table_column_at_cursor(&mut self.cursor, placement)
+                {
+                    self.set_status("Inserted table column");
+                    self.reset_preferred_column();
+                } else {
+                    self.set_status("Not in a table");
+                }
             }
             Command::Unknown(value) => {
                 self.set_status(format!("Unknown command: {value}"));
@@ -2209,6 +2233,20 @@ const COMMAND_CANDIDATES: &[CommandCandidate] = &[
         detail: "Insert a Markdown table",
         aliases: &["table", "grid"],
         action: CommandCandidateAction::Command("table"),
+    },
+    CommandCandidate {
+        replacement: "row",
+        label: "row",
+        detail: "Insert a row below the current table row",
+        aliases: &["row", "table row", "insert row"],
+        action: CommandCandidateAction::Command("row"),
+    },
+    CommandCandidate {
+        replacement: "column",
+        label: "column",
+        detail: "Insert a column right of the current table cell",
+        aliases: &["column", "col", "table column", "insert column"],
+        action: CommandCandidateAction::Command("column"),
     },
 ];
 
