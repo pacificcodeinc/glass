@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.8] - 2026-05-21
+
+Full commit range: [`v0.1.7...v0.1.8`](https://github.com/pacificcodeinc/glass/compare/v0.1.7...v0.1.8)
+
+### Added
+
+- `--render` and `--dump-render` for full-page ANSI debug snapshots that render the document body and status bar without opening the interactive editor.
+- Automatic ANSI render output when `glass <path>` writes to piped or redirected stdout, such as `glass README.md | less -R`.
+- Thorough `--help` and `-h` output covering usage, path behavior, render debugging, modes, keybindings, commands, mouse behavior, and examples.
+
+### Changed
+
+- Running `glass` without a path now prints the full help text instead of a terse usage error.
+
+### Fixed
+
+- Render debug output now uses the same Crossterm palette-index ANSI color mapping as the live terminal backend, so the status bar colors match interactive Glass more closely.
+
 ## [0.1.7] - 2026-05-18
 
 Full commit range: [`v0.1.6...v0.1.7`](https://github.com/pacificcodeinc/glass/compare/v0.1.6...v0.1.7)
@@ -157,7 +175,8 @@ Full commit range: [`v0.1.0...v0.1.1`](https://github.com/pacificcodeinc/glass/c
 - Live Markdown rendering with concealed syntax markers.
 - Checkbox (`- [ ]` / `- [x]`) rendering.
 
-[Unreleased]: https://github.com/pacificcodeinc/glass/compare/v0.1.7...HEAD
+[Unreleased]: https://github.com/pacificcodeinc/glass/compare/v0.1.8...HEAD
+[0.1.8]: https://github.com/pacificcodeinc/glass/compare/v0.1.7...v0.1.8
 [0.1.7]: https://github.com/pacificcodeinc/glass/compare/v0.1.6...v0.1.7
 [0.1.6]: https://github.com/pacificcodeinc/glass/compare/v0.1.5...v0.1.6
 [0.1.5]: https://github.com/pacificcodeinc/glass/compare/v0.1.4...v0.1.5
