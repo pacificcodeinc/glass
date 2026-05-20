@@ -26,6 +26,28 @@ cargo install --path .
 glass <notes-directory>
 ```
 
+Print full command, keybinding, and render-debugging help:
+
+```bash
+glass --help
+```
+
+Render a full ANSI debug snapshot without opening the interactive editor:
+
+```bash
+glass --render [--width 100] [--height rows] <path>
+```
+
+`--width` defaults to 100 columns. When `--height` is omitted, Glass renders the
+entire document followed by the status bar.
+
+Glass also renders automatically when stdout is redirected or piped:
+
+```bash
+glass README.md | less -R
+glass README.md > render.ansi
+```
+
 ## Keybindings
 
 ### Normal mode
