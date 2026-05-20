@@ -26,6 +26,15 @@ cargo install --path .
 glass <notes-directory>
 ```
 
+Render a full ANSI debug snapshot without opening the interactive editor:
+
+```bash
+glass --render [--width 100] [--height rows] <path>
+```
+
+`--width` defaults to 100 columns. When `--height` is omitted, Glass renders the
+entire document followed by the status bar.
+
 ## Keybindings
 
 ### Normal mode
