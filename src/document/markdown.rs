@@ -152,6 +152,17 @@ fn parse_facade_line_block(line: &str) -> Block {
         };
     }
 
+    if trimmed.starts_with('>') {
+        let level = trimmed.chars().take_while(|ch| *ch == '>').count() as u8;
+        let rest = trimmed[level as usize..].trim_start();
+        if !rest.is_empty() {
+            return Block::Quote {
+                level,
+                content: parse_inlines(rest),
+            };
+        }
+    }
+
     if let Some(rest) = trimmed.strip_prefix("> ") {
         return Block::Quote {
             level: 1,
@@ -472,6 +483,7 @@ fn parse_styled_text(source: &str) -> Vec<Inline> {
 
         if starts_with(&chars, index, "**")
             && let Some(end) = find_token(&chars, index + 2, "**")
+            && end > index + 2
         {
             result.push(Inline::Strong(parse_styled_text(
                 &chars[index + 2..end].iter().collect::<String>(),
@@ -481,7 +493,13 @@ fn parse_styled_text(source: &str) -> Vec<Inline> {
         }
 
         if (chars[index] == '*' || chars[index] == '_')
+            && chars.get(index + 1) != Some(&chars[index])
+            && index
+                .checked_sub(1)
+                .and_then(|previous| chars.get(previous))
+                != Some(&chars[index])
             && let Some(end) = find_next(&chars, index + 1, chars[index])
+            && end > index + 1
         {
             result.push(Inline::Emphasis(parse_styled_text(
                 &chars[index + 1..end].iter().collect::<String>(),

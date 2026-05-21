@@ -289,7 +289,7 @@ impl ListMarker {
         }
     }
 
-    fn plain_marker(self, indent: usize) -> String {
+    pub(crate) fn plain_marker(self, indent: usize) -> String {
         match self {
             ListMarker::Bullet => {
                 if indent >= 2 {

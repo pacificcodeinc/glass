@@ -9,15 +9,13 @@ use ratatui::{
 use crate::{
     app::{App, Mode, SearchMatch, TextSelection},
     config::theme::Theme,
-    document::Block,
-    editor::render::visible_rows,
-    markdown::{
-        highlight::{
-            concealed_wrap_line, concealed_wrap_segments, render_markdown_segment_with_completion,
-        },
-        table::TableLayout,
-    },
+    document::{Block, SurfaceMode, surface::wrap_surface_or_facade_line},
+    editor::{buffer::DocumentBuffer, render::visible_rows},
+    markdown::{highlight::render_markdown_segment_with_completion, table::TableLayout},
 };
+
+#[cfg(test)]
+use crate::markdown::highlight::{concealed_wrap_line, concealed_wrap_segments};
 
 const ARTICLE_WIDTH: u16 = 82;
 
@@ -53,7 +51,16 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App, theme: Theme) {
         app.viewport.top_wrap_index,
         page.height as usize,
         text_width,
-        |line_num, text, w| facade_wrap_line(&table_layout, line_num, text, w),
+        |line_num, text, w| {
+            surface_wrap_line(
+                &app.buffer,
+                &table_layout,
+                Some((app.cursor.line, app.cursor.column)),
+                line_num,
+                text,
+                w,
+            )
+        },
     );
     let visual_range = app.visual_line_anchor.map(|anchor| {
         let start = anchor.min(app.cursor.line);
@@ -62,8 +69,10 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App, theme: Theme) {
     });
 
     let cursor_line_text = app.buffer.line(app.cursor.line);
-    let (cursor_segments, _) = facade_wrap_line(
+    let (cursor_segments, _) = surface_wrap_line(
+        &app.buffer,
         &table_layout,
+        Some((app.cursor.line, app.cursor.column)),
         app.cursor.line,
         &cursor_line_text,
         text_width,
@@ -88,8 +97,47 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App, theme: Theme) {
             row.wrap_index,
         );
 
+        let mut display_range = None;
         let (mut line, source_map) = if let Some(rendered) = table_row {
             (rendered.line, Some(rendered.source_map))
+        } else if active && let Some(block) = app.buffer.block_for_line(row.line_number) {
+            let surface = app.buffer.surface_line(
+                row.line_number,
+                SurfaceMode::Active {
+                    cursor_column: app.cursor.column,
+                },
+            );
+            if surface.has_revealed_syntax() {
+                let display_segments = surface.wrap_display_segments(text_width);
+                let (display_start, display_end) = display_segments
+                    .get(row.wrap_index)
+                    .copied()
+                    .unwrap_or((0, surface.display_len()));
+                display_range = Some((display_start, display_end));
+                (
+                    render_surface_segment(
+                        block,
+                        &surface.text,
+                        display_start,
+                        display_end,
+                        theme,
+                        row.wrap_index,
+                        row.completed && row.wrap_index > 0,
+                    ),
+                    Some(surface.source_map_for_display_range(display_start, display_end)),
+                )
+            } else {
+                (
+                    render_document_segment(
+                        block,
+                        &row.full_text,
+                        row.source_start,
+                        row.source_end,
+                        theme,
+                    ),
+                    None,
+                )
+            }
         } else if let Some(block) = app.buffer.block_for_line(row.line_number) {
             (
                 render_document_segment(
@@ -167,7 +215,27 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App, theme: Theme) {
 
         if is_cursor_row && !cursor_found && lines.len() < height {
             cursor_visual_y = lines.len();
-            if let Some(source_map) = &source_map {
+            if let Some((display_start, display_end)) = display_range {
+                let surface_column = app
+                    .surface_cursor_column_for_line(row.line_number)
+                    .unwrap_or_else(|| {
+                        app.buffer
+                            .surface_line(
+                                row.line_number,
+                                SurfaceMode::Active {
+                                    cursor_column: app.cursor.column,
+                                },
+                            )
+                            .display_column_for_source_column(app.cursor.column)
+                    });
+                cursor_visual_x = Some(
+                    gutter_width
+                        + surface_column
+                            .saturating_sub(display_start)
+                            .min(display_end.saturating_sub(display_start))
+                            as u16,
+                );
+            } else if let Some(source_map) = &source_map {
                 let source_column = app.cursor.column;
                 let mapped_column = source_map
                     .iter()
@@ -203,20 +271,68 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App, theme: Theme) {
     }
 }
 
-pub(crate) fn facade_wrap_line(
+pub(crate) fn surface_wrap_line(
+    buffer: &DocumentBuffer,
     table_layout: &TableLayout,
+    active_line: Option<(usize, usize)>,
     line_number: usize,
     text: &str,
     width: usize,
 ) -> (Vec<(usize, usize)>, usize) {
     let trimmed = text.trim_end_matches(['\r', '\n']);
     if table_layout.is_table_row(line_number) {
-        table_layout.wrap_line(line_number, trimmed, width)
-    } else {
-        wrap_facade_text_line(trimmed, width)
+        return table_layout.wrap_line(line_number, trimmed, width);
+    }
+
+    let mode = active_line
+        .filter(|(line, _)| *line == line_number)
+        .map(|(_, cursor_column)| SurfaceMode::Active { cursor_column })
+        .unwrap_or(SurfaceMode::Inactive);
+    wrap_surface_or_facade_line(buffer.block_for_line(line_number), trimmed, width, mode)
+}
+
+fn render_surface_segment(
+    block: &Block,
+    source: &str,
+    segment_start: usize,
+    segment_end: usize,
+    theme: Theme,
+    wrap_index: usize,
+    completed: bool,
+) -> Line<'static> {
+    match block {
+        Block::Heading { .. } => {
+            let mut line = render_markdown_segment_with_completion(
+                source,
+                segment_start,
+                segment_end,
+                theme,
+                true,
+                wrap_index,
+                completed,
+            );
+            for span in &mut line.spans {
+                span.style = span.style.patch(theme.heading);
+            }
+            line
+        }
+        Block::CodeFence { .. } => Line::from(Span::styled(
+            char_slice(source, segment_start, segment_end),
+            theme.inline_code,
+        )),
+        _ => render_markdown_segment_with_completion(
+            source,
+            segment_start,
+            segment_end,
+            theme,
+            true,
+            wrap_index,
+            completed,
+        ),
     }
 }
 
+#[cfg(test)]
 fn wrap_facade_text_line(text: &str, width: usize) -> (Vec<(usize, usize)>, usize) {
     let marker_len = facade_list_marker_len(text);
     let width = width.max(1);
@@ -691,6 +807,30 @@ mod tests {
         assert_eq!(line.spans[0].content.as_ref(), "[ ] ");
         assert_eq!(line.spans[0].style, theme.list_marker);
         assert_eq!(line.spans[1].content.as_ref(), "task");
+    }
+
+    #[test]
+    fn active_heading_surface_reveals_marker() {
+        let theme = Theme::monochrome_for_tests();
+        let document = crate::document::MarkdownCodec::parse("# Heading");
+        let block = document.block_for_plain_line(0).unwrap();
+        let surface = crate::document::SurfaceLine::for_block(
+            block,
+            "Heading",
+            SurfaceMode::Active { cursor_column: 0 },
+        );
+
+        let line = render_surface_segment(
+            block,
+            &surface.text,
+            0,
+            surface.display_len(),
+            theme,
+            0,
+            false,
+        );
+
+        assert_eq!(line_text(&line), "# Heading");
     }
 
     #[test]

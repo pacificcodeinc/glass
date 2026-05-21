@@ -59,7 +59,16 @@ fn full_render_height(app: &App, width: u16) -> u16 {
         0,
         usize::MAX,
         text_width,
-        |line_num, text, w| ui::editor::facade_wrap_line(&table_layout, line_num, text, w),
+        |line_num, text, w| {
+            ui::editor::surface_wrap_line(
+                &app.buffer,
+                &table_layout,
+                Some((app.cursor.line, app.cursor.column)),
+                line_num,
+                text,
+                w,
+            )
+        },
     );
     rows.len().saturating_add(1).min(u16::MAX as usize) as u16
 }

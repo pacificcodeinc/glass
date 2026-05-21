@@ -5,8 +5,8 @@ use ropey::Rope;
 
 use crate::{
     document::{
-        Block, DocLink, DocRange, Document, Inline, MarkdownCodec, TableAlignment, TableCell,
-        TableRow,
+        Block, DocLink, DocRange, Document, Inline, MarkdownCodec, SurfaceLine, SurfaceMode,
+        TableAlignment, TableCell, TableRow,
     },
     editor::{
         commands::{TableColumnPlacement, TableRowPlacement},
@@ -318,6 +318,49 @@ impl DocumentBuffer {
 
     pub fn block_for_line(&self, line: usize) -> Option<&Block> {
         self.document.block_for_plain_line(line)
+    }
+
+    pub fn surface_line(&self, line: usize, mode: SurfaceMode) -> SurfaceLine {
+        let source = self.line(line);
+        let source = source.trim_end_matches(['\r', '\n']);
+        self.block_for_line(line)
+            .map(|block| SurfaceLine::for_block(block, source, mode))
+            .unwrap_or_else(|| SurfaceLine::plain(source))
+    }
+
+    pub fn replace_line_from_surface(
+        &mut self,
+        line: usize,
+        surface_text: &str,
+        surface_column: usize,
+        cursor: &mut Cursor,
+    ) -> usize {
+        let line = line.min(self.line_count().saturating_sub(1));
+        let block_index = self.block_index_for_line(line);
+        let parsed = MarkdownCodec::parse_plain(surface_text);
+        let replacement = parsed.blocks.into_iter().next().unwrap_or(Block::Blank);
+
+        self.push_undo_snapshot(*cursor);
+        if let Some(block) = self.document.blocks.get_mut(block_index) {
+            *block = replacement;
+        } else {
+            self.document.blocks.push(replacement);
+        }
+
+        self.text = Rope::from_str(&self.document.plain_text());
+        cursor.line = line.min(self.line_count().saturating_sub(1));
+        let active_surface = self.surface_line(
+            cursor.line,
+            SurfaceMode::Active {
+                cursor_column: self.line_len_chars(cursor.line),
+            },
+        );
+        let display_column = surface_column.min(active_surface.display_len());
+        cursor.column = active_surface
+            .source_column_for_display_column(display_column)
+            .min(self.line_len_chars(cursor.line));
+        self.update_dirty();
+        display_column
     }
 
     pub fn toggle_checkbox_at_line(&mut self, line: usize, cursor: &mut Cursor) -> bool {
@@ -890,6 +933,61 @@ mod tests {
         assert_eq!(buffer.as_string(), "Heading");
         assert_eq!(buffer.markdown_string(), "# Heading");
         assert_eq!(cursor, Cursor { line: 0, column: 7 });
+    }
+
+    #[test]
+    fn surface_edit_changes_heading_level() {
+        let mut buffer = DocumentBuffer::empty();
+        let mut cursor = Cursor::default();
+        buffer.insert_str(&mut cursor, "## Heading");
+        cursor = Cursor { line: 0, column: 0 };
+
+        let display_column = buffer.replace_line_from_surface(0, "# Heading", 2, &mut cursor);
+
+        assert_eq!(buffer.as_string(), "Heading");
+        assert_eq!(buffer.markdown_string(), "# Heading");
+        assert_eq!(display_column, 2);
+        assert_eq!(cursor, Cursor { line: 0, column: 0 });
+    }
+
+    #[test]
+    fn surface_edit_removing_heading_marker_converts_to_paragraph() {
+        let mut buffer = DocumentBuffer::empty();
+        let mut cursor = Cursor::default();
+        buffer.insert_str(&mut cursor, "# Heading");
+        cursor = Cursor { line: 0, column: 0 };
+
+        buffer.replace_line_from_surface(0, "Heading", 0, &mut cursor);
+
+        assert_eq!(buffer.as_string(), "Heading");
+        assert_eq!(buffer.markdown_string(), "Heading");
+        assert_eq!(cursor, Cursor { line: 0, column: 0 });
+    }
+
+    #[test]
+    fn surface_edit_updates_link_target() {
+        let mut buffer = DocumentBuffer::empty();
+        let mut cursor = Cursor::default();
+        buffer.insert_str(&mut cursor, "[README](README.md)");
+        cursor = Cursor { line: 0, column: 2 };
+
+        buffer.replace_line_from_surface(0, "[README](guide.md)", 17, &mut cursor);
+
+        assert_eq!(buffer.as_string(), "README");
+        assert_eq!(buffer.markdown_string(), "[README](guide.md)");
+    }
+
+    #[test]
+    fn invalid_inline_surface_edit_degrades_to_plain_text() {
+        let mut buffer = DocumentBuffer::empty();
+        let mut cursor = Cursor::default();
+        buffer.insert_str(&mut cursor, "**bold**");
+        cursor = Cursor { line: 0, column: 2 };
+
+        buffer.replace_line_from_surface(0, "**bold*", 7, &mut cursor);
+
+        assert_eq!(buffer.as_string(), "**bold*");
+        assert_eq!(buffer.markdown_string(), "**bold*");
     }
 
     #[test]

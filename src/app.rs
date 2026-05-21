@@ -14,6 +14,7 @@ use crossterm::event::{
 
 use crate::{
     config::theme::Theme,
+    document::{SurfaceLine, SurfaceMode, surface::wrap_surface_or_facade_line},
     editor::{
         buffer::DocumentBuffer,
         commands::{Command, parse_command},
@@ -23,7 +24,7 @@ use crate::{
     },
     fs::tree::FileTree,
     markdown::inline::LinkKind,
-    markdown::{highlight::concealed_wrap_line, table::TableLayout},
+    markdown::table::TableLayout,
 };
 
 const STATUS_MESSAGE_TTL: Duration = Duration::from_secs(3);
@@ -119,6 +120,13 @@ pub struct TextSelection {
     pub head: Cursor,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SurfaceEdit {
+    Insert(char),
+    Backspace,
+    Delete,
+}
+
 impl TextSelection {
     pub fn ordered(self) -> (Cursor, Cursor) {
         if cursor_before_or_equal(self.anchor, self.head) {
@@ -173,6 +181,7 @@ pub struct App {
     pub visual_line_anchor: Option<usize>,
     preferred_column: Option<usize>,
     preferred_visual_column: Option<usize>,
+    surface_cursor: Option<(usize, usize, usize)>,
     pending_g: bool,
     pending_delete: bool,
     pending_change: bool,
@@ -210,6 +219,7 @@ impl App {
             visual_line_anchor: None,
             preferred_column: None,
             preferred_visual_column: None,
+            surface_cursor: None,
             pending_g: false,
             pending_delete: false,
             pending_change: false,
@@ -297,11 +307,15 @@ impl App {
 
         match mouse.kind {
             MouseEventKind::Down(MouseButton::Left) => {
-                let Some(cursor) = self.cursor_for_mouse_position(mouse.column, mouse.row) else {
+                let Some((cursor, surface_column)) =
+                    self.cursor_for_mouse_position(mouse.column, mouse.row)
+                else {
                     return Ok(());
                 };
 
                 self.cursor = cursor;
+                self.surface_cursor =
+                    surface_column.map(|column| (cursor.line, cursor.column, column));
                 self.clear_text_selection();
                 self.cancel_pending_operators();
                 self.reset_preferred_column();
@@ -316,11 +330,15 @@ impl App {
                 let Some(anchor) = self.mouse_anchor else {
                     return Ok(());
                 };
-                let Some(cursor) = self.cursor_for_mouse_position(mouse.column, mouse.row) else {
+                let Some((cursor, surface_column)) =
+                    self.cursor_for_mouse_position(mouse.column, mouse.row)
+                else {
                     return Ok(());
                 };
 
                 self.cursor = cursor;
+                self.surface_cursor =
+                    surface_column.map(|column| (cursor.line, cursor.column, column));
                 self.update_text_selection(anchor, cursor);
                 self.cancel_pending_operators();
                 self.reset_preferred_column();
@@ -331,8 +349,11 @@ impl App {
                     anchor,
                     self.cursor_for_mouse_position(mouse.column, mouse.row),
                 ) {
-                    self.cursor = cursor;
-                    self.update_text_selection(anchor, cursor);
+                    self.cursor = cursor.0;
+                    self.surface_cursor = cursor
+                        .1
+                        .map(|column| (self.cursor.line, self.cursor.column, column));
+                    self.update_text_selection(anchor, self.cursor);
                     self.cancel_pending_operators();
                     self.reset_preferred_column();
                 }
@@ -473,16 +494,22 @@ impl App {
                 self.mode = Mode::Insert;
             }
             KeyCode::Char('h') | KeyCode::Left => {
-                if !self.move_table_cursor_horizontally(-1) {
+                if !self.move_table_cursor_horizontally(-1)
+                    && !self.move_surface_cursor_horizontally(-1)
+                {
                     motions::left(&mut self.cursor);
+                    self.surface_cursor = None;
                 }
                 self.reset_preferred_column();
             }
             KeyCode::Char('j') | KeyCode::Down => self.visual_line_down(),
             KeyCode::Char('k') | KeyCode::Up => self.visual_line_up(),
             KeyCode::Char('l') | KeyCode::Right => {
-                if !self.move_table_cursor_horizontally(1) {
+                if !self.move_table_cursor_horizontally(1)
+                    && !self.move_surface_cursor_horizontally(1)
+                {
                     motions::right(&self.buffer, &mut self.cursor);
+                    self.surface_cursor = None;
                 }
                 self.reset_preferred_column();
             }
@@ -546,7 +573,10 @@ impl App {
             KeyCode::Char('N') => self.jump_search_match(-1),
             KeyCode::Char('u') => self.undo(),
             KeyCode::Char('x') | KeyCode::Delete => {
-                self.buffer.delete_char(&mut self.cursor);
+                if !self.edit_active_surface(SurfaceEdit::Delete) {
+                    self.surface_cursor = None;
+                    self.buffer.delete_char(&mut self.cursor);
+                }
                 self.reset_preferred_column();
             }
             _ => {}
@@ -569,7 +599,8 @@ impl App {
                     self.delete_to_line_start();
                 } else if key.modifiers.contains(KeyModifiers::ALT) {
                     self.delete_word_backward();
-                } else {
+                } else if !self.edit_active_surface(SurfaceEdit::Backspace) {
+                    self.surface_cursor = None;
                     self.buffer.delete_previous_char(&mut self.cursor);
                 }
                 self.reset_preferred_column();
@@ -577,7 +608,8 @@ impl App {
             KeyCode::Delete => {
                 if key.modifiers.contains(KeyModifiers::SUPER) {
                     self.delete_to_line_end();
-                } else {
+                } else if !self.edit_active_surface(SurfaceEdit::Delete) {
+                    self.surface_cursor = None;
                     self.buffer.delete_char(&mut self.cursor);
                 }
                 self.reset_preferred_column();
@@ -601,15 +633,24 @@ impl App {
                 self.reset_preferred_column();
             }
             KeyCode::Char(ch) if is_text_input_key(key) => {
-                self.buffer.insert_char(&mut self.cursor, ch);
+                if !self.edit_active_surface(SurfaceEdit::Insert(ch)) {
+                    self.surface_cursor = None;
+                    self.buffer.insert_char(&mut self.cursor, ch);
+                }
                 self.reset_preferred_column();
             }
             KeyCode::Left => {
-                motions::left(&mut self.cursor);
+                if !self.move_surface_cursor_horizontally(-1) {
+                    motions::left(&mut self.cursor);
+                    self.surface_cursor = None;
+                }
                 self.reset_preferred_column();
             }
             KeyCode::Right => {
-                motions::right(&self.buffer, &mut self.cursor);
+                if !self.move_surface_cursor_horizontally(1) {
+                    motions::right(&self.buffer, &mut self.cursor);
+                    self.surface_cursor = None;
+                }
                 self.reset_preferred_column();
             }
             KeyCode::Up => self.move_line_up_preserving_column(),
@@ -1263,7 +1304,7 @@ impl App {
         self.viewport.visible_width.saturating_sub(gutter).max(1)
     }
 
-    fn cursor_for_mouse_position(&self, column: u16, row: u16) -> Option<Cursor> {
+    fn cursor_for_mouse_position(&self, column: u16, row: u16) -> Option<(Cursor, Option<usize>)> {
         if !self.viewport_contains(column, row) {
             return None;
         }
@@ -1283,7 +1324,11 @@ impl App {
         local_x < self.viewport.visible_width && local_y < self.viewport.visible_height
     }
 
-    fn cursor_for_viewport_position(&self, local_x: usize, local_y: usize) -> Option<Cursor> {
+    fn cursor_for_viewport_position(
+        &self,
+        local_x: usize,
+        local_y: usize,
+    ) -> Option<(Cursor, Option<usize>)> {
         let gutter = (self.buffer.line_count().to_string().len() + 1) as usize;
         let text_x = local_x.saturating_sub(gutter);
         let width = self.wrap_width();
@@ -1298,26 +1343,73 @@ impl App {
                 if table_layout.is_table_row(line_num) {
                     table_layout.wrap_line(line_num, text, width)
                 } else {
-                    concealed_wrap_line(text, width)
+                    let mode = if line_num == self.cursor.line {
+                        SurfaceMode::Active {
+                            cursor_column: self.cursor.column,
+                        }
+                    } else {
+                        SurfaceMode::Inactive
+                    };
+                    wrap_surface_or_facade_line(
+                        self.buffer.block_for_line(line_num),
+                        text,
+                        width,
+                        mode,
+                    )
                 }
             },
         );
 
         let Some(row) = rows.get(local_y) else {
             let line = self.buffer.line_count().saturating_sub(1);
-            return Some(Cursor {
-                line,
-                column: self.buffer.line_len_chars(line),
-            });
+            return Some((
+                Cursor {
+                    line,
+                    column: self.buffer.line_len_chars(line),
+                },
+                None,
+            ));
         };
 
         let text_x = text_x.saturating_sub(row.continuation_indent);
+        if row.line_number == self.cursor.line
+            && !table_layout.is_table_row(row.line_number)
+            && self.buffer.block_for_line(row.line_number).is_some()
+        {
+            let surface = self.buffer.surface_line(
+                row.line_number,
+                SurfaceMode::Active {
+                    cursor_column: self.cursor.column,
+                },
+            );
+            let display_segments = surface.wrap_display_segments(width);
+            let (display_start, display_end) = display_segments
+                .get(row.wrap_index)
+                .copied()
+                .unwrap_or((0, surface.display_len()));
+            let surface_column =
+                display_start + text_x.min(display_end.saturating_sub(display_start));
+            let column = surface
+                .source_column_for_display_column(surface_column)
+                .min(self.buffer.line_len_chars(row.line_number));
+            return Some((
+                Cursor {
+                    line: row.line_number,
+                    column,
+                },
+                Some(surface_column.min(surface.display_len())),
+            ));
+        }
+
         let segment_len = row.source_end.saturating_sub(row.source_start);
         let column = row.source_start + text_x.min(segment_len);
-        Some(Cursor {
-            line: row.line_number,
-            column: column.min(self.buffer.line_len_chars(row.line_number)),
-        })
+        Some((
+            Cursor {
+                line: row.line_number,
+                column: column.min(self.buffer.line_len_chars(row.line_number)),
+            },
+            None,
+        ))
     }
 
     fn scroll_visual_rows(&mut self, delta: isize) {
@@ -1393,6 +1485,18 @@ impl App {
             return column;
         }
 
+        if let Some(surface) = self.active_surface_line()
+            && surface.has_virtual_chars()
+        {
+            let surface_column = self.active_surface_column(&surface);
+            let display_segments = surface.wrap_display_segments(width);
+            for (start, end) in display_segments {
+                if surface_column >= start && surface_column <= end {
+                    return surface_column.saturating_sub(start);
+                }
+            }
+        }
+
         let (segment_start, _) =
             self.visual_line_bounds(self.cursor.line, self.cursor.column, width);
         self.cursor.column.saturating_sub(segment_start)
@@ -1455,8 +1559,24 @@ impl App {
             return;
         }
 
+        if let Some(surface) = self.active_surface_line()
+            && surface.has_virtual_chars()
+        {
+            let surface_column = self.active_surface_column(&surface);
+            for (start, end) in surface.wrap_display_segments(width) {
+                if surface_column >= start && surface_column <= end {
+                    self.cursor.column = surface
+                        .source_column_for_display_column(start)
+                        .min(self.buffer.line_len_chars(self.cursor.line));
+                    self.surface_cursor = Some((self.cursor.line, self.cursor.column, start));
+                    return;
+                }
+            }
+        }
+
         let (seg_start, _) = self.visual_line_bounds(self.cursor.line, self.cursor.column, width);
         self.cursor.column = seg_start;
+        self.surface_cursor = None;
     }
 
     fn visual_line_end(&mut self) {
@@ -1470,8 +1590,24 @@ impl App {
             return;
         }
 
+        if let Some(surface) = self.active_surface_line()
+            && surface.has_virtual_chars()
+        {
+            let surface_column = self.active_surface_column(&surface);
+            for (start, end) in surface.wrap_display_segments(width) {
+                if surface_column >= start && surface_column <= end {
+                    self.cursor.column = surface
+                        .source_column_for_display_column(end)
+                        .min(self.buffer.line_len_chars(self.cursor.line));
+                    self.surface_cursor = Some((self.cursor.line, self.cursor.column, end));
+                    return;
+                }
+            }
+        }
+
         let (_, seg_end) = self.visual_line_bounds(self.cursor.line, self.cursor.column, width);
         self.cursor.column = seg_end.min(self.buffer.line_len_chars(self.cursor.line));
+        self.surface_cursor = None;
     }
 
     fn handle_navigation_modifier(&mut self, key: KeyEvent) -> bool {
@@ -1579,6 +1715,111 @@ impl App {
     fn reset_preferred_column(&mut self) {
         self.preferred_column = None;
         self.preferred_visual_column = None;
+    }
+
+    pub(crate) fn surface_cursor_column_for_line(&self, line: usize) -> Option<usize> {
+        let (cursor_line, source_column, column) = self.surface_cursor?;
+        if cursor_line != line || source_column != self.cursor.column {
+            return None;
+        }
+        Some(
+            column.min(
+                self.buffer
+                    .surface_line(
+                        line,
+                        SurfaceMode::Active {
+                            cursor_column: self.cursor.column,
+                        },
+                    )
+                    .display_len(),
+            ),
+        )
+    }
+
+    fn active_surface_line(&self) -> Option<SurfaceLine> {
+        if self.is_table_row(self.cursor.line)
+            || self.buffer.block_for_line(self.cursor.line).is_none()
+        {
+            return None;
+        }
+        Some(self.buffer.surface_line(
+            self.cursor.line,
+            SurfaceMode::Active {
+                cursor_column: self.cursor.column,
+            },
+        ))
+    }
+
+    fn active_surface_column(&self, surface: &SurfaceLine) -> usize {
+        self.surface_cursor_column_for_line(self.cursor.line)
+            .unwrap_or_else(|| surface.display_column_for_source_column(self.cursor.column))
+            .min(surface.display_len())
+    }
+
+    fn move_surface_cursor_horizontally(&mut self, delta: isize) -> bool {
+        let Some(surface) = self.active_surface_line() else {
+            return false;
+        };
+        if !surface.has_virtual_chars() {
+            return false;
+        }
+
+        let current = self.active_surface_column(&surface);
+        let target = if delta < 0 {
+            current.saturating_sub(1)
+        } else {
+            current.saturating_add(1).min(surface.display_len())
+        };
+        if target == current {
+            return false;
+        }
+
+        self.cursor.column = surface
+            .source_column_for_display_column(target)
+            .min(self.buffer.line_len_chars(self.cursor.line));
+        self.surface_cursor = Some((self.cursor.line, self.cursor.column, target));
+        true
+    }
+
+    fn edit_active_surface(&mut self, edit: SurfaceEdit) -> bool {
+        let Some(surface) = self.active_surface_line() else {
+            return false;
+        };
+        if !surface.has_virtual_chars() {
+            return false;
+        }
+
+        let mut surface_column = self.active_surface_column(&surface);
+        let mut chars = surface.text.chars().collect::<Vec<_>>();
+        match edit {
+            SurfaceEdit::Insert(ch) => {
+                chars.insert(surface_column, ch);
+                surface_column += 1;
+            }
+            SurfaceEdit::Backspace => {
+                if surface_column == 0 {
+                    return false;
+                }
+                surface_column -= 1;
+                chars.remove(surface_column);
+            }
+            SurfaceEdit::Delete => {
+                if surface_column >= chars.len() {
+                    return false;
+                }
+                chars.remove(surface_column);
+            }
+        }
+
+        let surface_text = chars.into_iter().collect::<String>();
+        let display_column = self.buffer.replace_line_from_surface(
+            self.cursor.line,
+            &surface_text,
+            surface_column,
+            &mut self.cursor,
+        );
+        self.surface_cursor = Some((self.cursor.line, self.cursor.column, display_column));
+        true
     }
 
     fn move_to_line_preserving_column(&mut self, line: usize) {
@@ -2125,7 +2366,14 @@ impl App {
         if table_layout.is_table_row(line) {
             table_layout.wrap_line(line, trimmed, width)
         } else {
-            concealed_wrap_line(trimmed, width)
+            let mode = if line == self.cursor.line {
+                SurfaceMode::Active {
+                    cursor_column: self.cursor.column,
+                }
+            } else {
+                SurfaceMode::Inactive
+            };
+            wrap_surface_or_facade_line(self.buffer.block_for_line(line), trimmed, width, mode)
         }
     }
 
@@ -3135,6 +3383,7 @@ mod tests {
             visual_line_anchor: None,
             preferred_column: None,
             preferred_visual_column: None,
+            surface_cursor: None,
             pending_g: false,
             pending_delete: false,
             pending_change: false,
@@ -4004,6 +4253,33 @@ mod tests {
         press(&mut app, KeyCode::Char('u'));
         assert_eq!(app.buffer.as_string(), "[ ] todo");
         assert_eq!(app.buffer.markdown_string(), "- [ ] todo");
+    }
+
+    #[test]
+    fn normal_mode_can_edit_revealed_heading_marker() {
+        let mut app = test_app("## Heading");
+
+        press(&mut app, KeyCode::Left);
+        press(&mut app, KeyCode::Left);
+        press(&mut app, KeyCode::Delete);
+
+        assert_eq!(app.buffer.as_string(), "Heading");
+        assert_eq!(app.buffer.markdown_string(), "# Heading");
+        assert_eq!(app.cursor, Cursor { line: 0, column: 0 });
+    }
+
+    #[test]
+    fn insert_mode_can_edit_revealed_link_target() {
+        let mut app = test_app("[README](README.md)");
+        app.mode = Mode::Insert;
+
+        for _ in 0..8 {
+            press(&mut app, KeyCode::Right);
+        }
+        press(&mut app, KeyCode::Char('X'));
+
+        assert_eq!(app.buffer.as_string(), "README");
+        assert_eq!(app.buffer.markdown_string(), "[README](XREADME.md)");
     }
 
     #[test]
