@@ -6,7 +6,8 @@ use ropey::Rope;
 use crate::{
     document::{
         Block, DocLink, DocRange, Document, Inline, MarkdownCodec, SurfaceLine, SurfaceMode,
-        TableAlignment, TableCell, TableRow,
+        TableAlignment, TableCell, TableRow, markdown::inline_plain_column_for_source_column,
+        model::inline_plain_text,
     },
     editor::{
         commands::{TableColumnPlacement, TableRowPlacement},
@@ -387,6 +388,44 @@ impl DocumentBuffer {
         false
     }
 
+    pub fn delete_structural_list_marker_at_cursor(
+        &mut self,
+        cursor: &mut Cursor,
+        include_content_boundary: bool,
+    ) -> bool {
+        let line = cursor.line.min(self.line_count().saturating_sub(1));
+        let block_index = self.block_index_for_line(line);
+        let Some(block) = self.document.blocks.get(block_index) else {
+            return false;
+        };
+
+        let Some((marker_width, content)) = structural_list_marker(block) else {
+            return false;
+        };
+        let content_is_empty = inline_plain_text(&content).is_empty();
+        let cursor_is_in_marker = cursor.column < marker_width
+            || (cursor.column == marker_width && (include_content_boundary || content_is_empty));
+        if !cursor_is_in_marker {
+            return false;
+        }
+
+        self.push_undo_snapshot(*cursor);
+        let replacement = if content_is_empty {
+            Block::Blank
+        } else {
+            Block::Paragraph(content)
+        };
+        if let Some(block) = self.document.blocks.get_mut(block_index) {
+            *block = replacement;
+        }
+
+        self.text = Rope::from_str(&self.document.plain_text());
+        cursor.line = line.min(self.line_count().saturating_sub(1));
+        cursor.column = 0;
+        self.update_dirty();
+        true
+    }
+
     pub fn insert_table(&mut self, rows: usize, columns: usize, cursor: &mut Cursor) {
         self.push_undo_snapshot(*cursor);
         let rows = rows.max(2);
@@ -630,10 +669,32 @@ impl DocumentBuffer {
 
     fn sync_document_from_facade(&mut self, cursor: &mut Cursor) {
         let old_document = self.document.clone();
+        let source_line = self
+            .line(cursor.line)
+            .trim_end_matches(['\r', '\n'])
+            .to_string();
+        let source_column = cursor.column;
         let parsed = MarkdownCodec::parse_plain(&self.text.to_string());
         self.document = reconcile_facade_document(&old_document, parsed);
-        self.rebuild_facade_preserving_cursor(cursor);
+        self.rebuild_facade_after_parse(cursor, &source_line, source_column);
         self.update_dirty();
+    }
+
+    fn rebuild_facade_after_parse(
+        &mut self,
+        cursor: &mut Cursor,
+        source_line: &str,
+        source_column: usize,
+    ) {
+        let line = cursor.line;
+        self.text = Rope::from_str(&self.document.plain_text());
+        cursor.line = line.min(self.text.len_lines().saturating_sub(1));
+        cursor.column = self
+            .document
+            .block_for_plain_line(cursor.line)
+            .map(|block| remap_facade_cursor_after_parse(source_line, source_column, block))
+            .unwrap_or(source_column)
+            .min(self.line_len_chars(cursor.line));
     }
 
     fn rebuild_facade_preserving_cursor(&mut self, cursor: &mut Cursor) {
@@ -793,6 +854,176 @@ fn reconcile_block(old: &Block, parsed: Block) -> Block {
     }
 }
 
+fn structural_list_marker(block: &Block) -> Option<(usize, Vec<Inline>)> {
+    match block {
+        Block::ListItem {
+            indent,
+            marker,
+            content,
+        } => Some((
+            *indent + marker.plain_marker(*indent).chars().count() + 1,
+            content.clone(),
+        )),
+        Block::ChecklistItem {
+            indent, content, ..
+        } => Some((*indent + 4, content.clone())),
+        _ => None,
+    }
+}
+
+fn remap_facade_cursor_after_parse(
+    source_line: &str,
+    source_column: usize,
+    block: &Block,
+) -> usize {
+    match block {
+        Block::Heading { level, .. } => {
+            let Some(source_content_start) = heading_content_start(source_line, *level) else {
+                return inline_plain_column_for_source_column(source_line, source_column);
+            };
+            if source_column <= source_content_start {
+                return 0;
+            }
+            inline_plain_column_for_source_column(
+                char_slice_from(source_line, source_content_start),
+                source_column.saturating_sub(source_content_start),
+            )
+        }
+        Block::Quote { level, .. } => {
+            let Some((source_content_start, output_content_start)) =
+                quote_content_columns(source_line, *level)
+            else {
+                return inline_plain_column_for_source_column(source_line, source_column);
+            };
+            if source_column <= source_content_start {
+                return source_column.min(output_content_start);
+            }
+            output_content_start
+                + inline_plain_column_for_source_column(
+                    char_slice_from(source_line, source_content_start),
+                    source_column.saturating_sub(source_content_start),
+                )
+        }
+        Block::ListItem { indent, marker, .. } => {
+            let Some((source_content_start, output_content_start)) = list_content_columns(
+                source_line,
+                *indent,
+                marker.plain_marker(*indent).chars().count() + 1,
+            ) else {
+                return inline_plain_column_for_source_column(source_line, source_column);
+            };
+            if source_column <= source_content_start {
+                return source_column.min(output_content_start);
+            }
+            output_content_start
+                + inline_plain_column_for_source_column(
+                    char_slice_from(source_line, source_content_start),
+                    source_column.saturating_sub(source_content_start),
+                )
+        }
+        Block::ChecklistItem { indent, .. } => {
+            let Some((source_content_start, output_content_start)) =
+                checklist_content_columns(source_line, *indent)
+            else {
+                return inline_plain_column_for_source_column(source_line, source_column);
+            };
+            if source_column <= source_content_start {
+                let removed = source_content_start.saturating_sub(output_content_start);
+                return source_column
+                    .saturating_sub(removed)
+                    .min(output_content_start);
+            }
+            output_content_start
+                + inline_plain_column_for_source_column(
+                    char_slice_from(source_line, source_content_start),
+                    source_column.saturating_sub(source_content_start),
+                )
+        }
+        Block::Paragraph(_) => inline_plain_column_for_source_column(source_line, source_column),
+        _ => source_column,
+    }
+}
+
+fn heading_content_start(source_line: &str, level: u8) -> Option<usize> {
+    if leading_whitespace_chars(source_line) != 0 {
+        return None;
+    }
+    let marker_len = level as usize + 1;
+    let marker = format!("{} ", "#".repeat(level as usize));
+    source_line.starts_with(&marker).then_some(marker_len)
+}
+
+fn quote_content_columns(source_line: &str, level: u8) -> Option<(usize, usize)> {
+    let leading = leading_whitespace_chars(source_line);
+    let trimmed = source_line.trim_start();
+    let quote_len = trimmed.chars().take_while(|ch| *ch == '>').count();
+    if quote_len == 0 || quote_len != level as usize {
+        return None;
+    }
+    let spaces = trimmed
+        .chars()
+        .skip(quote_len)
+        .take_while(|ch| ch.is_whitespace())
+        .count();
+    Some((leading + quote_len + spaces, leading + quote_len + 1))
+}
+
+fn list_content_columns(
+    source_line: &str,
+    indent: usize,
+    output_marker_len: usize,
+) -> Option<(usize, usize)> {
+    let leading = leading_whitespace_chars(source_line);
+    let trimmed = source_line.trim_start();
+    let source_marker_len = bullet_marker_len(trimmed).or_else(|| ordered_marker_len(trimmed))?;
+    Some((leading + source_marker_len, indent + output_marker_len))
+}
+
+fn checklist_content_columns(source_line: &str, indent: usize) -> Option<(usize, usize)> {
+    let leading = leading_whitespace_chars(source_line);
+    let trimmed = source_line.trim_start();
+    let source_marker_len = marker_len(
+        trimmed,
+        &[
+            "- [ ] ", "- [x] ", "[ ] ", "[x] ", "• [ ] ", "• [x] ", "◦ [ ] ", "◦ [x] ",
+        ],
+    )?;
+    Some((leading + source_marker_len, indent + 4))
+}
+
+fn bullet_marker_len(trimmed: &str) -> Option<usize> {
+    marker_len(trimmed, &["- ", "* ", "+ ", "• ", "◦ "])
+}
+
+fn ordered_marker_len(trimmed: &str) -> Option<usize> {
+    let bytes = trimmed.as_bytes();
+    let mut index = 0usize;
+    while index < bytes.len() && bytes[index].is_ascii_digit() {
+        index += 1;
+    }
+    (index > 0 && trimmed.get(index..index + 2) == Some(". ")).then_some(index + 2)
+}
+
+fn marker_len(source: &str, markers: &[&str]) -> Option<usize> {
+    markers
+        .iter()
+        .find(|marker| source.starts_with(**marker))
+        .map(|marker| marker.chars().count())
+}
+
+fn leading_whitespace_chars(source: &str) -> usize {
+    source.chars().take_while(|ch| ch.is_whitespace()).count()
+}
+
+fn char_slice_from(source: &str, start: usize) -> &str {
+    let byte_index = source
+        .char_indices()
+        .nth(start)
+        .map(|(index, _)| index)
+        .unwrap_or(source.len());
+    &source[byte_index..]
+}
+
 fn trim_line_ending_len(line: &str) -> usize {
     line.trim_end_matches(['\r', '\n']).chars().count()
 }
@@ -936,6 +1167,53 @@ mod tests {
     }
 
     #[test]
+    fn heading_shortcut_before_existing_text_maps_cursor_to_content_start() {
+        let mut buffer = DocumentBuffer::empty();
+        let mut cursor = Cursor::default();
+        buffer.insert_str(&mut cursor, "Heading");
+        cursor = Cursor { line: 0, column: 0 };
+
+        buffer.insert_char(&mut cursor, '#');
+        buffer.insert_char(&mut cursor, ' ');
+
+        assert_eq!(buffer.as_string(), "Heading");
+        assert_eq!(buffer.markdown_string(), "# Heading");
+        assert_eq!(cursor, Cursor { line: 0, column: 0 });
+    }
+
+    #[test]
+    fn typed_checkbox_shortcut_after_bullet_facade_converts_to_checklist() {
+        let mut buffer = DocumentBuffer::empty();
+        let mut cursor = Cursor::default();
+
+        for ch in "- [ ] todo".chars() {
+            buffer.insert_char(&mut cursor, ch);
+        }
+
+        assert_eq!(buffer.as_string(), "[ ] todo");
+        assert_eq!(buffer.markdown_string(), "- [ ] todo");
+        assert_eq!(cursor, Cursor { line: 0, column: 8 });
+    }
+
+    #[test]
+    fn inline_markdown_typing_remaps_cursor_to_plain_text() {
+        let mut buffer = DocumentBuffer::empty();
+        let mut cursor = Cursor::default();
+
+        buffer.insert_str(&mut cursor, "a **bold** tail");
+
+        assert_eq!(buffer.as_string(), "a bold tail");
+        assert_eq!(buffer.markdown_string(), "a **bold** tail");
+        assert_eq!(
+            cursor,
+            Cursor {
+                line: 0,
+                column: 11
+            }
+        );
+    }
+
+    #[test]
     fn surface_edit_changes_heading_level() {
         let mut buffer = DocumentBuffer::empty();
         let mut cursor = Cursor::default();
@@ -1000,6 +1278,18 @@ mod tests {
             buffer.selected_markdown(Cursor { line: 0, column: 0 }, Cursor { line: 0, column: 7 });
 
         assert_eq!(selected.as_deref(), Some("# Heading"));
+    }
+
+    #[test]
+    fn selected_full_blocks_do_not_insert_extra_blank_lines() {
+        let mut buffer = DocumentBuffer::empty();
+        let mut cursor = Cursor::default();
+        buffer.insert_str(&mut cursor, "# Heading\n- [ ] todo");
+
+        let selected =
+            buffer.selected_markdown(Cursor { line: 0, column: 0 }, Cursor { line: 1, column: 8 });
+
+        assert_eq!(selected.as_deref(), Some("# Heading\n- [ ] todo"));
     }
 
     #[test]

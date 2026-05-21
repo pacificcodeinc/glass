@@ -1,5 +1,7 @@
 use crate::{
-    document::model::{Block, Document, Inline, ListMarker, TableAlignment, TableCell, TableRow},
+    document::model::{
+        Block, Document, Inline, ListMarker, TableAlignment, TableCell, TableRow, inline_plain_text,
+    },
     markdown::inline::{LinkKind, links},
 };
 
@@ -197,6 +199,18 @@ fn parse_facade_line_block(line: &str) -> Block {
     if let Some(rest) = trimmed
         .strip_prefix("• ")
         .or_else(|| trimmed.strip_prefix("◦ "))
+        && let Some((checked, content)) = parse_facade_checkbox(rest)
+    {
+        return Block::ChecklistItem {
+            indent: leading,
+            checked,
+            content: parse_inlines(content),
+        };
+    }
+
+    if let Some(rest) = trimmed
+        .strip_prefix("• ")
+        .or_else(|| trimmed.strip_prefix("◦ "))
         .or_else(|| parse_bullet_marker(trimmed))
     {
         return Block::ListItem {
@@ -230,6 +244,13 @@ fn parse_markdown_checkbox(trimmed: &str) -> Option<(bool, &str)> {
         .strip_prefix("- [ ] ")
         .map(|rest| (false, rest))
         .or_else(|| trimmed.strip_prefix("- [x] ").map(|rest| (true, rest)))
+}
+
+fn parse_facade_checkbox(trimmed: &str) -> Option<(bool, &str)> {
+    trimmed
+        .strip_prefix("[ ] ")
+        .map(|rest| (false, rest))
+        .or_else(|| trimmed.strip_prefix("[x] ").map(|rest| (true, rest)))
 }
 
 fn parse_bullet_marker(trimmed: &str) -> Option<&str> {
@@ -467,6 +488,79 @@ pub fn parse_inlines(source: &str) -> Vec<Inline> {
     merge_text(result)
 }
 
+pub(crate) fn inline_plain_column_for_source_column(source: &str, source_column: usize) -> usize {
+    let source_column = source_column.min(source.chars().count());
+    let parsed_links = links(source);
+    let mut index = 0usize;
+    let mut plain_column = 0usize;
+
+    for link in parsed_links {
+        if link.source_start > index {
+            let segment = slice_chars(source, index, link.source_start);
+            if source_column <= link.source_start {
+                return plain_column
+                    + styled_plain_column_for_source_column(
+                        &segment,
+                        source_column.saturating_sub(index),
+                    );
+            }
+            plain_column += inline_plain_text(&parse_styled_text(&segment))
+                .chars()
+                .count();
+        }
+
+        if source_column < link.source_end {
+            return match link.kind {
+                LinkKind::Markdown => {
+                    let label_start = link.label_start.unwrap_or(link.source_start);
+                    let label_end = link.label_end.unwrap_or(label_start);
+                    let label = link.label.as_deref().unwrap_or(&link.target);
+                    if source_column <= label_start {
+                        plain_column
+                    } else if source_column <= label_end {
+                        plain_column
+                            + styled_plain_column_for_source_column(
+                                label,
+                                source_column.saturating_sub(label_start),
+                            )
+                    } else {
+                        plain_column + inline_plain_text(&parse_styled_text(label)).chars().count()
+                    }
+                }
+                LinkKind::Wiki => {
+                    plain_column
+                        + source_column
+                            .saturating_sub(link.target_start)
+                            .min(link.target.chars().count())
+                }
+                LinkKind::Url => {
+                    plain_column
+                        + source_column
+                            .saturating_sub(link.target_start)
+                            .min(link.target.chars().count())
+                }
+            };
+        }
+
+        plain_column += match link.kind {
+            LinkKind::Markdown => {
+                let label = link.label.as_deref().unwrap_or(&link.target);
+                inline_plain_text(&parse_styled_text(label)).chars().count()
+            }
+            LinkKind::Wiki | LinkKind::Url => link.target.chars().count(),
+        };
+        index = link.source_end;
+    }
+
+    if index < source.chars().count() {
+        let segment = slice_chars(source, index, source.chars().count());
+        plain_column
+            + styled_plain_column_for_source_column(&segment, source_column.saturating_sub(index))
+    } else {
+        plain_column
+    }
+}
+
 fn parse_styled_text(source: &str) -> Vec<Inline> {
     let chars = source.chars().collect::<Vec<_>>();
     let mut result = Vec::new();
@@ -514,6 +608,99 @@ fn parse_styled_text(source: &str) -> Vec<Inline> {
     }
 
     merge_text(result)
+}
+
+fn styled_plain_column_for_source_column(source: &str, source_column: usize) -> usize {
+    let chars = source.chars().collect::<Vec<_>>();
+    let source_column = source_column.min(chars.len());
+    let mut index = 0usize;
+    let mut plain_column = 0usize;
+
+    while index < chars.len() {
+        if chars[index] == '`'
+            && let Some(end) = find_next(&chars, index + 1, '`')
+        {
+            if source_column <= index {
+                return plain_column;
+            }
+            let content_len = end.saturating_sub(index + 1);
+            if source_column <= end {
+                return plain_column + source_column.saturating_sub(index + 1).min(content_len);
+            }
+            if source_column <= end + 1 {
+                return plain_column + content_len;
+            }
+            plain_column += content_len;
+            index = end + 1;
+            continue;
+        }
+
+        if starts_with(&chars, index, "**")
+            && let Some(end) = find_token(&chars, index + 2, "**")
+            && end > index + 2
+        {
+            if source_column <= index + 2 {
+                return plain_column;
+            }
+            let content = chars[index + 2..end].iter().collect::<String>();
+            let content_plain_len = inline_plain_text(&parse_styled_text(&content))
+                .chars()
+                .count();
+            if source_column <= end {
+                return plain_column
+                    + styled_plain_column_for_source_column(
+                        &content,
+                        source_column.saturating_sub(index + 2),
+                    );
+            }
+            if source_column <= end + 2 {
+                return plain_column + content_plain_len;
+            }
+            plain_column += content_plain_len;
+            index = end + 2;
+            continue;
+        }
+
+        if (chars[index] == '*' || chars[index] == '_')
+            && chars.get(index + 1) != Some(&chars[index])
+            && index
+                .checked_sub(1)
+                .and_then(|previous| chars.get(previous))
+                != Some(&chars[index])
+            && let Some(end) = find_next(&chars, index + 1, chars[index])
+            && end > index + 1
+        {
+            if source_column <= index + 1 {
+                return plain_column;
+            }
+            let content = chars[index + 1..end].iter().collect::<String>();
+            let content_plain_len = inline_plain_text(&parse_styled_text(&content))
+                .chars()
+                .count();
+            if source_column <= end {
+                return plain_column
+                    + styled_plain_column_for_source_column(
+                        &content,
+                        source_column.saturating_sub(index + 1),
+                    );
+            }
+            if source_column <= end + 1 {
+                return plain_column + content_plain_len;
+            }
+            plain_column += content_plain_len;
+            index = end + 1;
+            continue;
+        }
+
+        let next = next_special(&chars, index + 1).unwrap_or(chars.len());
+        if source_column <= next {
+            return plain_column + source_column.saturating_sub(index);
+        }
+        plain_column += next.saturating_sub(index);
+        index = next;
+    }
+
+    plain_column
 }
 
 fn merge_text(inlines: Vec<Inline>) -> Vec<Inline> {
@@ -634,10 +821,31 @@ mod tests {
     }
 
     #[test]
+    fn parses_checkbox_shortcut_after_facade_bullet_marker() {
+        let document = MarkdownCodec::parse_plain("• [ ] todo");
+
+        assert_eq!(document.plain_text(), "[ ] todo");
+        assert_eq!(MarkdownCodec::serialize(&document), "- [ ] todo");
+    }
+
+    #[test]
     fn inline_plain_text_hides_syntax() {
         let inlines = parse_inlines("a **bold** [link](target.md)");
 
         assert_eq!(inline_plain_text(&inlines), "a bold link");
         assert_eq!(inline_markdown(&inlines), "a **bold** [link](target.md)");
+    }
+
+    #[test]
+    fn inline_plain_column_maps_source_syntax_to_plain_text() {
+        assert_eq!(inline_plain_column_for_source_column("**bold**", 8), 4);
+        assert_eq!(
+            inline_plain_column_for_source_column("a **bold** tail", 10),
+            6
+        );
+        assert_eq!(
+            inline_plain_column_for_source_column("[README](guide.md)", 17),
+            6
+        );
     }
 }

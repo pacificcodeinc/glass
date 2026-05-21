@@ -1,40 +1,32 @@
-# Issues
+# Current Glass Issues
 
-Bug & feature log for glass.
+## Markdown Typing
 
-## Rendering
+- Typing Markdown shortcuts into the document model is unreliable.
+- Inline Markdown syntax does not consistently convert into the document model.
+- `- [ ]` on a new line should create a checkbox item.
+- `# ` before text should create a heading instead of dropping the marker or leaving invalid facade text.
 
-- [ ] **Fenced code blocks**: highlight the language identifier (e.g., `rust` in ` ```rust `).
-- [x] **Tables**: render Markdown tables.
-- [ ] **Strikethrough**: render `~~text~~`, including inside list items.
-- [ ] **URL display**: strip unnecessary parts (e.g., `https://`) from bare URLs that lack pretty titles.
-- [ ] **Link expansion**: only expand URLs to their real Markdown form on hover, not whenever their line is active in Normal mode.
-- [ ] **Inline elements**: fix broken behavior of inline elements across line breaks.
-- [ ] **Wiki-links**: render `[[File.md]]` distinctly and support jumping to the linked file.
+## Scrolling And Visual Motion
 
-## Editor & Input
+- Scrolling can feel laggy or delayed.
+- `G` and `Shift+V` are noticeably slow in larger documents.
 
-- [x] **Mouse support**: click anywhere in the editor to move the cursor.
-- [ ] **Vim motions**: achieve full parity with standard Vim motions.
-- [ ] **Simple mode**: add a non-Vim editing mode (post-1.0).
-- [ ] **Spell check**: add spell-checking support.
-- [ ] **Line breaking**: fix general line-breaking bugs.
-- [ ] **Search**: in Normal mode, pressing `/` opens a bottom popup to search for text in the current document.
-- [ ] **Command bar**: typing `:` in Normal mode opens the status bar for command input. Show a fuzzy-searchable suggestion popup above the status bar with all available commands; use Tab to cycle completions and Up/Down to navigate. Example: `:table` inserts a Markdown table at the cursor. Or `:read` sets the view to read-only without expanding the markdwon when you're active on the line.
+## Selection And Copying
 
-## File Management
+- Drag selection currently copies too eagerly.
+- Copying should happen once when the user finishes dragging a selection.
+- Starting a new selection should clear the previous copied-selection state.
+- Copied Markdown can contain extra lines or incorrectly translated Markdown.
+- `"+y` should copy through the clipboard/register path.
 
-- [ ] **File picker**: rewrite the fuzzy-find / Command+P picker from scratch.
-- [x] **Old picker cleanup**: remove the fuzzy finder, command palette overlay, and Command+P binding before the rewrite.
-- [x] **Lazy file creation**: when opening a new file via `glass <new-file>.md`, only create it on disk after `:w` is used.
-- [ ] **New file UI**: show the unsaved-change indicator and the target filename (instead of `[no note]`) when opening a non-existent file.
+## Tables
 
-## UI / Status Bar
+- Newly created tables become glitchy when a cell is cleared.
+- Empty cells should remain focusable and editable.
+- Typing should not be allowed into invalid source positions beside a rendered table.
 
-- [x] **Sidebar branding**: fix the "Glass" text in the sidebar randomly turning red.
-- [ ] **Unsaved indicator**: use a white (instead of red) unsaved-change icon next to the filename in the status bar.
+## Test Coverage
 
-## Cursor Behavior
-
-- [x] **`G` motion**: preserve the current column, like `dd` does.
-- [x] **Column preservation**: preserve the cursor column when jumping lines with `h`/`j`/arrows/`g`/`gg`.
+- Add app-level typing tests that drive Glass through key and mouse events.
+- Use render snapshots for static layout checks and app harness tests for editing behavior.

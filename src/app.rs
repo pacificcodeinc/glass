@@ -185,6 +185,8 @@ pub struct App {
     pending_g: bool,
     pending_delete: bool,
     pending_change: bool,
+    pending_register_prefix: bool,
+    pending_register: Option<char>,
     mouse_anchor: Option<Cursor>,
     last_copied_selection: Option<String>,
 }
@@ -223,6 +225,8 @@ impl App {
             pending_g: false,
             pending_delete: false,
             pending_change: false,
+            pending_register_prefix: false,
+            pending_register: None,
             mouse_anchor: None,
             last_copied_selection: None,
         })
@@ -354,6 +358,7 @@ impl App {
                         .1
                         .map(|column| (self.cursor.line, self.cursor.column, column));
                     self.update_text_selection(anchor, self.cursor);
+                    self.copy_current_text_selection();
                     self.cancel_pending_operators();
                     self.reset_preferred_column();
                 }
@@ -378,6 +383,8 @@ impl App {
         self.pending_g = false;
         self.pending_delete = false;
         self.pending_change = false;
+        self.pending_register_prefix = false;
+        self.pending_register = None;
     }
 
     fn clear_text_selection(&mut self) {
@@ -394,9 +401,16 @@ impl App {
         }
 
         self.text_selection = Some(TextSelection { anchor, head });
+    }
+
+    fn copy_current_text_selection(&mut self) {
         let Some(selected_text) = self.selected_text() else {
             return;
         };
+        self.copy_text(selected_text);
+    }
+
+    fn copy_text(&mut self, selected_text: String) {
         if self.last_copied_selection.as_ref() == Some(&selected_text) {
             return;
         }
@@ -412,6 +426,26 @@ impl App {
         }
     }
 
+    fn copy_visual_selection(&mut self) {
+        let anchor = self.visual_line_anchor.unwrap_or(self.cursor.line);
+        let start_line = anchor.min(self.cursor.line);
+        let end_line = anchor.max(self.cursor.line);
+        let start = Cursor {
+            line: start_line,
+            column: 0,
+        };
+        let end = Cursor {
+            line: end_line,
+            column: self.buffer.line_len_chars(end_line),
+        };
+        if let Some(selected_text) = self.buffer.selected_markdown(start, end) {
+            self.copy_text(selected_text);
+        }
+        self.mode = Mode::Normal;
+        self.visual_line_anchor = None;
+        self.cancel_pending_operators();
+    }
+
     fn selected_text(&self) -> Option<String> {
         let selection = self.text_selection?;
         let (start, end) = selection.ordered();
@@ -419,6 +453,14 @@ impl App {
     }
 
     fn handle_normal_key(&mut self, key: KeyEvent) -> Result<()> {
+        if self.pending_register_prefix {
+            self.pending_register_prefix = false;
+            if let KeyCode::Char(register) = key.code {
+                self.pending_register = Some(register);
+            }
+            return Ok(());
+        }
+
         if self.pending_delete {
             self.pending_delete = false;
             self.delete_motion(key);
@@ -449,6 +491,10 @@ impl App {
         }
 
         match key.code {
+            KeyCode::Char('"') => {
+                self.pending_register_prefix = true;
+                self.set_status("register");
+            }
             KeyCode::Char(':') => {
                 self.enter_command_line();
             }
@@ -567,13 +613,30 @@ impl App {
                 self.pending_delete = true;
                 self.set_status("delete");
             }
+            KeyCode::Char('y') if self.pending_register == Some('+') => {
+                let line = self.cursor.line;
+                let start = Cursor { line, column: 0 };
+                let end = Cursor {
+                    line,
+                    column: self.buffer.line_len_chars(line),
+                };
+                if let Some(selected_text) = self.buffer.selected_markdown(start, end) {
+                    self.copy_text(selected_text);
+                }
+                self.cancel_pending_operators();
+            }
             KeyCode::Char('G') => self.document_end_preserving_column(),
             KeyCode::Char('g') => self.pending_g = true,
             KeyCode::Char('n') => self.jump_search_match(1),
             KeyCode::Char('N') => self.jump_search_match(-1),
             KeyCode::Char('u') => self.undo(),
             KeyCode::Char('x') | KeyCode::Delete => {
-                if !self.edit_active_surface(SurfaceEdit::Delete) {
+                if self
+                    .buffer
+                    .delete_structural_list_marker_at_cursor(&mut self.cursor, false)
+                {
+                    self.surface_cursor = None;
+                } else if !self.edit_active_surface(SurfaceEdit::Delete) {
                     self.surface_cursor = None;
                     self.buffer.delete_char(&mut self.cursor);
                 }
@@ -599,6 +662,11 @@ impl App {
                     self.delete_to_line_start();
                 } else if key.modifiers.contains(KeyModifiers::ALT) {
                     self.delete_word_backward();
+                } else if self
+                    .buffer
+                    .delete_structural_list_marker_at_cursor(&mut self.cursor, true)
+                {
+                    self.surface_cursor = None;
                 } else if !self.edit_active_surface(SurfaceEdit::Backspace) {
                     self.surface_cursor = None;
                     self.buffer.delete_previous_char(&mut self.cursor);
@@ -608,6 +676,11 @@ impl App {
             KeyCode::Delete => {
                 if key.modifiers.contains(KeyModifiers::SUPER) {
                     self.delete_to_line_end();
+                } else if self
+                    .buffer
+                    .delete_structural_list_marker_at_cursor(&mut self.cursor, false)
+                {
+                    self.surface_cursor = None;
                 } else if !self.edit_active_surface(SurfaceEdit::Delete) {
                     self.surface_cursor = None;
                     self.buffer.delete_char(&mut self.cursor);
@@ -668,6 +741,14 @@ impl App {
     }
 
     fn handle_visual_key(&mut self, key: KeyEvent) -> Result<()> {
+        if self.pending_register_prefix {
+            self.pending_register_prefix = false;
+            if let KeyCode::Char(register) = key.code {
+                self.pending_register = Some(register);
+            }
+            return Ok(());
+        }
+
         if self.pending_g {
             self.pending_g = false;
             match key.code {
@@ -686,6 +767,10 @@ impl App {
         }
 
         match key.code {
+            KeyCode::Char('"') => {
+                self.pending_register_prefix = true;
+                self.set_status("register");
+            }
             KeyCode::Char(':') => {
                 self.enter_command_line();
             }
@@ -700,6 +785,7 @@ impl App {
                 self.mode = Mode::Normal;
                 self.visual_line_anchor = None;
             }
+            KeyCode::Char('y') => self.copy_visual_selection(),
             KeyCode::Char('d') | KeyCode::Char('D') | KeyCode::Delete | KeyCode::Backspace => {
                 self.delete_visual_lines();
             }
@@ -3210,7 +3296,7 @@ fn parse_list_item(content: &str) -> Option<ListItem<'_>> {
         {
             return Some(ListItem {
                 kind: ListItemKind::Checkbox,
-                marker_len: content.len() - item_content.len(),
+                marker_len: content.chars().count() - item_content.chars().count(),
                 content: item_content,
             });
         }
@@ -3226,7 +3312,7 @@ fn parse_list_item(content: &str) -> Option<ListItem<'_>> {
         {
             return Some(ListItem {
                 kind: ListItemKind::Checkbox,
-                marker_len: content.len() - item_content.len(),
+                marker_len: content.chars().count() - item_content.chars().count(),
                 content: item_content,
             });
         }
@@ -3235,7 +3321,7 @@ fn parse_list_item(content: &str) -> Option<ListItem<'_>> {
     if let Some((number, item_content)) = parse_numbered_list(content) {
         return Some(ListItem {
             kind: ListItemKind::Numbered(number.parse().unwrap_or(1)),
-            marker_len: content.len() - item_content.len(),
+            marker_len: content.chars().count() - item_content.chars().count(),
             content: item_content,
         });
     }
@@ -3245,7 +3331,7 @@ fn parse_list_item(content: &str) -> Option<ListItem<'_>> {
         if let Some(item_content) = content.strip_prefix(&prefix) {
             return Some(ListItem {
                 kind: ListItemKind::Bullet(marker),
-                marker_len: prefix.len(),
+                marker_len: prefix.chars().count(),
                 content: item_content,
             });
         }
@@ -3387,6 +3473,8 @@ mod tests {
             pending_g: false,
             pending_delete: false,
             pending_change: false,
+            pending_register_prefix: false,
+            pending_register: None,
             mouse_anchor: None,
             last_copied_selection: None,
         }
@@ -3484,6 +3572,44 @@ mod tests {
 
         assert!(app.should_quit);
         assert_eq!(app.mode, Mode::Normal);
+    }
+
+    #[test]
+    fn visual_mode_y_copies_selected_lines() {
+        let mut app = test_app("# Heading\n- [ ] todo");
+        app.resize_viewport(5, 40);
+
+        press(&mut app, KeyCode::Char('V'));
+        press(&mut app, KeyCode::Char('j'));
+        press(&mut app, KeyCode::Char('y'));
+
+        assert_eq!(
+            app.last_copied_selection.as_deref(),
+            Some("# Heading\n- [ ] todo")
+        );
+        assert_eq!(app.status_message, "Copied selection");
+        assert_eq!(app.mode, Mode::Normal);
+        assert_eq!(app.visual_line_anchor, None);
+    }
+
+    #[test]
+    fn visual_mode_clipboard_register_y_copies_selected_lines() {
+        let mut app = test_app("# Heading\n- [ ] todo");
+        app.resize_viewport(5, 40);
+
+        press(&mut app, KeyCode::Char('V'));
+        press(&mut app, KeyCode::Char('j'));
+        press(&mut app, KeyCode::Char('"'));
+        press(&mut app, KeyCode::Char('+'));
+        press(&mut app, KeyCode::Char('y'));
+
+        assert_eq!(
+            app.last_copied_selection.as_deref(),
+            Some("# Heading\n- [ ] todo")
+        );
+        assert_eq!(app.status_message, "Copied selection");
+        assert_eq!(app.mode, Mode::Normal);
+        assert_eq!(app.visual_line_anchor, None);
     }
 
     #[test]
@@ -3617,7 +3743,7 @@ mod tests {
     }
 
     #[test]
-    fn mouse_drag_selects_text_and_copies_immediately() {
+    fn mouse_drag_selects_text_and_copies_on_release() {
         let mut app = test_app("bravo");
         app.resize_viewport(5, 20);
 
@@ -3626,6 +3752,10 @@ mod tests {
 
         assert_eq!(app.cursor, Cursor { line: 0, column: 4 });
         assert_eq!(app.selected_text().as_deref(), Some("rav"));
+        assert_eq!(app.last_copied_selection, None);
+
+        release(&mut app, 6, 0);
+
         assert_eq!(app.status_message, "Copied selection");
         assert_eq!(app.last_copied_selection.as_deref(), Some("rav"));
     }
@@ -3652,6 +3782,22 @@ mod tests {
 
         assert_eq!(app.selected_text().as_deref(), Some("rav"));
         assert_eq!(app.mouse_anchor, None);
+    }
+
+    #[test]
+    fn starting_new_mouse_selection_clears_previous_copy_state() {
+        let mut app = test_app("bravo");
+        app.resize_viewport(5, 20);
+
+        click(&mut app, 3, 0);
+        drag(&mut app, 6, 0);
+        release(&mut app, 6, 0);
+        assert_eq!(app.last_copied_selection.as_deref(), Some("rav"));
+
+        click(&mut app, 1, 0);
+
+        assert_eq!(app.text_selection, None);
+        assert_eq!(app.last_copied_selection, None);
     }
 
     #[test]
@@ -4401,6 +4547,87 @@ mod tests {
         assert_eq!(buffer.as_string(), "[ ] todo\n\nafter");
         assert_eq!(buffer.markdown_string(), "- [ ] todo\n\nafter");
         assert_eq!(cursor, Cursor { line: 1, column: 0 });
+    }
+
+    #[test]
+    fn enter_exits_empty_rendered_bullet_item() {
+        assert_eq!(
+            list_continuation_after_enter("• ", 2),
+            ListContinuation::EndList {
+                delete_to_column: 2
+            }
+        );
+    }
+
+    #[test]
+    fn double_enter_exits_bullet_list_at_document_end() {
+        let mut app = test_app("- todo");
+        app.mode = Mode::Insert;
+        app.cursor = Cursor { line: 0, column: 6 };
+
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.buffer.as_string(), "• todo\n• ");
+        assert_eq!(app.cursor, Cursor { line: 1, column: 2 });
+
+        press(&mut app, KeyCode::Enter);
+
+        assert_eq!(app.buffer.as_string(), "• todo\n\n");
+        assert_eq!(app.buffer.markdown_string(), "- todo\n\n");
+        assert_eq!(app.cursor, Cursor { line: 1, column: 0 });
+    }
+
+    #[test]
+    fn backspace_at_empty_checklist_marker_clears_line() {
+        let mut app = test_app("- [ ] ");
+        app.mode = Mode::Insert;
+        app.cursor = Cursor { line: 0, column: 4 };
+
+        press(&mut app, KeyCode::Backspace);
+
+        assert_eq!(app.buffer.as_string(), "");
+        assert_eq!(app.buffer.markdown_string(), "");
+        assert_eq!(app.cursor, Cursor { line: 0, column: 0 });
+    }
+
+    #[test]
+    fn backspacing_through_checklist_content_clears_marker_without_artifacts() {
+        let mut app = test_app("- [ ] my");
+        app.mode = Mode::Insert;
+        app.cursor = Cursor { line: 0, column: 6 };
+
+        press(&mut app, KeyCode::Backspace);
+        press(&mut app, KeyCode::Backspace);
+        press(&mut app, KeyCode::Backspace);
+
+        assert_eq!(app.buffer.as_string(), "");
+        assert_eq!(app.buffer.markdown_string(), "");
+        assert_eq!(app.cursor, Cursor { line: 0, column: 0 });
+    }
+
+    #[test]
+    fn backspace_at_checklist_content_start_converts_to_paragraph() {
+        let mut app = test_app("- [ ] my name");
+        app.mode = Mode::Insert;
+        app.cursor = Cursor { line: 0, column: 4 };
+
+        press(&mut app, KeyCode::Backspace);
+
+        assert_eq!(app.buffer.as_string(), "my name");
+        assert_eq!(app.buffer.markdown_string(), "my name");
+        assert_eq!(app.cursor, Cursor { line: 0, column: 0 });
+    }
+
+    #[test]
+    fn delete_at_checklist_content_start_deletes_content_not_marker() {
+        let mut app = test_app("- [ ] my");
+        app.mode = Mode::Insert;
+        app.cursor = Cursor { line: 0, column: 4 };
+
+        press(&mut app, KeyCode::Delete);
+
+        assert_eq!(app.buffer.as_string(), "[ ] y");
+        assert_eq!(app.buffer.markdown_string(), "- [ ] y");
+        assert_eq!(app.cursor, Cursor { line: 0, column: 4 });
     }
 
     #[test]

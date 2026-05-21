@@ -10,6 +10,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - Document facade rendering now uses the same concealed wrapping path for display and full-height `--render` snapshots, preventing dropped wrap-boundary characters and preserving continuation indentation for facade list markers.
+- Markdown shortcut typing now remaps the cursor through hidden syntax, so heading and inline formatting conversions do not jump to the wrong facade column.
+- Typing `- [ ]` through the rendered bullet facade now converts to a checklist item.
+- Empty rendered bullet items now exit cleanly on Enter instead of leaving stray bullet glyphs.
+- Backspacing through rendered list and checklist markers now clears or unwraps the structural item instead of corrupting the marker text.
+- Drag selection now copies once on mouse release instead of copying repeatedly while dragging.
+- Visual selection yanking now supports `y` and the clipboard register form `"+y`.
+- Copied full-block selections no longer insert extra blank lines between serialized Markdown blocks.
 
 ## [0.1.8] - 2026-05-21
 

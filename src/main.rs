@@ -316,7 +316,7 @@ COMMANDS:
 
 MOUSE:
   Click          move the cursor
-  Drag           select text and copy it immediately
+  Drag           select text and copy when released
   Wheel          scroll through wrapped visual rows
   Cmd-click      open the link under the pointer
 

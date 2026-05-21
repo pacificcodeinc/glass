@@ -135,7 +135,7 @@ impl Document {
             if ranges_overlap(range_start, range_end, block_start, block_end) {
                 if range_start <= block_start && range_end >= block_end {
                     if !result.is_empty() {
-                        result.push_str("\n\n");
+                        result.push('\n');
                     }
                     result.push_str(&block.to_markdown());
                 } else {

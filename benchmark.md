@@ -25,7 +25,7 @@ Indented headings should stay plain:
 
 ## Paragraphs And Wrapping
 
-This paragraph is intentionally long so it wraps across several visual rows in a normal terminal width. It includes plain words, punctuation, and a useful search target: glass benchmark needle. Cursor movement should preserve the intended visual column when moving through this wrapped paragraph, and selection should copy the selected text immediately.
+This paragraph is intentionally long so it wraps across several visual rows in a normal terminal width. It includes plain words, punctuation, and a useful search target: glass benchmark needle. Cursor movement should preserve the intended visual column when moving through this wrapped paragraph, and selection should copy the selected text when dragging finishes.
 
 This query is split across a physical line break for search testing:
 multi
