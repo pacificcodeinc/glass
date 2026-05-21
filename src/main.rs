@@ -1,6 +1,7 @@
 mod app;
 mod config;
 mod debug_render;
+mod document;
 mod editor;
 mod fs;
 mod markdown;
@@ -262,7 +263,7 @@ NORMAL MODE KEYS:
   :              open command line
   /              search the current file
   h j k l        move left/down/up/right
-  w b            move word forward/backward
+  w b            word forward/backward
   0 ^ $          line start, first non-blank, line end
   gg G           document top/bottom
   n N            next/previous search result
@@ -276,7 +277,9 @@ NORMAL MODE KEYS:
 
 INSERT MODE KEYS:
   Esc            return to Normal mode
-  Tab            insert four spaces
+  Tab            move to next table cell, or insert four spaces
+  Shift-Tab      move to previous table cell
+  Enter          move to next table row, continue a list, or insert newline
   Backspace      delete previous character
   Option-Left    move one word left
   Option-Right   move one word right
@@ -302,9 +305,18 @@ COMMANDS:
       Open a file path relative to the notes directory, or create it on save if
       it does not exist yet.
 
+  :table [rows]x[columns]
+      Insert a Markdown table. Defaults to 2x2.
+
+  :row, :row above
+      Insert a table row below or above the current row.
+
+  :column, :column left
+      Insert a table column right or left of the current cell.
+
 MOUSE:
   Click          move the cursor
-  Drag           select text and copy it immediately
+  Drag           select text and copy when released
   Wheel          scroll through wrapped visual rows
   Cmd-click      open the link under the pointer
 
@@ -426,6 +438,7 @@ mod tests {
         assert!(help.contains("ends with the status bar"));
         assert!(help.contains("stdout is redirected or piped"));
         assert!(help.contains(":e <path>, :edit <path>"));
+        assert!(help.contains(":table [rows]x[columns]"));
         assert!(help.contains("Cmd-click"));
     }
 

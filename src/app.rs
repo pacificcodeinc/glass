@@ -1,4 +1,5 @@
 use std::{
+    cell::RefCell,
     path::{Path, PathBuf},
     process::Command as ProcessCommand,
     time::{Duration, Instant},
@@ -14,16 +15,17 @@ use crossterm::event::{
 
 use crate::{
     config::theme::Theme,
+    document::{SurfaceLine, SurfaceMode, surface::wrap_surface_or_facade_line},
     editor::{
         buffer::DocumentBuffer,
         commands::{Command, parse_command},
         cursor::Cursor,
         motions,
-        render::{visible_rows, visual_line_bounds, wrap_index_for_column, wrap_line},
+        render::visible_rows,
     },
     fs::tree::FileTree,
-    markdown::inline::{LinkKind, link_at_column},
-    markdown::{highlight::concealed_wrap_line, table::TableLayout},
+    markdown::inline::LinkKind,
+    markdown::table::TableLayout,
 };
 
 const STATUS_MESSAGE_TTL: Duration = Duration::from_secs(3);
@@ -40,6 +42,8 @@ pub enum Mode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CommandPrompt {
     Command,
+    File,
+    Palette,
     Search,
 }
 
@@ -117,6 +121,13 @@ pub struct TextSelection {
     pub head: Cursor,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SurfaceEdit {
+    Insert(char),
+    Backspace,
+    Delete,
+}
+
 impl TextSelection {
     pub fn ordered(self) -> (Cursor, Cursor) {
         if cursor_before_or_equal(self.anchor, self.head) {
@@ -171,11 +182,56 @@ pub struct App {
     pub visual_line_anchor: Option<usize>,
     preferred_column: Option<usize>,
     preferred_visual_column: Option<usize>,
+    surface_cursor: Option<(usize, usize, usize)>,
     pending_g: bool,
     pending_delete: bool,
     pending_change: bool,
+    pending_register_prefix: bool,
+    pending_register: Option<char>,
     mouse_anchor: Option<Cursor>,
     last_copied_selection: Option<String>,
+    wrap_cache: RefCell<WrapCache>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct WrapCacheKey {
+    line: usize,
+    width: usize,
+    cursor_line: usize,
+    cursor_column: usize,
+    surface_column: Option<usize>,
+}
+
+#[derive(Debug, Clone)]
+struct WrapCacheEntry {
+    key: WrapCacheKey,
+    value: (Vec<(usize, usize)>, usize),
+}
+
+#[derive(Debug, Default)]
+struct WrapCache {
+    entries: Vec<WrapCacheEntry>,
+}
+
+impl WrapCache {
+    fn get(&self, key: WrapCacheKey) -> Option<(Vec<(usize, usize)>, usize)> {
+        self.entries
+            .iter()
+            .rev()
+            .find(|entry| entry.key == key)
+            .map(|entry| entry.value.clone())
+    }
+
+    fn insert(&mut self, key: WrapCacheKey, value: (Vec<(usize, usize)>, usize)) {
+        if self.entries.len() >= 256 {
+            self.entries.remove(0);
+        }
+        self.entries.push(WrapCacheEntry { key, value });
+    }
+
+    fn clear(&mut self) {
+        self.entries.clear();
+    }
 }
 
 impl App {
@@ -208,21 +264,27 @@ impl App {
             visual_line_anchor: None,
             preferred_column: None,
             preferred_visual_column: None,
+            surface_cursor: None,
             pending_g: false,
             pending_delete: false,
             pending_change: false,
+            pending_register_prefix: false,
+            pending_register: None,
             mouse_anchor: None,
             last_copied_selection: None,
+            wrap_cache: RefCell::new(WrapCache::default()),
         })
     }
 
     pub fn handle_event(&mut self, event: Event) -> Result<()> {
+        self.clear_wrap_cache();
         match event {
             Event::Key(key) => self.handle_key_event(key)?,
             Event::Mouse(mouse) => self.handle_mouse_event(mouse)?,
             _ => {}
         }
 
+        self.clear_wrap_cache();
         self.keep_cursor_visible();
         Ok(())
     }
@@ -253,8 +315,13 @@ impl App {
             return Ok(());
         }
 
-        if self.mode != Mode::CommandLine && is_command_sheet_shortcut(key) {
-            self.enter_command_sheet(CommandPrompt::Command);
+        if self.mode != Mode::CommandLine && is_file_picker_shortcut(key) {
+            self.enter_command_sheet(CommandPrompt::File);
+            return Ok(());
+        }
+
+        if self.mode != Mode::CommandLine && is_command_palette_shortcut(key) {
+            self.enter_command_sheet(CommandPrompt::Palette);
             return Ok(());
         }
 
@@ -273,14 +340,20 @@ impl App {
     }
 
     pub fn resize_viewport(&mut self, visible_height: usize, visible_width: usize) {
+        self.clear_wrap_cache();
         self.viewport.visible_height = visible_height.max(1);
         self.viewport.visible_width = visible_width.max(1);
         self.keep_cursor_visible();
     }
 
     pub fn move_viewport_to(&mut self, x: u16, y: u16) {
+        self.clear_wrap_cache();
         self.viewport.x = x;
         self.viewport.y = y;
+    }
+
+    fn clear_wrap_cache(&self) {
+        self.wrap_cache.borrow_mut().clear();
     }
 
     fn handle_mouse_event(&mut self, mouse: MouseEvent) -> Result<()> {
@@ -290,11 +363,15 @@ impl App {
 
         match mouse.kind {
             MouseEventKind::Down(MouseButton::Left) => {
-                let Some(cursor) = self.cursor_for_mouse_position(mouse.column, mouse.row) else {
+                let Some((cursor, surface_column)) =
+                    self.cursor_for_mouse_position(mouse.column, mouse.row)
+                else {
                     return Ok(());
                 };
 
                 self.cursor = cursor;
+                self.surface_cursor =
+                    surface_column.map(|column| (cursor.line, cursor.column, column));
                 self.clear_text_selection();
                 self.cancel_pending_operators();
                 self.reset_preferred_column();
@@ -309,11 +386,15 @@ impl App {
                 let Some(anchor) = self.mouse_anchor else {
                     return Ok(());
                 };
-                let Some(cursor) = self.cursor_for_mouse_position(mouse.column, mouse.row) else {
+                let Some((cursor, surface_column)) =
+                    self.cursor_for_mouse_position(mouse.column, mouse.row)
+                else {
                     return Ok(());
                 };
 
                 self.cursor = cursor;
+                self.surface_cursor =
+                    surface_column.map(|column| (cursor.line, cursor.column, column));
                 self.update_text_selection(anchor, cursor);
                 self.cancel_pending_operators();
                 self.reset_preferred_column();
@@ -324,8 +405,12 @@ impl App {
                     anchor,
                     self.cursor_for_mouse_position(mouse.column, mouse.row),
                 ) {
-                    self.cursor = cursor;
-                    self.update_text_selection(anchor, cursor);
+                    self.cursor = cursor.0;
+                    self.surface_cursor = cursor
+                        .1
+                        .map(|column| (self.cursor.line, self.cursor.column, column));
+                    self.update_text_selection(anchor, self.cursor);
+                    self.copy_current_text_selection();
                     self.cancel_pending_operators();
                     self.reset_preferred_column();
                 }
@@ -350,6 +435,8 @@ impl App {
         self.pending_g = false;
         self.pending_delete = false;
         self.pending_change = false;
+        self.pending_register_prefix = false;
+        self.pending_register = None;
     }
 
     fn clear_text_selection(&mut self) {
@@ -366,9 +453,16 @@ impl App {
         }
 
         self.text_selection = Some(TextSelection { anchor, head });
+    }
+
+    fn copy_current_text_selection(&mut self) {
         let Some(selected_text) = self.selected_text() else {
             return;
         };
+        self.copy_text(selected_text);
+    }
+
+    fn copy_text(&mut self, selected_text: String) {
         if self.last_copied_selection.as_ref() == Some(&selected_text) {
             return;
         }
@@ -384,26 +478,41 @@ impl App {
         }
     }
 
+    fn copy_visual_selection(&mut self) {
+        let anchor = self.visual_line_anchor.unwrap_or(self.cursor.line);
+        let start_line = anchor.min(self.cursor.line);
+        let end_line = anchor.max(self.cursor.line);
+        let start = Cursor {
+            line: start_line,
+            column: 0,
+        };
+        let end = Cursor {
+            line: end_line,
+            column: self.buffer.line_len_chars(end_line),
+        };
+        if let Some(selected_text) = self.buffer.selected_markdown(start, end) {
+            self.copy_text(selected_text);
+        }
+        self.mode = Mode::Normal;
+        self.visual_line_anchor = None;
+        self.cancel_pending_operators();
+    }
+
     fn selected_text(&self) -> Option<String> {
         let selection = self.text_selection?;
         let (start, end) = selection.ordered();
-        let start = self.buffer.char_index(start);
-        let end = self.buffer.char_index(end);
-        if start == end {
-            return None;
-        }
-
-        Some(
-            self.buffer
-                .as_string()
-                .chars()
-                .skip(start)
-                .take(end.saturating_sub(start))
-                .collect(),
-        )
+        self.buffer.selected_markdown(start, end)
     }
 
     fn handle_normal_key(&mut self, key: KeyEvent) -> Result<()> {
+        if self.pending_register_prefix {
+            self.pending_register_prefix = false;
+            if let KeyCode::Char(register) = key.code {
+                self.pending_register = Some(register);
+            }
+            return Ok(());
+        }
+
         if self.pending_delete {
             self.pending_delete = false;
             self.delete_motion(key);
@@ -434,6 +543,10 @@ impl App {
         }
 
         match key.code {
+            KeyCode::Char('"') => {
+                self.pending_register_prefix = true;
+                self.set_status("register");
+            }
             KeyCode::Char(':') => {
                 self.enter_command_line();
             }
@@ -479,13 +592,23 @@ impl App {
                 self.mode = Mode::Insert;
             }
             KeyCode::Char('h') | KeyCode::Left => {
-                motions::left(&mut self.cursor);
+                if !self.move_table_cursor_horizontally(-1)
+                    && !self.move_surface_cursor_horizontally(-1)
+                {
+                    motions::left(&mut self.cursor);
+                    self.surface_cursor = None;
+                }
                 self.reset_preferred_column();
             }
             KeyCode::Char('j') | KeyCode::Down => self.visual_line_down(),
             KeyCode::Char('k') | KeyCode::Up => self.visual_line_up(),
             KeyCode::Char('l') | KeyCode::Right => {
-                motions::right(&self.buffer, &mut self.cursor);
+                if !self.move_table_cursor_horizontally(1)
+                    && !self.move_surface_cursor_horizontally(1)
+                {
+                    motions::right(&self.buffer, &mut self.cursor);
+                    self.surface_cursor = None;
+                }
                 self.reset_preferred_column();
             }
             KeyCode::Char('w') => {
@@ -542,13 +665,35 @@ impl App {
                 self.pending_delete = true;
                 self.set_status("delete");
             }
+            KeyCode::Char('y') if self.pending_register == Some('+') => {
+                let line = self.cursor.line;
+                let start = Cursor { line, column: 0 };
+                let end = Cursor {
+                    line,
+                    column: self.buffer.line_len_chars(line),
+                };
+                if let Some(selected_text) = self.buffer.selected_markdown(start, end) {
+                    self.copy_text(selected_text);
+                }
+                self.cancel_pending_operators();
+            }
             KeyCode::Char('G') => self.document_end_preserving_column(),
             KeyCode::Char('g') => self.pending_g = true,
             KeyCode::Char('n') => self.jump_search_match(1),
             KeyCode::Char('N') => self.jump_search_match(-1),
             KeyCode::Char('u') => self.undo(),
             KeyCode::Char('x') | KeyCode::Delete => {
-                self.buffer.delete_char(&mut self.cursor);
+                if self.buffer.delete_table_char(&mut self.cursor, false) {
+                    self.surface_cursor = None;
+                } else if self
+                    .buffer
+                    .delete_structural_list_marker_at_cursor(&mut self.cursor, false)
+                {
+                    self.surface_cursor = None;
+                } else if !self.edit_active_surface(SurfaceEdit::Delete) {
+                    self.surface_cursor = None;
+                    self.buffer.delete_char(&mut self.cursor);
+                }
                 self.reset_preferred_column();
             }
             _ => {}
@@ -561,7 +706,9 @@ impl App {
         match key.code {
             KeyCode::Esc => self.mode = Mode::Normal,
             KeyCode::Enter => {
-                insert_newline_with_list_continuation(&mut self.buffer, &mut self.cursor);
+                if !self.buffer.enter_table_cell(&mut self.cursor) {
+                    insert_newline_with_list_continuation(&mut self.buffer, &mut self.cursor);
+                }
                 self.reset_preferred_column();
             }
             KeyCode::Backspace => {
@@ -569,7 +716,15 @@ impl App {
                     self.delete_to_line_start();
                 } else if key.modifiers.contains(KeyModifiers::ALT) {
                     self.delete_word_backward();
-                } else {
+                } else if self.buffer.delete_table_char(&mut self.cursor, true) {
+                    self.surface_cursor = None;
+                } else if self
+                    .buffer
+                    .delete_structural_list_marker_at_cursor(&mut self.cursor, true)
+                {
+                    self.surface_cursor = None;
+                } else if !self.edit_active_surface(SurfaceEdit::Backspace) {
+                    self.surface_cursor = None;
                     self.buffer.delete_previous_char(&mut self.cursor);
                 }
                 self.reset_preferred_column();
@@ -577,13 +732,27 @@ impl App {
             KeyCode::Delete => {
                 if key.modifiers.contains(KeyModifiers::SUPER) {
                     self.delete_to_line_end();
-                } else {
+                } else if self.buffer.delete_table_char(&mut self.cursor, false) {
+                    self.surface_cursor = None;
+                } else if self
+                    .buffer
+                    .delete_structural_list_marker_at_cursor(&mut self.cursor, false)
+                {
+                    self.surface_cursor = None;
+                } else if !self.edit_active_surface(SurfaceEdit::Delete) {
+                    self.surface_cursor = None;
                     self.buffer.delete_char(&mut self.cursor);
                 }
                 self.reset_preferred_column();
             }
             KeyCode::Tab => {
-                self.buffer.insert_str(&mut self.cursor, "    ");
+                if !self.buffer.move_table_cell(&mut self.cursor, 1) {
+                    self.buffer.insert_str(&mut self.cursor, "    ");
+                }
+                self.reset_preferred_column();
+            }
+            KeyCode::BackTab => {
+                self.buffer.move_table_cell(&mut self.cursor, -1);
                 self.reset_preferred_column();
             }
             KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -595,15 +764,26 @@ impl App {
                 self.reset_preferred_column();
             }
             KeyCode::Char(ch) if is_text_input_key(key) => {
-                self.buffer.insert_char(&mut self.cursor, ch);
+                if self.buffer.insert_table_char(&mut self.cursor, ch) {
+                    self.surface_cursor = None;
+                } else if !self.edit_active_surface(SurfaceEdit::Insert(ch)) {
+                    self.surface_cursor = None;
+                    self.buffer.insert_char(&mut self.cursor, ch);
+                }
                 self.reset_preferred_column();
             }
             KeyCode::Left => {
-                motions::left(&mut self.cursor);
+                if !self.move_surface_cursor_horizontally(-1) {
+                    motions::left(&mut self.cursor);
+                    self.surface_cursor = None;
+                }
                 self.reset_preferred_column();
             }
             KeyCode::Right => {
-                motions::right(&self.buffer, &mut self.cursor);
+                if !self.move_surface_cursor_horizontally(1) {
+                    motions::right(&self.buffer, &mut self.cursor);
+                    self.surface_cursor = None;
+                }
                 self.reset_preferred_column();
             }
             KeyCode::Up => self.move_line_up_preserving_column(),
@@ -621,6 +801,14 @@ impl App {
     }
 
     fn handle_visual_key(&mut self, key: KeyEvent) -> Result<()> {
+        if self.pending_register_prefix {
+            self.pending_register_prefix = false;
+            if let KeyCode::Char(register) = key.code {
+                self.pending_register = Some(register);
+            }
+            return Ok(());
+        }
+
         if self.pending_g {
             self.pending_g = false;
             match key.code {
@@ -639,6 +827,10 @@ impl App {
         }
 
         match key.code {
+            KeyCode::Char('"') => {
+                self.pending_register_prefix = true;
+                self.set_status("register");
+            }
             KeyCode::Char(':') => {
                 self.enter_command_line();
             }
@@ -653,17 +845,22 @@ impl App {
                 self.mode = Mode::Normal;
                 self.visual_line_anchor = None;
             }
+            KeyCode::Char('y') => self.copy_visual_selection(),
             KeyCode::Char('d') | KeyCode::Char('D') | KeyCode::Delete | KeyCode::Backspace => {
                 self.delete_visual_lines();
             }
             KeyCode::Char('h') | KeyCode::Left => {
-                motions::left(&mut self.cursor);
+                if !self.move_table_cursor_horizontally(-1) {
+                    motions::left(&mut self.cursor);
+                }
                 self.reset_preferred_column();
             }
             KeyCode::Char('j') | KeyCode::Down => self.visual_line_down(),
             KeyCode::Char('k') | KeyCode::Up => self.visual_line_up(),
             KeyCode::Char('l') | KeyCode::Right => {
-                motions::right(&self.buffer, &mut self.cursor);
+                if !self.move_table_cursor_horizontally(1) {
+                    motions::right(&self.buffer, &mut self.cursor);
+                }
                 self.reset_preferred_column();
             }
             KeyCode::Char('w') => {
@@ -991,6 +1188,33 @@ impl App {
             return self.execute_search_query(&input, selected);
         }
 
+        if matches!(self.sheet.prompt, CommandPrompt::File) {
+            if let Some(item) = selected {
+                return self.execute_sheet_item(item);
+            }
+            if let Some(path) = resolve_command_path_input(&input, &self.notes_dir) {
+                self.finish_command_sheet();
+                return self.open_path(&path);
+            }
+            self.finish_command_sheet();
+            self.set_status(format!("No file match: {input}"));
+            return Ok(());
+        }
+
+        if matches!(self.sheet.prompt, CommandPrompt::Palette) {
+            let command = parse_command(&input);
+            if !matches!(command, Command::Unknown(_)) {
+                self.finish_command_sheet();
+                return self.execute_command(command);
+            }
+            if let Some(item) = selected {
+                return self.execute_sheet_item(item);
+            }
+            self.finish_command_sheet();
+            self.set_status(format!("No command match: {input}"));
+            return Ok(());
+        }
+
         if let Some(search_query) = input.strip_prefix('/') {
             return self.execute_search_query(search_query.trim(), selected);
         }
@@ -1105,6 +1329,32 @@ impl App {
                 self.should_quit = true;
             }
             Command::Edit(path) => self.open_path(&path)?,
+            Command::Table { rows, columns } => {
+                self.buffer.insert_table(rows, columns, &mut self.cursor);
+                self.set_status(format!("Inserted {rows}x{columns} table"));
+            }
+            Command::TableRow { placement } => {
+                if self
+                    .buffer
+                    .insert_table_row_at_cursor(&mut self.cursor, placement)
+                {
+                    self.set_status("Inserted table row");
+                    self.reset_preferred_column();
+                } else {
+                    self.set_status("Not in a table");
+                }
+            }
+            Command::TableColumn { placement } => {
+                if self
+                    .buffer
+                    .insert_table_column_at_cursor(&mut self.cursor, placement)
+                {
+                    self.set_status("Inserted table column");
+                    self.reset_preferred_column();
+                } else {
+                    self.set_status("Not in a table");
+                }
+            }
             Command::Unknown(value) => {
                 self.set_status(format!("Unknown command: {value}"));
             }
@@ -1200,7 +1450,7 @@ impl App {
         self.viewport.visible_width.saturating_sub(gutter).max(1)
     }
 
-    fn cursor_for_mouse_position(&self, column: u16, row: u16) -> Option<Cursor> {
+    fn cursor_for_mouse_position(&self, column: u16, row: u16) -> Option<(Cursor, Option<usize>)> {
         if !self.viewport_contains(column, row) {
             return None;
         }
@@ -1220,7 +1470,11 @@ impl App {
         local_x < self.viewport.visible_width && local_y < self.viewport.visible_height
     }
 
-    fn cursor_for_viewport_position(&self, local_x: usize, local_y: usize) -> Option<Cursor> {
+    fn cursor_for_viewport_position(
+        &self,
+        local_x: usize,
+        local_y: usize,
+    ) -> Option<(Cursor, Option<usize>)> {
         let gutter = (self.buffer.line_count().to_string().len() + 1) as usize;
         let text_x = local_x.saturating_sub(gutter);
         let width = self.wrap_width();
@@ -1232,31 +1486,76 @@ impl App {
             self.viewport.visible_height,
             width,
             |line_num, text, width| {
-                if line_num == self.cursor.line {
-                    wrap_line(text, width)
-                } else if table_layout.is_table_row(line_num) {
+                if table_layout.is_table_row(line_num) {
                     table_layout.wrap_line(line_num, text, width)
                 } else {
-                    concealed_wrap_line(text, width)
+                    let mode = if line_num == self.cursor.line {
+                        SurfaceMode::Active {
+                            cursor_column: self.cursor.column,
+                        }
+                    } else {
+                        SurfaceMode::Inactive
+                    };
+                    wrap_surface_or_facade_line(
+                        self.buffer.block_for_line(line_num),
+                        text,
+                        width,
+                        mode,
+                    )
                 }
             },
         );
 
         let Some(row) = rows.get(local_y) else {
             let line = self.buffer.line_count().saturating_sub(1);
-            return Some(Cursor {
-                line,
-                column: self.buffer.line_len_chars(line),
-            });
+            return Some((
+                Cursor {
+                    line,
+                    column: self.buffer.line_len_chars(line),
+                },
+                None,
+            ));
         };
 
         let text_x = text_x.saturating_sub(row.continuation_indent);
+        if row.line_number == self.cursor.line
+            && !table_layout.is_table_row(row.line_number)
+            && self.buffer.block_for_line(row.line_number).is_some()
+        {
+            let surface = self.buffer.surface_line(
+                row.line_number,
+                SurfaceMode::Active {
+                    cursor_column: self.cursor.column,
+                },
+            );
+            let display_segments = surface.wrap_display_segments(width);
+            let (display_start, display_end) = display_segments
+                .get(row.wrap_index)
+                .copied()
+                .unwrap_or((0, surface.display_len()));
+            let surface_column =
+                display_start + text_x.min(display_end.saturating_sub(display_start));
+            let column = surface
+                .source_column_for_display_column(surface_column)
+                .min(self.buffer.line_len_chars(row.line_number));
+            return Some((
+                Cursor {
+                    line: row.line_number,
+                    column,
+                },
+                Some(surface_column.min(surface.display_len())),
+            ));
+        }
+
         let segment_len = row.source_end.saturating_sub(row.source_start);
         let column = row.source_start + text_x.min(segment_len);
-        Some(Cursor {
-            line: row.line_number,
-            column: column.min(self.buffer.line_len_chars(row.line_number)),
-        })
+        Some((
+            Cursor {
+                line: row.line_number,
+                column: column.min(self.buffer.line_len_chars(row.line_number)),
+            },
+            None,
+        ))
     }
 
     fn scroll_visual_rows(&mut self, delta: isize) {
@@ -1296,11 +1595,7 @@ impl App {
     }
 
     fn keep_cursor_in_scrolled_viewport(&mut self, width: usize) {
-        let cursor_wrap = wrap_index_for_column(
-            &self.buffer.line(self.cursor.line),
-            self.cursor.column,
-            width,
-        );
+        let cursor_wrap = self.wrap_index_for_column(self.cursor.line, self.cursor.column, width);
         let preferred_column = self.current_visual_column(width);
 
         if visual_position_before(
@@ -1330,8 +1625,26 @@ impl App {
     }
 
     fn current_visual_column(&self, width: usize) -> usize {
-        let line_text = self.buffer.line(self.cursor.line);
-        let (segment_start, _) = visual_line_bounds(&line_text, self.cursor.column, width);
+        if let Some((_, column)) =
+            self.table_visual_position(self.cursor.line, self.cursor.column, width)
+        {
+            return column;
+        }
+
+        if let Some(surface) = self.active_surface_line()
+            && surface.has_virtual_chars()
+        {
+            let surface_column = self.active_surface_column(&surface);
+            let display_segments = surface.wrap_display_segments(width);
+            for (start, end) in display_segments {
+                if surface_column >= start && surface_column <= end {
+                    return surface_column.saturating_sub(start);
+                }
+            }
+        }
+
+        let (segment_start, _) =
+            self.visual_line_bounds(self.cursor.line, self.cursor.column, width);
         self.cursor.column.saturating_sub(segment_start)
     }
 
@@ -1356,9 +1669,13 @@ impl App {
         preferred_column: usize,
     ) -> Cursor {
         let line = line.min(self.buffer.line_count().saturating_sub(1));
-        let line_text = self.buffer.line(line);
-        let trimmed = line_text.trim_end_matches(['\r', '\n']);
-        let (segments, _) = wrap_line(trimmed, width);
+        if let Some(column) =
+            self.table_source_column_for_visual_position(line, wrap_index, preferred_column, width)
+        {
+            return Cursor { line, column };
+        }
+
+        let (segments, _) = self.line_wrap_segments(line, width);
         let segment_index = wrap_index.min(segments.len().saturating_sub(1));
         let Some(&(start, end)) = segments.get(segment_index) else {
             return Cursor { line, column: 0 };
@@ -1377,17 +1694,66 @@ impl App {
     }
 
     fn visual_line_start(&mut self) {
-        let line_text = self.buffer.line(self.cursor.line);
         let width = self.wrap_width();
-        let (seg_start, _) = visual_line_bounds(&line_text, self.cursor.column, width);
+        if let Some(column) = self.table_source_column_for_visual_position(
+            self.cursor.line,
+            self.wrap_index_for_column(self.cursor.line, self.cursor.column, width),
+            0,
+            width,
+        ) {
+            self.cursor.column = column;
+            return;
+        }
+
+        if let Some(surface) = self.active_surface_line()
+            && surface.has_virtual_chars()
+        {
+            let surface_column = self.active_surface_column(&surface);
+            for (start, end) in surface.wrap_display_segments(width) {
+                if surface_column >= start && surface_column <= end {
+                    self.cursor.column = surface
+                        .source_column_for_display_column(start)
+                        .min(self.buffer.line_len_chars(self.cursor.line));
+                    self.surface_cursor = Some((self.cursor.line, self.cursor.column, start));
+                    return;
+                }
+            }
+        }
+
+        let (seg_start, _) = self.visual_line_bounds(self.cursor.line, self.cursor.column, width);
         self.cursor.column = seg_start;
+        self.surface_cursor = None;
     }
 
     fn visual_line_end(&mut self) {
-        let line_text = self.buffer.line(self.cursor.line);
         let width = self.wrap_width();
-        let (_, seg_end) = visual_line_bounds(&line_text, self.cursor.column, width);
+        if let Some(column) = self.table_source_column_for_visual_end(
+            self.cursor.line,
+            self.wrap_index_for_column(self.cursor.line, self.cursor.column, width),
+            width,
+        ) {
+            self.cursor.column = column;
+            return;
+        }
+
+        if let Some(surface) = self.active_surface_line()
+            && surface.has_virtual_chars()
+        {
+            let surface_column = self.active_surface_column(&surface);
+            for (start, end) in surface.wrap_display_segments(width) {
+                if surface_column >= start && surface_column <= end {
+                    self.cursor.column = surface
+                        .source_column_for_display_column(end)
+                        .min(self.buffer.line_len_chars(self.cursor.line));
+                    self.surface_cursor = Some((self.cursor.line, self.cursor.column, end));
+                    return;
+                }
+            }
+        }
+
+        let (_, seg_end) = self.visual_line_bounds(self.cursor.line, self.cursor.column, width);
         self.cursor.column = seg_end.min(self.buffer.line_len_chars(self.cursor.line));
+        self.surface_cursor = None;
     }
 
     fn handle_navigation_modifier(&mut self, key: KeyEvent) -> bool {
@@ -1497,6 +1863,111 @@ impl App {
         self.preferred_visual_column = None;
     }
 
+    pub(crate) fn surface_cursor_column_for_line(&self, line: usize) -> Option<usize> {
+        let (cursor_line, source_column, column) = self.surface_cursor?;
+        if cursor_line != line || source_column != self.cursor.column {
+            return None;
+        }
+        Some(
+            column.min(
+                self.buffer
+                    .surface_line(
+                        line,
+                        SurfaceMode::Active {
+                            cursor_column: self.cursor.column,
+                        },
+                    )
+                    .display_len(),
+            ),
+        )
+    }
+
+    fn active_surface_line(&self) -> Option<SurfaceLine> {
+        if self.is_table_row(self.cursor.line)
+            || self.buffer.block_for_line(self.cursor.line).is_none()
+        {
+            return None;
+        }
+        Some(self.buffer.surface_line(
+            self.cursor.line,
+            SurfaceMode::Active {
+                cursor_column: self.cursor.column,
+            },
+        ))
+    }
+
+    fn active_surface_column(&self, surface: &SurfaceLine) -> usize {
+        self.surface_cursor_column_for_line(self.cursor.line)
+            .unwrap_or_else(|| surface.display_column_for_source_column(self.cursor.column))
+            .min(surface.display_len())
+    }
+
+    fn move_surface_cursor_horizontally(&mut self, delta: isize) -> bool {
+        let Some(surface) = self.active_surface_line() else {
+            return false;
+        };
+        if !surface.has_virtual_chars() {
+            return false;
+        }
+
+        let current = self.active_surface_column(&surface);
+        let target = if delta < 0 {
+            current.saturating_sub(1)
+        } else {
+            current.saturating_add(1).min(surface.display_len())
+        };
+        if target == current {
+            return false;
+        }
+
+        self.cursor.column = surface
+            .source_column_for_display_column(target)
+            .min(self.buffer.line_len_chars(self.cursor.line));
+        self.surface_cursor = Some((self.cursor.line, self.cursor.column, target));
+        true
+    }
+
+    fn edit_active_surface(&mut self, edit: SurfaceEdit) -> bool {
+        let Some(surface) = self.active_surface_line() else {
+            return false;
+        };
+        if !surface.has_virtual_chars() {
+            return false;
+        }
+
+        let mut surface_column = self.active_surface_column(&surface);
+        let mut chars = surface.text.chars().collect::<Vec<_>>();
+        match edit {
+            SurfaceEdit::Insert(ch) => {
+                chars.insert(surface_column, ch);
+                surface_column += 1;
+            }
+            SurfaceEdit::Backspace => {
+                if surface_column == 0 {
+                    return false;
+                }
+                surface_column -= 1;
+                chars.remove(surface_column);
+            }
+            SurfaceEdit::Delete => {
+                if surface_column >= chars.len() {
+                    return false;
+                }
+                chars.remove(surface_column);
+            }
+        }
+
+        let surface_text = chars.into_iter().collect::<String>();
+        let display_column = self.buffer.replace_line_from_surface(
+            self.cursor.line,
+            &surface_text,
+            surface_column,
+            &mut self.cursor,
+        );
+        self.surface_cursor = Some((self.cursor.line, self.cursor.column, display_column));
+        true
+    }
+
     fn move_to_line_preserving_column(&mut self, line: usize) {
         let column = self.preferred_column();
         self.cursor.line = line.min(self.buffer.line_count().saturating_sub(1));
@@ -1539,8 +2010,7 @@ impl App {
         width: usize,
     ) {
         let line = line.min(self.buffer.line_count().saturating_sub(1));
-        let line_text = self.buffer.line(line);
-        let (segments, _) = wrap_line(line_text.trim_end_matches(['\r', '\n']), width);
+        let (segments, _) = self.line_wrap_segments(line, width);
         let Some(&(start, end)) = segments.get(segment_index) else {
             self.cursor.line = line;
             self.cursor.column = self.buffer.line_len_chars(line);
@@ -1559,61 +2029,85 @@ impl App {
     }
 
     fn visual_line_down(&mut self) {
-        let line_text = self.buffer.line(self.cursor.line);
         let width = self.wrap_width();
-        let (segments, _) = wrap_line(line_text.trim_end_matches(['\r', '\n']), width);
-        let current_seg = wrap_index_for_column(&line_text, self.cursor.column, width);
-        let segment_start = segments
-            .get(current_seg)
-            .map(|(start, _)| *start)
-            .unwrap_or_default();
+        let (segments, _) = self.line_wrap_segments(self.cursor.line, width);
+        let current_seg = self.wrap_index_for_column(self.cursor.line, self.cursor.column, width);
+        let visual_column = self.current_visual_column(width);
+        let segment_start = if self.is_table_row(self.cursor.line) {
+            self.cursor.column.saturating_sub(visual_column)
+        } else {
+            segments
+                .get(current_seg)
+                .map(|(start, _)| *start)
+                .unwrap_or_default()
+        };
         let rel = self.preferred_visual_column(segment_start);
         if current_seg + 1 < segments.len() {
-            let (next_start, next_end) = segments[current_seg + 1];
-            let max_col = visual_segment_max_column(
-                &segments,
+            if let Some(column) = self.table_source_column_for_visual_position(
+                self.cursor.line,
                 current_seg + 1,
-                self.buffer.line_len_chars(self.cursor.line),
-                next_end,
-            );
-            self.cursor.column = if next_start + rel > max_col {
-                max_col
+                rel,
+                width,
+            ) {
+                self.cursor.column = column;
             } else {
-                next_start + rel
-            };
+                let (next_start, next_end) = segments[current_seg + 1];
+                let max_col = visual_segment_max_column(
+                    &segments,
+                    current_seg + 1,
+                    self.buffer.line_len_chars(self.cursor.line),
+                    next_end,
+                );
+                self.cursor.column = if next_start + rel > max_col {
+                    max_col
+                } else {
+                    next_start + rel
+                };
+            }
         } else if self.cursor.line + 1 < self.buffer.line_count() {
             self.move_to_visual_segment_preserving_column(self.cursor.line + 1, 0, width);
         }
     }
 
     fn visual_line_up(&mut self) {
-        let line_text = self.buffer.line(self.cursor.line);
         let width = self.wrap_width();
-        let (segments, _) = wrap_line(line_text.trim_end_matches(['\r', '\n']), width);
-        let current_seg = wrap_index_for_column(&line_text, self.cursor.column, width);
-        let segment_start = segments
-            .get(current_seg)
-            .map(|(start, _)| *start)
-            .unwrap_or_default();
+        let (segments, _) = self.line_wrap_segments(self.cursor.line, width);
+        let current_seg = self.wrap_index_for_column(self.cursor.line, self.cursor.column, width);
+        let visual_column = self.current_visual_column(width);
+        let segment_start = if self.is_table_row(self.cursor.line) {
+            self.cursor.column.saturating_sub(visual_column)
+        } else {
+            segments
+                .get(current_seg)
+                .map(|(start, _)| *start)
+                .unwrap_or_default()
+        };
         let rel = self.preferred_visual_column(segment_start);
         if current_seg > 0 {
-            let (prev_start, prev_end) = segments[current_seg - 1];
-            let max_col = visual_segment_max_column(
-                &segments,
+            if let Some(column) = self.table_source_column_for_visual_position(
+                self.cursor.line,
                 current_seg - 1,
-                self.buffer.line_len_chars(self.cursor.line),
-                prev_end,
-            );
-            self.cursor.column = if prev_start + rel > max_col {
-                max_col
+                rel,
+                width,
+            ) {
+                self.cursor.column = column;
             } else {
-                prev_start + rel
-            };
+                let (prev_start, prev_end) = segments[current_seg - 1];
+                let max_col = visual_segment_max_column(
+                    &segments,
+                    current_seg - 1,
+                    self.buffer.line_len_chars(self.cursor.line),
+                    prev_end,
+                );
+                self.cursor.column = if prev_start + rel > max_col {
+                    max_col
+                } else {
+                    prev_start + rel
+                };
+            }
         } else if self.cursor.line > 0 {
             let previous_line = self.cursor.line - 1;
-            let previous_text = self.buffer.line(previous_line);
-            let (previous_segments, _) =
-                wrap_line(previous_text.trim_end_matches(['\r', '\n']), width);
+            let (previous_segments, _) = self.line_wrap_segments(previous_line, width);
             self.move_to_visual_segment_preserving_column(
                 previous_line,
                 previous_segments.len().saturating_sub(1),
@@ -1657,16 +2151,29 @@ impl App {
 
     fn refresh_sheet_items(&mut self) {
         let input = self.command_line.trim().to_string();
-        let mut items = if matches!(self.sheet.prompt, CommandPrompt::Search) {
-            self.preview_search(&input);
-            search_sheet_items(&self.buffer, &input)
-        } else if let Some(search_query) = input.strip_prefix('/') {
-            let query = search_query.trim();
-            self.preview_search(query);
-            search_sheet_items(&self.buffer, query)
-        } else {
-            self.clear_search();
-            command_sheet_items(&input, &self.notes_dir, &self.file_tree)
+        let mut items = match self.sheet.prompt {
+            CommandPrompt::Search => {
+                self.preview_search(&input);
+                search_sheet_items(&self.buffer, &input)
+            }
+            CommandPrompt::File => {
+                self.clear_search();
+                file_sheet_items(&input, &self.notes_dir, &self.file_tree)
+            }
+            CommandPrompt::Palette => {
+                self.clear_search();
+                palette_sheet_items(&input)
+            }
+            CommandPrompt::Command => {
+                if let Some(search_query) = input.strip_prefix('/') {
+                    let query = search_query.trim();
+                    self.preview_search(query);
+                    search_sheet_items(&self.buffer, query)
+                } else {
+                    self.clear_search();
+                    command_sheet_items(&input, &self.notes_dir, &self.file_tree)
+                }
+            }
         };
 
         items.truncate(128);
@@ -1684,9 +2191,7 @@ impl App {
     }
 
     fn follow_link_under_cursor(&mut self) -> Result<()> {
-        let line = self.buffer.line(self.cursor.line);
-        let source = line.trim_end_matches(['\r', '\n']);
-        let Some(link) = link_at_column(source, self.cursor.column) else {
+        let Some(link) = self.buffer.link_at_cursor(self.cursor) else {
             self.set_status("No link under cursor");
             return Ok(());
         };
@@ -1736,11 +2241,7 @@ impl App {
         let width = self.wrap_width();
         self.normalize_viewport(width);
 
-        let cursor_wrap = wrap_index_for_column(
-            &self.buffer.line(self.cursor.line),
-            self.cursor.column,
-            width,
-        );
+        let cursor_wrap = self.wrap_index_for_column(self.cursor.line, self.cursor.column, width);
         if visual_position_before(
             self.cursor.line,
             cursor_wrap,
@@ -1749,6 +2250,17 @@ impl App {
         ) {
             self.viewport.top_line = self.cursor.line;
             self.viewport.top_wrap_index = cursor_wrap;
+            return;
+        }
+
+        if self.cursor.line > self.viewport.top_line
+            && self.cursor.line.saturating_sub(self.viewport.top_line)
+                >= self.viewport.visible_height
+        {
+            let (line, wrap_index) = self.visual_position_for_cursor_bottom(cursor_wrap, width);
+            self.viewport.top_line = line;
+            self.viewport.top_wrap_index = wrap_index;
+            self.normalize_viewport(width);
             return;
         }
 
@@ -1847,42 +2359,243 @@ impl App {
         (line, wrap)
     }
 
-    fn line_wrap_count(&self, line: usize, width: usize) -> usize {
-        let line_text = self.buffer.line(line);
-        let trimmed = line_text.trim_end_matches(['\r', '\n']);
-        let table_layout = TableLayout::new(&self.buffer);
-        let (segments, _) = if line == self.cursor.line {
-            wrap_line(trimmed, width)
-        } else if table_layout.is_table_row(line) {
-            table_layout.wrap_line(line, trimmed, width)
-        } else {
-            concealed_wrap_line(trimmed, width)
-        };
-        segments.len().max(1)
+    fn is_table_row(&self, line: usize) -> bool {
+        TableLayout::new(&self.buffer).is_table_row(line)
     }
 
-    fn toggle_checkbox(&mut self) -> bool {
-        let original_cursor = self.cursor;
-        let line = self.buffer.line(original_cursor.line);
-        let trimmed = line.trim_end_matches(['\r', '\n']);
-        let leading_ws_len = trimmed.len() - trimmed.trim_start().len();
-        let content = &trimmed[leading_ws_len..];
+    fn table_visual_position(
+        &self,
+        line: usize,
+        column: usize,
+        width: usize,
+    ) -> Option<(usize, usize)> {
+        let layout = TableLayout::new(&self.buffer);
+        if !layout.is_table_row(line) {
+            return None;
+        }
 
-        let col = leading_ws_len + 3;
+        let source = self.buffer.line(line);
+        let trimmed = source.trim_end_matches(['\r', '\n']);
+        let wrap_count = self.line_wrap_count(line, width);
+        let mut fallback = None;
+        for wrap_index in 0..wrap_count {
+            let Some(rendered) =
+                layout.render_row_segment(line, trimmed, width, self.theme, wrap_index)
+            else {
+                continue;
+            };
 
-        if content.starts_with("- [ ] ") || content.starts_with("- [x] ") {
-            let unchecked = content.starts_with("- [ ] ");
-            let start = self.buffer.char_index(Cursor {
-                line: original_cursor.line,
-                column: col,
-            });
-            let replacement = if unchecked { "x" } else { " " };
-            self.buffer
-                .replace_range(start, start + 1, replacement, &mut self.cursor);
-            self.cursor = original_cursor;
+            let first_source = rendered.source_map.iter().flatten().copied().min();
+            let last_source = rendered.source_map.iter().flatten().copied().max();
+            if let (Some(first), Some(last)) = (first_source, last_source) {
+                if column >= first && column <= last.saturating_add(1) {
+                    let visual_column = rendered
+                        .source_map
+                        .iter()
+                        .position(|source_index| source_index.is_some_and(|index| index >= column))
+                        .or_else(|| rendered.source_map.iter().rposition(Option::is_some))
+                        .unwrap_or_default();
+                    return Some((wrap_index, visual_column));
+                }
+
+                if fallback.is_none() && column < first {
+                    fallback = rendered
+                        .source_map
+                        .iter()
+                        .position(Option::is_some)
+                        .map(|visual_column| (wrap_index, visual_column));
+                }
+            }
+        }
+
+        fallback.or_else(|| {
+            (0..wrap_count).rev().find_map(|wrap_index| {
+                layout
+                    .render_row_segment(line, trimmed, width, self.theme, wrap_index)
+                    .and_then(|rendered| {
+                        rendered
+                            .source_map
+                            .iter()
+                            .rposition(Option::is_some)
+                            .map(|visual_column| (wrap_index, visual_column))
+                    })
+            })
+        })
+    }
+
+    fn table_source_column_for_visual_position(
+        &self,
+        line: usize,
+        wrap_index: usize,
+        visual_column: usize,
+        width: usize,
+    ) -> Option<usize> {
+        let layout = TableLayout::new(&self.buffer);
+        if !layout.is_table_row(line) {
+            return None;
+        }
+
+        let source = self.buffer.line(line);
+        let trimmed = source.trim_end_matches(['\r', '\n']);
+        let rendered = layout.render_row_segment(line, trimmed, width, self.theme, wrap_index)?;
+        rendered
+            .source_map
+            .get(visual_column)
+            .copied()
+            .flatten()
+            .or_else(|| {
+                rendered
+                    .source_map
+                    .iter()
+                    .skip(visual_column)
+                    .flatten()
+                    .copied()
+                    .next()
+            })
+            .or_else(|| {
+                rendered
+                    .source_map
+                    .iter()
+                    .take(visual_column.saturating_add(1))
+                    .rev()
+                    .flatten()
+                    .copied()
+                    .next()
+            })
+    }
+
+    fn table_source_column_for_visual_end(
+        &self,
+        line: usize,
+        wrap_index: usize,
+        width: usize,
+    ) -> Option<usize> {
+        let layout = TableLayout::new(&self.buffer);
+        if !layout.is_table_row(line) {
+            return None;
+        }
+
+        let source = self.buffer.line(line);
+        let trimmed = source.trim_end_matches(['\r', '\n']);
+        let rendered = layout.render_row_segment(line, trimmed, width, self.theme, wrap_index)?;
+        rendered.source_map.iter().flatten().copied().last()
+    }
+
+    fn move_table_cursor_horizontally(&mut self, delta: isize) -> bool {
+        if delta == 0 {
+            return false;
+        }
+
+        let width = self.wrap_width();
+        let Some((wrap_index, visual_column)) =
+            self.table_visual_position(self.cursor.line, self.cursor.column, width)
+        else {
+            return false;
+        };
+
+        let target_column = if delta > 0 {
+            visual_column.saturating_add(1)
+        } else {
+            visual_column.saturating_sub(1)
+        };
+        if let Some(column) = self.table_source_column_for_visual_position(
+            self.cursor.line,
+            wrap_index,
+            target_column,
+            width,
+        ) {
+            self.cursor.column = column;
             return true;
         }
 
+        false
+    }
+
+    fn line_wrap_count(&self, line: usize, width: usize) -> usize {
+        let (segments, _) = self.line_wrap_segments(line, width);
+        segments.len().max(1)
+    }
+
+    fn line_wrap_segments(&self, line: usize, width: usize) -> (Vec<(usize, usize)>, usize) {
+        let surface_column = self
+            .surface_cursor
+            .and_then(|(cursor_line, source, column)| {
+                (cursor_line == line && source == self.cursor.column).then_some(column)
+            });
+        let key = WrapCacheKey {
+            line,
+            width,
+            cursor_line: self.cursor.line,
+            cursor_column: self.cursor.column,
+            surface_column,
+        };
+        if let Some(value) = self.wrap_cache.borrow().get(key) {
+            return value;
+        }
+
+        let line_text = self.buffer.line(line);
+        let trimmed = line_text.trim_end_matches(['\r', '\n']);
+        let table_layout = TableLayout::new(&self.buffer);
+        let value = if table_layout.is_table_row(line) {
+            table_layout.wrap_line(line, trimmed, width)
+        } else {
+            let mode = if line == self.cursor.line {
+                SurfaceMode::Active {
+                    cursor_column: self.cursor.column,
+                }
+            } else {
+                SurfaceMode::Inactive
+            };
+            wrap_surface_or_facade_line(self.buffer.block_for_line(line), trimmed, width, mode)
+        };
+        self.wrap_cache.borrow_mut().insert(key, value.clone());
+        value
+    }
+
+    fn wrap_index_for_column(&self, line: usize, column: usize, width: usize) -> usize {
+        if let Some((wrap_index, _)) = self.table_visual_position(line, column, width) {
+            return wrap_index;
+        }
+
+        let (segments, _) = self.line_wrap_segments(line, width);
+        for (index, &(start, end)) in segments.iter().enumerate() {
+            if column >= start && column < end {
+                return index;
+            }
+        }
+        segments.len().saturating_sub(1)
+    }
+
+    fn visual_line_bounds(&self, line: usize, column: usize, width: usize) -> (usize, usize) {
+        if let Some((wrap_index, _)) = self.table_visual_position(line, column, width) {
+            let start = self
+                .table_source_column_for_visual_position(line, wrap_index, 0, width)
+                .unwrap_or_default();
+            let end = self
+                .table_source_column_for_visual_end(line, wrap_index, width)
+                .map(|column| column.saturating_add(1))
+                .unwrap_or(start);
+            return (start, end);
+        }
+
+        let (segments, _) = self.line_wrap_segments(line, width);
+        for &(start, end) in &segments {
+            if column >= start && column < end {
+                return (start, end);
+            }
+        }
+        segments.last().copied().unwrap_or((0, 0))
+    }
+
+    fn toggle_checkbox(&mut self) -> bool {
+        let mut cursor = self.cursor;
+        if self
+            .buffer
+            .toggle_checkbox_at_line(self.cursor.line, &mut cursor)
+        {
+            self.cursor = cursor;
+            return true;
+        }
         false
     }
 }
@@ -1918,17 +2631,30 @@ fn is_text_input_key(key: KeyEvent) -> bool {
         .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER)
 }
 
-fn is_command_sheet_shortcut(key: KeyEvent) -> bool {
+fn is_file_picker_shortcut(key: KeyEvent) -> bool {
+    is_primary_p_shortcut(key) && !key.modifiers.contains(KeyModifiers::SHIFT) && !is_upper_p(key)
+}
+
+fn is_command_palette_shortcut(key: KeyEvent) -> bool {
+    is_primary_p_shortcut(key) && (key.modifiers.contains(KeyModifiers::SHIFT) || is_upper_p(key))
+}
+
+fn is_primary_p_shortcut(key: KeyEvent) -> bool {
     matches!(key.code, KeyCode::Char('p') | KeyCode::Char('P'))
         && key
             .modifiers
             .intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER)
 }
 
+fn is_upper_p(key: KeyEvent) -> bool {
+    matches!(key.code, KeyCode::Char('P'))
+}
+
 #[derive(Debug, Clone, Copy)]
 struct CommandCandidate {
     replacement: &'static str,
     label: &'static str,
+    command_label: &'static str,
     detail: &'static str,
     aliases: &'static [&'static str],
     action: CommandCandidateAction,
@@ -1944,45 +2670,75 @@ enum CommandCandidateAction {
 const COMMAND_CANDIDATES: &[CommandCandidate] = &[
     CommandCandidate {
         replacement: "w",
-        label: "write",
+        label: "Save File",
+        command_label: ":w",
         detail: "Save current file",
         aliases: &["w", "write", "save"],
         action: CommandCandidateAction::Command("w"),
     },
     CommandCandidate {
         replacement: "q",
-        label: "quit",
+        label: "Quit",
+        command_label: ":q",
         detail: "Quit if there are no unsaved changes",
         aliases: &["q", "quit", "close"],
         action: CommandCandidateAction::Command("q"),
     },
     CommandCandidate {
         replacement: "q!",
-        label: "quit!",
+        label: "Force Quit",
+        command_label: ":q!",
         detail: "Quit and discard unsaved changes",
         aliases: &["q!", "quit!", "force quit"],
         action: CommandCandidateAction::Command("q!"),
     },
     CommandCandidate {
         replacement: "wq",
-        label: "write quit",
+        label: "Save And Quit",
+        command_label: ":wq",
         detail: "Save current file and quit",
         aliases: &["wq", "x", "write quit", "save quit"],
         action: CommandCandidateAction::Command("wq"),
     },
     CommandCandidate {
         replacement: "e ",
-        label: "edit",
+        label: "Open File",
+        command_label: ":edit",
         detail: "Open a file path",
         aliases: &["e", "edit", "open", "file"],
         action: CommandCandidateAction::Complete("e "),
     },
     CommandCandidate {
         replacement: "/",
-        label: "search",
+        label: "Find In Document",
+        command_label: "/",
         detail: "Find text in the current document",
         aliases: &["/", "search", "find"],
         action: CommandCandidateAction::BeginSearch,
+    },
+    CommandCandidate {
+        replacement: "table",
+        label: "Insert Table",
+        command_label: ":table",
+        detail: "Insert a 2x2 table",
+        aliases: &["table", "insert table", "grid"],
+        action: CommandCandidateAction::Command("table"),
+    },
+    CommandCandidate {
+        replacement: "row",
+        label: "Insert Table Row",
+        command_label: ":row",
+        detail: "Insert a row below the current table row",
+        aliases: &["row", "table row", "insert row"],
+        action: CommandCandidateAction::Command("row"),
+    },
+    CommandCandidate {
+        replacement: "column",
+        label: "Insert Table Column",
+        command_label: ":column",
+        detail: "Insert a column right of the current table cell",
+        aliases: &["column", "col", "table column", "insert column"],
+        action: CommandCandidateAction::Command("column"),
     },
 ];
 
@@ -1992,29 +2748,90 @@ fn command_sheet_items(
     file_tree: &FileTree,
 ) -> Vec<(usize, SheetItem)> {
     let mut items = Vec::new();
+    let is_editing_path = is_edit_command_input(input);
 
-    for candidate in COMMAND_CANDIDATES {
-        if let Some(score) = score_command_candidate(input, candidate) {
-            items.push((1_000 + score, command_sheet_item(candidate)));
+    if !is_editing_path {
+        for candidate in COMMAND_CANDIDATES {
+            if let Some(score) = score_command_candidate(input, candidate) {
+                items.push((score, command_sheet_item(candidate, false)));
+            }
         }
     }
 
     let file_query = file_query_for_command_input(input);
+    if is_editing_path {
+        for (score, mut item) in file_sheet_items(file_query, notes_dir, file_tree) {
+            item.replacement = edit_replacement(input, &item.replacement);
+            items.push((score, item));
+        }
+    }
+
+    items.sort_by(|left, right| {
+        left.0
+            .cmp(&right.0)
+            .then_with(|| left.1.label.cmp(&right.1.label))
+            .then_with(|| left.1.detail.cmp(&right.1.detail))
+    });
+    items
+}
+
+fn palette_sheet_items(input: &str) -> Vec<(usize, SheetItem)> {
+    let mut items = Vec::new();
+    for candidate in COMMAND_CANDIDATES {
+        if matches!(candidate.action, CommandCandidateAction::Complete(_)) {
+            continue;
+        }
+        if let Some(score) = score_command_candidate(input, candidate) {
+            items.push((score, command_sheet_item(candidate, true)));
+        }
+    }
+
+    items.sort_by(|left, right| {
+        left.0
+            .cmp(&right.0)
+            .then_with(|| left.1.label.cmp(&right.1.label))
+    });
+    items
+}
+
+fn file_sheet_items(
+    input: &str,
+    notes_dir: &Path,
+    file_tree: &FileTree,
+) -> Vec<(usize, SheetItem)> {
+    let mut items = Vec::new();
+    let query = input.trim();
+
     for entry in file_tree.entries.iter().filter(|entry| !entry.is_dir) {
-        if let Some(score) = score_file_entry(file_query, notes_dir, entry) {
+        if let Some(score) = score_file_entry(query, notes_dir, entry) {
             let relative = relative_path_label(notes_dir, &entry.path);
             items.push((
                 score,
                 SheetItem {
                     kind: SheetItemKind::File,
                     label: entry.display_name.clone(),
-                    detail: relative.clone(),
-                    replacement: if input.starts_with("e ") || input.starts_with("edit ") {
-                        format!("e {relative}")
-                    } else {
-                        relative
-                    },
+                    detail: file_detail(notes_dir, entry, &relative),
+                    replacement: relative,
                     action: SheetAction::File(entry.path.clone()),
+                },
+            ));
+        }
+    }
+
+    if let Some(path) = resolve_command_path_input(query, notes_dir) {
+        let already_listed = items
+            .iter()
+            .any(|(_, item)| item.action == SheetAction::File(path.clone()));
+        if !already_listed {
+            let relative = relative_path_label(notes_dir, &path);
+            items.push((
+                0,
+                SheetItem {
+                    kind: SheetItemKind::File,
+                    label: relative.clone(),
+                    detail: "Create new file".to_string(),
+                    replacement: relative,
+                    action: SheetAction::File(path),
                 },
             ));
         }
@@ -2029,7 +2846,7 @@ fn command_sheet_items(
     items
 }
 
-fn command_sheet_item(candidate: &CommandCandidate) -> SheetItem {
+fn command_sheet_item(candidate: &CommandCandidate, palette: bool) -> SheetItem {
     let action = match candidate.action {
         CommandCandidateAction::Command(command) => SheetAction::Command(command.to_string()),
         CommandCandidateAction::Complete(value) => SheetAction::Complete(value.to_string()),
@@ -2038,7 +2855,12 @@ fn command_sheet_item(candidate: &CommandCandidate) -> SheetItem {
 
     SheetItem {
         kind: SheetItemKind::Command,
-        label: candidate.label.to_string(),
+        label: if palette {
+            candidate.label
+        } else {
+            candidate.command_label
+        }
+        .to_string(),
         detail: candidate.detail.to_string(),
         replacement: candidate.replacement.to_string(),
         action,
@@ -2066,6 +2888,37 @@ fn file_query_for_command_input(input: &str) -> &str {
         }
     }
     input
+}
+
+fn is_edit_command_input(input: &str) -> bool {
+    let input = input.trim();
+    if input == "e" || input == "edit" {
+        return true;
+    }
+
+    input
+        .split_once(' ')
+        .is_some_and(|(command, _)| matches!(command, "e" | "edit"))
+}
+
+fn edit_replacement(input: &str, path: &str) -> String {
+    let command = input
+        .trim()
+        .split_once(' ')
+        .map(|(command, _)| command)
+        .filter(|command| matches!(*command, "e" | "edit"))
+        .unwrap_or("e");
+    format!("{command} {path}")
+}
+
+fn file_detail(notes_dir: &Path, entry: &crate::fs::tree::TreeEntry, relative: &str) -> String {
+    entry
+        .path
+        .parent()
+        .and_then(|parent| parent.strip_prefix(notes_dir).ok())
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .map(|parent| parent.display().to_string())
+        .unwrap_or_else(|| relative.to_string())
 }
 
 fn resolve_command_path_input(input: &str, notes_dir: &Path) -> Option<PathBuf> {
@@ -2500,7 +3353,7 @@ fn list_continuation_after_enter(line: &str, column: usize) -> ListContinuation 
     }
 
     let prefix = match item.kind {
-        ListItemKind::Checkbox => format!("{leading_ws}- [ ] "),
+        ListItemKind::Checkbox => format!("{leading_ws}[ ] "),
         ListItemKind::Bullet(marker) => format!("{leading_ws}{marker} "),
         ListItemKind::Numbered(number) => format!("{leading_ws}{}. ", number + 1),
     };
@@ -2523,6 +3376,22 @@ struct ListItem<'a> {
 
 fn parse_list_item(content: &str) -> Option<ListItem<'_>> {
     if let Some(rest) = content
+        .strip_prefix("[ ]")
+        .or_else(|| content.strip_prefix("[x]"))
+    {
+        if let Some(item_content) = rest
+            .strip_prefix(' ')
+            .or_else(|| rest.is_empty().then_some(""))
+        {
+            return Some(ListItem {
+                kind: ListItemKind::Checkbox,
+                marker_len: content.chars().count() - item_content.chars().count(),
+                content: item_content,
+            });
+        }
+    }
+
+    if let Some(rest) = content
         .strip_prefix("- [ ]")
         .or_else(|| content.strip_prefix("- [x]"))
     {
@@ -2532,7 +3401,7 @@ fn parse_list_item(content: &str) -> Option<ListItem<'_>> {
         {
             return Some(ListItem {
                 kind: ListItemKind::Checkbox,
-                marker_len: content.len() - item_content.len(),
+                marker_len: content.chars().count() - item_content.chars().count(),
                 content: item_content,
             });
         }
@@ -2541,17 +3410,17 @@ fn parse_list_item(content: &str) -> Option<ListItem<'_>> {
     if let Some((number, item_content)) = parse_numbered_list(content) {
         return Some(ListItem {
             kind: ListItemKind::Numbered(number.parse().unwrap_or(1)),
-            marker_len: content.len() - item_content.len(),
+            marker_len: content.chars().count() - item_content.chars().count(),
             content: item_content,
         });
     }
 
-    for marker in ['-', '*', '+'] {
+    for marker in ['•', '◦', '-', '*', '+'] {
         let prefix = [marker, ' '].iter().collect::<String>();
         if let Some(item_content) = content.strip_prefix(&prefix) {
             return Some(ListItem {
                 kind: ListItemKind::Bullet(marker),
-                marker_len: prefix.len(),
+                marker_len: prefix.chars().count(),
                 content: item_content,
             });
         }
@@ -2689,11 +3558,15 @@ mod tests {
             visual_line_anchor: None,
             preferred_column: None,
             preferred_visual_column: None,
+            surface_cursor: None,
             pending_g: false,
             pending_delete: false,
             pending_change: false,
+            pending_register_prefix: false,
+            pending_register: None,
             mouse_anchor: None,
             last_copied_selection: None,
+            wrap_cache: RefCell::new(WrapCache::default()),
         }
     }
 
@@ -2789,6 +3662,44 @@ mod tests {
 
         assert!(app.should_quit);
         assert_eq!(app.mode, Mode::Normal);
+    }
+
+    #[test]
+    fn visual_mode_y_copies_selected_lines() {
+        let mut app = test_app("# Heading\n- [ ] todo");
+        app.resize_viewport(5, 40);
+
+        press(&mut app, KeyCode::Char('V'));
+        press(&mut app, KeyCode::Char('j'));
+        press(&mut app, KeyCode::Char('y'));
+
+        assert_eq!(
+            app.last_copied_selection.as_deref(),
+            Some("# Heading\n- [ ] todo")
+        );
+        assert_eq!(app.status_message, "Copied selection");
+        assert_eq!(app.mode, Mode::Normal);
+        assert_eq!(app.visual_line_anchor, None);
+    }
+
+    #[test]
+    fn visual_mode_clipboard_register_y_copies_selected_lines() {
+        let mut app = test_app("# Heading\n- [ ] todo");
+        app.resize_viewport(5, 40);
+
+        press(&mut app, KeyCode::Char('V'));
+        press(&mut app, KeyCode::Char('j'));
+        press(&mut app, KeyCode::Char('"'));
+        press(&mut app, KeyCode::Char('+'));
+        press(&mut app, KeyCode::Char('y'));
+
+        assert_eq!(
+            app.last_copied_selection.as_deref(),
+            Some("# Heading\n- [ ] todo")
+        );
+        assert_eq!(app.status_message, "Copied selection");
+        assert_eq!(app.mode, Mode::Normal);
+        assert_eq!(app.visual_line_anchor, None);
     }
 
     #[test]
@@ -2922,7 +3833,7 @@ mod tests {
     }
 
     #[test]
-    fn mouse_drag_selects_text_and_copies_immediately() {
+    fn mouse_drag_selects_text_and_copies_on_release() {
         let mut app = test_app("bravo");
         app.resize_viewport(5, 20);
 
@@ -2931,6 +3842,10 @@ mod tests {
 
         assert_eq!(app.cursor, Cursor { line: 0, column: 4 });
         assert_eq!(app.selected_text().as_deref(), Some("rav"));
+        assert_eq!(app.last_copied_selection, None);
+
+        release(&mut app, 6, 0);
+
         assert_eq!(app.status_message, "Copied selection");
         assert_eq!(app.last_copied_selection.as_deref(), Some("rav"));
     }
@@ -2957,6 +3872,22 @@ mod tests {
 
         assert_eq!(app.selected_text().as_deref(), Some("rav"));
         assert_eq!(app.mouse_anchor, None);
+    }
+
+    #[test]
+    fn starting_new_mouse_selection_clears_previous_copy_state() {
+        let mut app = test_app("bravo");
+        app.resize_viewport(5, 20);
+
+        click(&mut app, 3, 0);
+        drag(&mut app, 6, 0);
+        release(&mut app, 6, 0);
+        assert_eq!(app.last_copied_selection.as_deref(), Some("rav"));
+
+        click(&mut app, 1, 0);
+
+        assert_eq!(app.text_selection, None);
+        assert_eq!(app.last_copied_selection, None);
     }
 
     #[test]
@@ -3195,16 +4126,15 @@ mod tests {
     }
 
     #[test]
-    fn primary_p_opens_command_sheet_and_esc_closes_it() {
+    fn primary_p_opens_file_picker_and_esc_closes_it() {
         let mut app = test_app("text");
         app.status_message = "ready".to_string();
 
         press_modified(&mut app, KeyCode::Char('p'), KeyModifiers::SUPER);
 
         assert_eq!(app.mode, Mode::CommandLine);
-        assert_eq!(app.sheet.prompt, CommandPrompt::Command);
+        assert_eq!(app.sheet.prompt, CommandPrompt::File);
         assert_eq!(app.command_line, "");
-        assert!(!app.sheet.items.is_empty());
 
         press(&mut app, KeyCode::Esc);
 
@@ -3214,7 +4144,27 @@ mod tests {
     }
 
     #[test]
-    fn command_sheet_filters_matches_and_opens_selected_file() {
+    fn shifted_primary_p_opens_command_palette() {
+        let mut app = test_app("text");
+
+        press_modified(
+            &mut app,
+            KeyCode::Char('P'),
+            KeyModifiers::SUPER | KeyModifiers::SHIFT,
+        );
+
+        assert_eq!(app.mode, Mode::CommandLine);
+        assert_eq!(app.sheet.prompt, CommandPrompt::Palette);
+        assert!(
+            app.sheet
+                .items
+                .iter()
+                .any(|item| item.label == "Insert Table")
+        );
+    }
+
+    #[test]
+    fn file_picker_filters_matches_and_opens_selected_file() {
         let mut app = test_app("text");
         app.notes_dir = PathBuf::from("/notes");
         app.file_tree.entries = vec![
@@ -3243,7 +4193,7 @@ mod tests {
     }
 
     #[test]
-    fn command_sheet_lists_files_before_commands() {
+    fn command_line_lists_files_only_after_edit_command() {
         let mut app = test_app("text");
         app.notes_dir = PathBuf::from("/notes");
         app.file_tree.entries = vec![TreeEntry {
@@ -3253,6 +4203,16 @@ mod tests {
         }];
 
         press(&mut app, KeyCode::Char(':'));
+
+        assert!(
+            app.sheet
+                .items
+                .iter()
+                .all(|item| item.kind == SheetItemKind::Command)
+        );
+
+        press(&mut app, KeyCode::Char('e'));
+        press(&mut app, KeyCode::Char(' '));
 
         assert_eq!(app.sheet.items[0].kind, SheetItemKind::File);
         assert_eq!(app.sheet.items[0].label, "CHANGELOG.md");
@@ -3312,7 +4272,7 @@ mod tests {
     }
 
     #[test]
-    fn command_sheet_can_complete_selected_files_into_the_input() {
+    fn command_line_can_complete_selected_files_after_edit_command() {
         let mut app = test_app("text");
         app.notes_dir = PathBuf::from("/notes");
         app.file_tree.entries = vec![TreeEntry {
@@ -3322,12 +4282,14 @@ mod tests {
         }];
 
         press(&mut app, KeyCode::Char(':'));
+        press(&mut app, KeyCode::Char('e'));
+        press(&mut app, KeyCode::Char(' '));
         for ch in "gla".chars() {
             press(&mut app, KeyCode::Char(ch));
         }
         press(&mut app, KeyCode::Right);
 
-        assert_eq!(app.command_line, "projects/glass.md");
+        assert_eq!(app.command_line, "e projects/glass.md");
     }
 
     #[test]
@@ -3449,6 +4411,154 @@ mod tests {
     }
 
     #[test]
+    fn active_line_uses_facade_wrapping() {
+        let mut app = test_app("visit https://github.com/pacificcodeinc/glass/issues/123.");
+        app.cursor = Cursor { line: 0, column: 0 };
+
+        let raw_wraps = crate::editor::render::wrap_line(&app.buffer.line(0), 20)
+            .0
+            .len();
+        let facade_wraps = crate::markdown::highlight::concealed_wrap_line(&app.buffer.line(0), 20)
+            .0
+            .len();
+
+        assert!(facade_wraps < raw_wraps);
+        assert_eq!(app.line_wrap_count(0, 20), facade_wraps);
+    }
+
+    #[test]
+    fn hjkl_moves_through_rendered_table_rows() {
+        let mut app =
+            test_app("| Name | Notes |\n| --- | --- |\n| Ada | one two three four five six |");
+        app.resize_viewport(10, 28);
+        app.cursor = Cursor { line: 2, column: 8 };
+
+        let width = app.wrap_width();
+        let start = app.table_visual_position(app.cursor.line, app.cursor.column, width);
+        assert_eq!(start, Some((0, 9)));
+
+        press(&mut app, KeyCode::Char('l'));
+        assert_eq!(
+            app.table_visual_position(app.cursor.line, app.cursor.column, width),
+            Some((0, 10))
+        );
+
+        press(&mut app, KeyCode::Char('j'));
+        assert_eq!(app.cursor.line, 2);
+        assert_eq!(
+            app.table_visual_position(app.cursor.line, app.cursor.column, width),
+            Some((1, 10))
+        );
+
+        press(&mut app, KeyCode::Char('k'));
+        assert_eq!(
+            app.table_visual_position(app.cursor.line, app.cursor.column, width),
+            Some((0, 10))
+        );
+
+        press(&mut app, KeyCode::Char('h'));
+        assert_eq!(
+            app.table_visual_position(app.cursor.line, app.cursor.column, width),
+            Some((0, 9))
+        );
+    }
+
+    #[test]
+    fn insert_mode_types_into_empty_table_cell() {
+        let mut app = test_app("| A | B |\n| --- | --- |\n|   | y |");
+        app.mode = Mode::Insert;
+        app.cursor = Cursor { line: 2, column: 6 };
+
+        press(&mut app, KeyCode::Char('x'));
+
+        assert_eq!(
+            app.buffer.markdown_string(),
+            "| A   | B   |\n| --- | --- |\n| x   | y   |"
+        );
+        assert_eq!(app.cursor, Cursor { line: 2, column: 3 });
+    }
+
+    #[test]
+    fn cleared_table_cell_stays_editable() {
+        let mut app = test_app("| A | B |\n| --- | --- |\n| x | y |");
+        app.mode = Mode::Insert;
+        app.cursor = Cursor { line: 2, column: 3 };
+
+        press(&mut app, KeyCode::Backspace);
+        assert_eq!(
+            app.buffer.markdown_string(),
+            "| A   | B   |\n| --- | --- |\n|     | y   |"
+        );
+        assert_eq!(app.cursor, Cursor { line: 2, column: 6 });
+
+        press(&mut app, KeyCode::Char('z'));
+
+        assert_eq!(
+            app.buffer.markdown_string(),
+            "| A   | B   |\n| --- | --- |\n| z   | y   |"
+        );
+        assert_eq!(app.cursor, Cursor { line: 2, column: 3 });
+    }
+
+    #[test]
+    fn typing_at_table_row_edge_updates_nearest_cell() {
+        let mut app = test_app("| A | B |\n| --- | --- |\n| x | y |");
+        app.mode = Mode::Insert;
+        app.cursor = Cursor {
+            line: 2,
+            column: app.buffer.line_len_chars(2),
+        };
+
+        press(&mut app, KeyCode::Char('z'));
+
+        assert_eq!(
+            app.buffer.markdown_string(),
+            "| A   | B   |\n| --- | --- |\n| x   | yz  |"
+        );
+        assert!(!app.buffer.line(2).ends_with("|z"));
+    }
+
+    #[test]
+    fn typing_pipe_inside_table_cell_escapes_it() {
+        let mut app = test_app("| A | B |\n| --- | --- |\n| x | y |");
+        app.mode = Mode::Insert;
+        app.cursor = Cursor { line: 2, column: 3 };
+
+        press(&mut app, KeyCode::Char('|'));
+
+        assert_eq!(
+            app.buffer.markdown_string(),
+            "| A   | B   |\n| --- | --- |\n| x\\| | y   |"
+        );
+        assert_eq!(app.buffer.line_count(), 3);
+    }
+
+    #[test]
+    fn typing_on_table_delimiter_does_not_edit_raw_source() {
+        let mut app = test_app("| A | B |\n| --- | --- |\n| x | y |");
+        let original = app.buffer.markdown_string();
+        app.mode = Mode::Insert;
+        app.cursor = Cursor { line: 1, column: 2 };
+
+        press(&mut app, KeyCode::Char('z'));
+        press(&mut app, KeyCode::Backspace);
+        press(&mut app, KeyCode::Delete);
+
+        assert_eq!(app.buffer.markdown_string(), original);
+        assert_eq!(app.buffer.line_count(), 3);
+    }
+
+    #[test]
+    fn empty_table_cells_have_visual_cursor_targets() {
+        let mut app = test_app("| A | B |\n| --- | --- |\n|   |   |");
+        app.resize_viewport(5, 40);
+        let width = app.wrap_width();
+
+        assert!(app.table_visual_position(2, 6, width).is_some());
+        assert!(app.table_visual_position(2, 12, width).is_some());
+    }
+
+    #[test]
     fn normal_mode_u_undoes_last_insert() {
         let mut app = test_app("");
         app.mode = Mode::Insert;
@@ -3468,10 +4578,39 @@ mod tests {
         app.cursor = Cursor { line: 0, column: 0 };
 
         press(&mut app, KeyCode::Enter);
-        assert_eq!(app.buffer.as_string(), "- [x] todo");
+        assert_eq!(app.buffer.as_string(), "[x] todo");
+        assert_eq!(app.buffer.markdown_string(), "- [x] todo");
 
         press(&mut app, KeyCode::Char('u'));
-        assert_eq!(app.buffer.as_string(), "- [ ] todo");
+        assert_eq!(app.buffer.as_string(), "[ ] todo");
+        assert_eq!(app.buffer.markdown_string(), "- [ ] todo");
+    }
+
+    #[test]
+    fn normal_mode_can_edit_revealed_heading_marker() {
+        let mut app = test_app("## Heading");
+
+        press(&mut app, KeyCode::Left);
+        press(&mut app, KeyCode::Left);
+        press(&mut app, KeyCode::Delete);
+
+        assert_eq!(app.buffer.as_string(), "Heading");
+        assert_eq!(app.buffer.markdown_string(), "# Heading");
+        assert_eq!(app.cursor, Cursor { line: 0, column: 0 });
+    }
+
+    #[test]
+    fn insert_mode_can_edit_revealed_link_target() {
+        let mut app = test_app("[README](README.md)");
+        app.mode = Mode::Insert;
+
+        for _ in 0..8 {
+            press(&mut app, KeyCode::Right);
+        }
+        press(&mut app, KeyCode::Char('X'));
+
+        assert_eq!(app.buffer.as_string(), "README");
+        assert_eq!(app.buffer.markdown_string(), "[README](XREADME.md)");
     }
 
     #[test]
@@ -3538,11 +4677,11 @@ mod tests {
     fn enter_continues_checkbox_items_at_end_and_middle() {
         assert_eq!(
             list_continuation_after_enter("- [ ] todo", 10),
-            ListContinuation::Continue("- [ ] ".to_string())
+            ListContinuation::Continue("[ ] ".to_string())
         );
         assert_eq!(
             list_continuation_after_enter("- [x] todo", 6),
-            ListContinuation::Continue("- [ ] ".to_string())
+            ListContinuation::Continue("[ ] ".to_string())
         );
     }
 
@@ -3569,13 +4708,15 @@ mod tests {
         buffer.insert_str(&mut cursor, "- [ ] todo");
 
         insert_newline_with_list_continuation(&mut buffer, &mut cursor);
-        assert_eq!(buffer.as_string(), "- [ ] todo\n- [ ] ");
-        assert_eq!(cursor, Cursor { line: 1, column: 6 });
+        assert_eq!(buffer.as_string(), "[ ] todo\n[ ] ");
+        assert_eq!(buffer.markdown_string(), "- [ ] todo\n- [ ] ");
+        assert_eq!(cursor, Cursor { line: 1, column: 4 });
 
         insert_newline_with_list_continuation(&mut buffer, &mut cursor);
         buffer.clamp_cursor(&mut cursor);
 
-        assert_eq!(buffer.as_string(), "- [ ] todo\n\n");
+        assert_eq!(buffer.as_string(), "[ ] todo\n\n");
+        assert_eq!(buffer.markdown_string(), "- [ ] todo\n\n");
         assert_eq!(cursor, Cursor { line: 1, column: 0 });
     }
 
@@ -3588,8 +4729,90 @@ mod tests {
 
         insert_newline_with_list_continuation(&mut buffer, &mut cursor);
 
-        assert_eq!(buffer.as_string(), "- [ ] todo\n\nafter");
+        assert_eq!(buffer.as_string(), "[ ] todo\n\nafter");
+        assert_eq!(buffer.markdown_string(), "- [ ] todo\n\nafter");
         assert_eq!(cursor, Cursor { line: 1, column: 0 });
+    }
+
+    #[test]
+    fn enter_exits_empty_rendered_bullet_item() {
+        assert_eq!(
+            list_continuation_after_enter("• ", 2),
+            ListContinuation::EndList {
+                delete_to_column: 2
+            }
+        );
+    }
+
+    #[test]
+    fn double_enter_exits_bullet_list_at_document_end() {
+        let mut app = test_app("- todo");
+        app.mode = Mode::Insert;
+        app.cursor = Cursor { line: 0, column: 6 };
+
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.buffer.as_string(), "• todo\n• ");
+        assert_eq!(app.cursor, Cursor { line: 1, column: 2 });
+
+        press(&mut app, KeyCode::Enter);
+
+        assert_eq!(app.buffer.as_string(), "• todo\n\n");
+        assert_eq!(app.buffer.markdown_string(), "- todo\n\n");
+        assert_eq!(app.cursor, Cursor { line: 1, column: 0 });
+    }
+
+    #[test]
+    fn backspace_at_empty_checklist_marker_clears_line() {
+        let mut app = test_app("- [ ] ");
+        app.mode = Mode::Insert;
+        app.cursor = Cursor { line: 0, column: 4 };
+
+        press(&mut app, KeyCode::Backspace);
+
+        assert_eq!(app.buffer.as_string(), "");
+        assert_eq!(app.buffer.markdown_string(), "");
+        assert_eq!(app.cursor, Cursor { line: 0, column: 0 });
+    }
+
+    #[test]
+    fn backspacing_through_checklist_content_clears_marker_without_artifacts() {
+        let mut app = test_app("- [ ] my");
+        app.mode = Mode::Insert;
+        app.cursor = Cursor { line: 0, column: 6 };
+
+        press(&mut app, KeyCode::Backspace);
+        press(&mut app, KeyCode::Backspace);
+        press(&mut app, KeyCode::Backspace);
+
+        assert_eq!(app.buffer.as_string(), "");
+        assert_eq!(app.buffer.markdown_string(), "");
+        assert_eq!(app.cursor, Cursor { line: 0, column: 0 });
+    }
+
+    #[test]
+    fn backspace_at_checklist_content_start_converts_to_paragraph() {
+        let mut app = test_app("- [ ] my name");
+        app.mode = Mode::Insert;
+        app.cursor = Cursor { line: 0, column: 4 };
+
+        press(&mut app, KeyCode::Backspace);
+
+        assert_eq!(app.buffer.as_string(), "my name");
+        assert_eq!(app.buffer.markdown_string(), "my name");
+        assert_eq!(app.cursor, Cursor { line: 0, column: 0 });
+    }
+
+    #[test]
+    fn delete_at_checklist_content_start_deletes_content_not_marker() {
+        let mut app = test_app("- [ ] my");
+        app.mode = Mode::Insert;
+        app.cursor = Cursor { line: 0, column: 4 };
+
+        press(&mut app, KeyCode::Delete);
+
+        assert_eq!(app.buffer.as_string(), "[ ] y");
+        assert_eq!(app.buffer.markdown_string(), "- [ ] y");
+        assert_eq!(app.cursor, Cursor { line: 0, column: 4 });
     }
 
     #[test]

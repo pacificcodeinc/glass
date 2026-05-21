@@ -22,6 +22,7 @@ impl Default for TableAlignment {
 pub struct TableCell {
     pub text: String,
     pub source_indices: Vec<usize>,
+    pub insertion_index: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -137,6 +138,7 @@ impl TableLayout {
         let empty_cell = TableCell {
             text: String::new(),
             source_indices: Vec::new(),
+            insertion_index: source.chars().count(),
         };
         let row_height = (0..block.column_count())
             .map(|column| {
@@ -175,6 +177,7 @@ impl TableLayout {
         let empty_cell = TableCell {
             text: String::new(),
             source_indices: Vec::new(),
+            insertion_index: source.chars().count(),
         };
         let wrapped_cells = (0..block.column_count())
             .map(|column| {
@@ -480,6 +483,7 @@ fn parse_cell(chars: &[char], mut start: usize, mut end: usize) -> TableCell {
     TableCell {
         text,
         source_indices,
+        insertion_index: start,
     }
 }
 
@@ -497,6 +501,10 @@ fn is_escaped(chars: &[char], index: usize) -> bool {
 }
 
 fn wrap_cell(cell: &TableCell, width: usize, alignment: TableAlignment) -> Vec<FittedCell> {
+    if cell.text.is_empty() {
+        return vec![empty_fitted_cell(width.max(1), cell.insertion_index)];
+    }
+
     cell_wrap_segments(cell, width.max(1))
         .into_iter()
         .map(|(start, end)| {
@@ -587,6 +595,17 @@ fn blank_cell(width: usize) -> FittedCell {
     FittedCell {
         text: " ".repeat(width),
         source_map: std::iter::repeat_n(None, width).collect(),
+    }
+}
+
+fn empty_fitted_cell(width: usize, insertion_index: usize) -> FittedCell {
+    let mut source_map = std::iter::repeat_n(None, width).collect::<Vec<_>>();
+    if let Some(first) = source_map.first_mut() {
+        *first = Some(insertion_index);
+    }
+    FittedCell {
+        text: " ".repeat(width),
+        source_map,
     }
 }
 

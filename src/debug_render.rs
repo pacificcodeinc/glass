@@ -8,12 +8,7 @@ use ratatui::{
     style::{Color, Modifier},
 };
 
-use crate::{
-    app::App,
-    editor::render::{visible_rows, wrap_line},
-    markdown::{highlight::concealed_wrap_line, table::TableLayout},
-    ui,
-};
+use crate::{app::App, editor::render::visible_rows, markdown::table::TableLayout, ui};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct CellStyle {
@@ -65,13 +60,14 @@ fn full_render_height(app: &App, width: u16) -> u16 {
         usize::MAX,
         text_width,
         |line_num, text, w| {
-            if line_num == app.cursor.line {
-                wrap_line(text, w)
-            } else if table_layout.is_table_row(line_num) {
-                table_layout.wrap_line(line_num, text, w)
-            } else {
-                concealed_wrap_line(text, w)
-            }
+            ui::editor::surface_wrap_line(
+                &app.buffer,
+                &table_layout,
+                Some((app.cursor.line, app.cursor.column)),
+                line_num,
+                text,
+                w,
+            )
         },
     );
     rows.len().saturating_add(1).min(u16::MAX as usize) as u16

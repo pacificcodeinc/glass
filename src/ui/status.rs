@@ -72,6 +72,8 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App, theme: Theme) {
 fn command_prompt(app: &App) -> (&'static str, u16) {
     match app.sheet.prompt {
         CommandPrompt::Command => (":", 1),
+        CommandPrompt::File => ("Open ", 5),
+        CommandPrompt::Palette => ("> ", 2),
         CommandPrompt::Search => ("/", 1),
     }
 }
