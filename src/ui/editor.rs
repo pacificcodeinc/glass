@@ -1,7 +1,7 @@
 use ratatui::{
     Frame,
     layout::{Position, Rect},
-    style::Style,
+    style::{Modifier, Style},
     text::{Line, Span, Text},
     widgets::Paragraph,
 };
@@ -10,9 +10,11 @@ use crate::{
     app::{App, Mode, SearchMatch, TextSelection},
     config::theme::Theme,
     document::Block,
-    editor::render::{detect_list_marker, visible_rows},
+    editor::render::visible_rows,
     markdown::{
-        highlight::{concealed_wrap_line, render_markdown_segment_with_completion},
+        highlight::{
+            concealed_wrap_line, concealed_wrap_segments, render_markdown_segment_with_completion,
+        },
         table::TableLayout,
     },
 };
@@ -51,13 +53,7 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App, theme: Theme) {
         app.viewport.top_wrap_index,
         page.height as usize,
         text_width,
-        |line_num, text, w| {
-            if table_layout.is_table_row(line_num) {
-                table_layout.wrap_line(line_num, text, w)
-            } else {
-                concealed_wrap_line(text, w)
-            }
-        },
+        |line_num, text, w| facade_wrap_line(&table_layout, line_num, text, w),
     );
     let visual_range = app.visual_line_anchor.map(|anchor| {
         let start = anchor.min(app.cursor.line);
@@ -193,7 +189,7 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App, theme: Theme) {
 
     if app.mode != Mode::CommandLine {
         let cursor_indent = if wrap_index_of_cursor > 0 {
-            detect_list_marker(&cursor_line_text)
+            facade_list_marker_len(&cursor_line_text)
         } else {
             0
         };
@@ -207,7 +203,7 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App, theme: Theme) {
     }
 }
 
-fn facade_wrap_line(
+pub(crate) fn facade_wrap_line(
     table_layout: &TableLayout,
     line_number: usize,
     text: &str,
@@ -217,8 +213,35 @@ fn facade_wrap_line(
     if table_layout.is_table_row(line_number) {
         table_layout.wrap_line(line_number, trimmed, width)
     } else {
-        concealed_wrap_line(trimmed, width)
+        wrap_facade_text_line(trimmed, width)
     }
+}
+
+fn wrap_facade_text_line(text: &str, width: usize) -> (Vec<(usize, usize)>, usize) {
+    let marker_len = facade_list_marker_len(text);
+    let width = width.max(1);
+    if marker_len == 0 || marker_len >= width {
+        return concealed_wrap_line(text, width);
+    }
+
+    let source_len = text.chars().count();
+    let content = char_slice(text, marker_len, source_len);
+    if content.is_empty() {
+        return (vec![(0, source_len)], marker_len);
+    }
+
+    let content_width = width - marker_len;
+    let content_segments = concealed_wrap_segments(&content, content_width);
+    let mut segments = Vec::new();
+    for (index, (start, end)) in content_segments.into_iter().enumerate() {
+        if index == 0 {
+            segments.push((0, marker_len + end));
+        } else {
+            segments.push((marker_len + start, marker_len + end));
+        }
+    }
+
+    (segments, marker_len)
 }
 
 fn wrap_index_for_segments(segments: &[(usize, usize)], column: usize) -> usize {
@@ -254,30 +277,72 @@ fn render_document_segment(
     let text = char_slice(source, segment_start, segment_end);
     match block {
         Block::Heading { .. } => Line::from(Span::styled(text, theme.heading)),
-        Block::Quote { .. } => Line::from(Span::styled(text, theme.quote)),
+        Block::Quote { .. } => render_markdown_segment_with_completion(
+            source,
+            segment_start,
+            segment_end,
+            theme,
+            false,
+            0,
+            false,
+        ),
         Block::CodeFence { .. } => Line::from(Span::styled(text, theme.inline_code)),
         Block::RawMarkdown(_) => Line::from(Span::styled(text, theme.muted)),
         Block::ListItem { .. } | Block::ChecklistItem { .. } => {
             let marker_len = facade_list_marker_len(source);
+            let completed = matches!(block, Block::ChecklistItem { checked: true, .. });
             if marker_len <= segment_start {
-                return Line::from(Span::styled(text, Style::default().fg(theme.text)));
+                return render_markdown_segment_with_completion(
+                    source,
+                    segment_start,
+                    segment_end,
+                    theme,
+                    false,
+                    0,
+                    completed,
+                );
             }
             if marker_len >= segment_end {
-                return Line::from(Span::styled(text, theme.list_marker));
+                let marker_style = if completed {
+                    theme.list_marker.add_modifier(Modifier::BOLD)
+                } else {
+                    theme.list_marker
+                };
+                return Line::from(Span::styled(text, marker_style));
             }
 
-            Line::from(vec![
-                Span::styled(
-                    char_slice(source, segment_start, marker_len),
-                    theme.list_marker,
-                ),
-                Span::styled(
-                    char_slice(source, marker_len, segment_end),
-                    Style::default().fg(theme.text),
-                ),
-            ])
+            let marker_style = if completed {
+                theme.list_marker.add_modifier(Modifier::BOLD)
+            } else {
+                theme.list_marker
+            };
+            let mut spans = vec![Span::styled(
+                char_slice(source, segment_start, marker_len),
+                marker_style,
+            )];
+            spans.extend(
+                render_markdown_segment_with_completion(
+                    source,
+                    marker_len,
+                    segment_end,
+                    theme,
+                    false,
+                    0,
+                    completed,
+                )
+                .spans,
+            );
+            Line::from(spans)
         }
-        _ => Line::from(Span::styled(text, Style::default().fg(theme.text))),
+        _ => render_markdown_segment_with_completion(
+            source,
+            segment_start,
+            segment_end,
+            theme,
+            false,
+            0,
+            false,
+        ),
     }
 }
 
@@ -296,7 +361,7 @@ fn facade_list_marker_len(source: &str) -> usize {
         return leading + digits + 2;
     }
 
-    leading
+    0
 }
 
 fn selected_line(mut line: Line<'static>, theme: Theme) -> Line<'static> {
@@ -626,5 +691,41 @@ mod tests {
         assert_eq!(line.spans[0].content.as_ref(), "[ ] ");
         assert_eq!(line.spans[0].style, theme.list_marker);
         assert_eq!(line.spans[1].content.as_ref(), "task");
+    }
+
+    #[test]
+    fn paragraph_render_matches_concealed_wrap_boundaries() {
+        let theme = Theme::monochrome_for_tests();
+        let block = Block::Paragraph(Vec::new());
+        let source = "Final long wrapped line with many constructs: bold words, inline code, a link, a bare URL https://example.com/final-check, and enough plain text to wrap several times in a narrow viewport.";
+        let (segments, _) = wrap_facade_text_line(source, 78);
+
+        let rendered = segments
+            .into_iter()
+            .map(|(start, end)| {
+                line_text(&render_document_segment(&block, source, start, end, theme))
+            })
+            .collect::<Vec<_>>();
+        let joined = rendered.join("\n");
+
+        assert!(joined.contains("to wrap"));
+        assert!(!joined.contains("to wra\nseveral"));
+    }
+
+    #[test]
+    fn facade_list_wrapping_reports_marker_indent() {
+        let (segments, marker_len) =
+            wrap_facade_text_line("  ◦ Another nested bullet item that wraps for a while", 24);
+
+        assert_eq!(marker_len, 4);
+        assert!(segments.len() > 1);
+        assert!(segments[1].0 >= marker_len);
+    }
+
+    fn line_text(line: &Line<'static>) -> String {
+        line.spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>()
     }
 }

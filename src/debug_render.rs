@@ -4,10 +4,11 @@ use anyhow::Result;
 use ratatui::{
     Terminal,
     backend::TestBackend,
+    layout::Rect,
     style::{Color, Modifier},
 };
 
-use crate::{app::App, ui};
+use crate::{app::App, editor::render::visible_rows, markdown::table::TableLayout, ui};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct CellStyle {
@@ -30,13 +31,37 @@ pub fn render_path_to_ansi(
     notes_dir: PathBuf,
     initial_file: Option<PathBuf>,
     width: u16,
-    height: u16,
+    height: Option<u16>,
 ) -> Result<String> {
     let mut app = App::new(notes_dir, initial_file)?;
-    let backend = TestBackend::new(width.max(1), height.max(1));
+    let width = width.max(1);
+    let height = height.unwrap_or_else(|| full_render_height(&app, width));
+    let backend = TestBackend::new(width, height.max(2));
     let mut terminal = Terminal::new(backend)?;
     terminal.draw(|frame| ui::draw(frame, &mut app))?;
     Ok(buffer_to_ansi(terminal.backend().buffer()))
+}
+
+fn full_render_height(app: &App, width: u16) -> u16 {
+    let editor_area = Rect {
+        x: 0,
+        y: 0,
+        width,
+        height: 1,
+    };
+    let page = ui::editor::page_area(editor_area);
+    let gutter_width = (app.buffer.line_count().to_string().len() + 1).max(1);
+    let text_width = page.width.saturating_sub(gutter_width as u16).max(1) as usize;
+    let table_layout = TableLayout::new(&app.buffer);
+    let rows = visible_rows(
+        &app.buffer,
+        0,
+        0,
+        usize::MAX,
+        text_width,
+        |line_num, text, w| ui::editor::facade_wrap_line(&table_layout, line_num, text, w),
+    );
+    rows.len().saturating_add(1).min(u16::MAX as usize) as u16
 }
 
 fn buffer_to_ansi(buffer: &ratatui::buffer::Buffer) -> String {
@@ -101,37 +126,93 @@ fn bg_ansi(color: Color) -> String {
 }
 
 fn color_ansi(color: Color, foreground: bool) -> String {
-    let base = if foreground { 30 } else { 40 };
-    let bright_base = if foreground { 90 } else { 100 };
+    let target = if foreground { 38 } else { 48 };
     match color {
         Color::Reset => format!("\x1b[{}m", if foreground { 39 } else { 49 }),
-        Color::Black => format!("\x1b[{base}m"),
-        Color::Red => format!("\x1b[{}m", base + 1),
-        Color::Green => format!("\x1b[{}m", base + 2),
-        Color::Yellow => format!("\x1b[{}m", base + 3),
-        Color::Blue => format!("\x1b[{}m", base + 4),
-        Color::Magenta => format!("\x1b[{}m", base + 5),
-        Color::Cyan => format!("\x1b[{}m", base + 6),
-        Color::Gray | Color::White => format!("\x1b[{}m", base + 7),
-        Color::DarkGray => format!("\x1b[{bright_base}m"),
-        Color::LightRed => format!("\x1b[{}m", bright_base + 1),
-        Color::LightGreen => format!("\x1b[{}m", bright_base + 2),
-        Color::LightYellow => format!("\x1b[{}m", bright_base + 3),
-        Color::LightBlue => format!("\x1b[{}m", bright_base + 4),
-        Color::LightMagenta => format!("\x1b[{}m", bright_base + 5),
-        Color::LightCyan => format!("\x1b[{}m", bright_base + 6),
-        Color::Rgb(r, g, b) => {
-            format!("\x1b[{};2;{r};{g};{b}m", if foreground { 38 } else { 48 })
-        }
+        Color::Black => indexed_color_ansi(target, 0),
+        Color::Red => indexed_color_ansi(target, 1),
+        Color::Green => indexed_color_ansi(target, 2),
+        Color::Yellow => indexed_color_ansi(target, 3),
+        Color::Blue => indexed_color_ansi(target, 4),
+        Color::Magenta => indexed_color_ansi(target, 5),
+        Color::Cyan => indexed_color_ansi(target, 6),
+        Color::Gray => indexed_color_ansi(target, 7),
+        Color::DarkGray => indexed_color_ansi(target, 8),
+        Color::LightRed => indexed_color_ansi(target, 9),
+        Color::LightGreen => indexed_color_ansi(target, 10),
+        Color::LightYellow => indexed_color_ansi(target, 11),
+        Color::LightBlue => indexed_color_ansi(target, 12),
+        Color::LightMagenta => indexed_color_ansi(target, 13),
+        Color::LightCyan => indexed_color_ansi(target, 14),
+        Color::White => indexed_color_ansi(target, 15),
+        Color::Rgb(r, g, b) => format!("\x1b[{target};2;{r};{g};{b}m"),
         Color::Indexed(index) => {
-            format!("\x1b[{};5;{index}m", if foreground { 38 } else { 48 })
+            format!("\x1b[{target};5;{index}m")
         }
     }
+}
+
+fn indexed_color_ansi(target: u8, index: u8) -> String {
+    format!("\x1b[{target};5;{index}m")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use anyhow::Context;
+    use std::fs;
+
+    #[test]
+    fn render_full_height_includes_entire_file_and_status_bar() -> Result<()> {
+        let dir = std::env::temp_dir().join(format!("glass-render-test-{}", std::process::id()));
+        fs::create_dir_all(&dir)?;
+        let file = dir.join("note.md");
+        fs::write(&file, "one\ntwo\nthree\n")?;
+
+        let ansi = render_path_to_ansi(dir.clone(), Some(file), 80, None)?;
+
+        assert!(ansi.contains("one"));
+        assert!(ansi.contains("two"));
+        assert!(ansi.contains("three"));
+        assert!(ansi.contains(" NORMAL  note.md"));
+
+        fs::remove_dir_all(dir).context("failed to clean render test directory")?;
+        Ok(())
+    }
+
+    #[test]
+    fn render_height_can_clip_document_but_keeps_status_bar() -> Result<()> {
+        let dir =
+            std::env::temp_dir().join(format!("glass-render-clip-test-{}", std::process::id()));
+        fs::create_dir_all(&dir)?;
+        let file = dir.join("note.md");
+        fs::write(&file, "one\ntwo\nthree\n")?;
+
+        let ansi = render_path_to_ansi(dir.clone(), Some(file), 80, Some(2))?;
+
+        assert!(ansi.contains("one"));
+        assert!(!ansi.contains("three"));
+        assert!(ansi.contains(" NORMAL  note.md"));
+
+        fs::remove_dir_all(dir).context("failed to clean render test directory")?;
+        Ok(())
+    }
+
+    #[test]
+    fn render_height_has_status_bar_even_when_too_small() -> Result<()> {
+        let dir =
+            std::env::temp_dir().join(format!("glass-render-small-test-{}", std::process::id()));
+        fs::create_dir_all(&dir)?;
+        let file = dir.join("note.md");
+        fs::write(&file, "one\n")?;
+
+        let ansi = render_path_to_ansi(dir.clone(), Some(file), 80, Some(1))?;
+
+        assert!(ansi.contains(" NORMAL  note.md"));
+
+        fs::remove_dir_all(dir).context("failed to clean render test directory")?;
+        Ok(())
+    }
 
     #[test]
     fn style_ansi_includes_rgb_and_modifiers() {
@@ -144,5 +225,17 @@ mod tests {
         assert!(ansi.contains("\x1b[38;2;1;2;3m"));
         assert!(ansi.contains("\x1b[1m"));
         assert!(ansi.contains("\x1b[4m"));
+    }
+
+    #[test]
+    fn named_colors_match_crossterm_palette_indices() {
+        let ansi = style_ansi(CellStyle {
+            fg: Color::Black,
+            bg: Color::White,
+            modifier: Modifier::empty(),
+        });
+
+        assert!(ansi.contains("\x1b[38;5;0m"));
+        assert!(ansi.contains("\x1b[48;5;15m"));
     }
 }
