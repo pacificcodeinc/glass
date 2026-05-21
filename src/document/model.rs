@@ -425,7 +425,7 @@ fn table_markdown(alignments: &[TableAlignment], rows: &[TableRow]) -> String {
     let mut widths = vec![3usize; column_count];
     for row in rows {
         for (index, cell) in row.cells.iter().enumerate() {
-            widths[index] = widths[index].max(inline_markdown(&cell.content).chars().count());
+            widths[index] = widths[index].max(table_cell_markdown(cell).chars().count());
         }
     }
 
@@ -445,7 +445,7 @@ fn table_row_markdown(row: &TableRow, widths: &[usize]) -> String {
         let value = row
             .cells
             .get(index)
-            .map(|cell| inline_markdown(&cell.content))
+            .map(table_cell_markdown)
             .unwrap_or_default();
         line.push(' ');
         line.push_str(&value);
@@ -453,6 +453,27 @@ fn table_row_markdown(row: &TableRow, widths: &[usize]) -> String {
         line.push_str(" |");
     }
     line
+}
+
+fn table_cell_markdown(cell: &TableCell) -> String {
+    escape_table_pipes(&inline_markdown(&cell.content))
+}
+
+fn escape_table_pipes(value: &str) -> String {
+    let mut escaped = String::new();
+    let mut backslashes = 0usize;
+    for ch in value.chars() {
+        if ch == '|' && backslashes % 2 == 0 {
+            escaped.push('\\');
+        }
+        escaped.push(ch);
+        if ch == '\\' {
+            backslashes += 1;
+        } else {
+            backslashes = 0;
+        }
+    }
+    escaped
 }
 
 fn table_delimiter_markdown(alignments: &[TableAlignment], widths: &[usize]) -> String {

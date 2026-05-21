@@ -6,8 +6,9 @@ use ropey::Rope;
 use crate::{
     document::{
         Block, DocLink, DocRange, Document, Inline, MarkdownCodec, SurfaceLine, SurfaceMode,
-        TableAlignment, TableCell, TableRow, markdown::inline_plain_column_for_source_column,
-        model::inline_plain_text,
+        TableAlignment, TableCell, TableRow,
+        markdown::{inline_plain_column_for_source_column, parse_inlines},
+        model::{inline_markdown, inline_plain_text},
     },
     editor::{
         commands::{TableColumnPlacement, TableRowPlacement},
@@ -572,6 +573,64 @@ impl DocumentBuffer {
         true
     }
 
+    pub fn insert_table_char(&mut self, cursor: &mut Cursor, ch: char) -> bool {
+        if ch == '\n' {
+            return false;
+        }
+        let Some(location) = self.table_edit_location_at_cursor(*cursor) else {
+            return self.cursor_is_inside_table_block(*cursor);
+        };
+
+        let Some(mut text) = self.table_cell_markdown(location) else {
+            return self.cursor_is_inside_table_block(*cursor);
+        };
+        self.push_undo_snapshot(*cursor);
+        insert_char_at_column(&mut text, location.cell_column, ch);
+        let Some(cell) = self.table_cell_mut(location) else {
+            return self.cursor_is_inside_table_block(*cursor);
+        };
+        cell.content = parse_inlines(&text);
+
+        self.rebuild_facade_preserving_cursor(cursor);
+        *cursor = self.cursor_for_table_cell(location, location.cell_column + 1);
+        self.update_dirty();
+        true
+    }
+
+    pub fn delete_table_char(&mut self, cursor: &mut Cursor, backspace: bool) -> bool {
+        let Some(location) = self.table_edit_location_at_cursor(*cursor) else {
+            return self.cursor_is_inside_table_block(*cursor);
+        };
+
+        let Some(cell_text) = self.table_cell_markdown(location) else {
+            return self.cursor_is_inside_table_block(*cursor);
+        };
+        let text_len = cell_text.chars().count();
+        let delete_column = if backspace {
+            let Some(column) = location.cell_column.checked_sub(1) else {
+                return true;
+            };
+            column
+        } else if location.cell_column < text_len {
+            location.cell_column
+        } else {
+            return true;
+        };
+
+        self.push_undo_snapshot(*cursor);
+        let mut text = cell_text;
+        remove_char_at_column(&mut text, delete_column);
+        let Some(cell) = self.table_cell_mut(location) else {
+            return self.cursor_is_inside_table_block(*cursor);
+        };
+        cell.content = parse_inlines(&text);
+
+        self.rebuild_facade_preserving_cursor(cursor);
+        *cursor = self.cursor_for_table_cell(location, delete_column);
+        self.update_dirty();
+        true
+    }
+
     pub fn move_table_cell(&self, cursor: &mut Cursor, delta: isize) -> bool {
         if delta == 0 || !is_table_content_line(&self.line(cursor.line)) {
             return false;
@@ -754,6 +813,105 @@ impl DocumentBuffer {
         None
     }
 
+    fn table_edit_location_at_cursor(&self, cursor: Cursor) -> Option<TableEditLocation> {
+        let mut plain_line = 0usize;
+        for (block_index, block) in self.document.blocks.iter().enumerate() {
+            let line_count = block.plain_line_count();
+            let next = plain_line + line_count;
+            if cursor.line >= plain_line && cursor.line < next {
+                let Block::Table { rows, .. } = block else {
+                    return None;
+                };
+                let local_line = cursor.line - plain_line;
+                if local_line == 1 {
+                    return None;
+                }
+                let row_index =
+                    table_row_for_source_line(local_line).min(rows.len().saturating_sub(1));
+                let ranges = table_cell_ranges(&self.line(cursor.line));
+                let cell_count = rows
+                    .get(row_index)
+                    .map(|row| row.cells.len())
+                    .unwrap_or_default()
+                    .max(ranges.len());
+                if cell_count == 0 {
+                    return None;
+                }
+                let column_index =
+                    table_column_for_source_column(&ranges, cursor.column, cell_count);
+                let (cell_start, cell_end) =
+                    ranges.get(column_index).copied().unwrap_or_else(|| {
+                        let line_len = self.line_len_chars(cursor.line);
+                        (line_len, line_len)
+                    });
+                let cell_column = cursor
+                    .column
+                    .saturating_sub(cell_start)
+                    .min(cell_end.saturating_sub(cell_start));
+                return Some(TableEditLocation {
+                    block_index,
+                    block_start: plain_line,
+                    row_index,
+                    column_index,
+                    cell_column,
+                });
+            }
+            plain_line = next;
+        }
+        None
+    }
+
+    fn cursor_is_inside_table_block(&self, cursor: Cursor) -> bool {
+        let mut plain_line = 0usize;
+        for block in &self.document.blocks {
+            let line_count = block.plain_line_count();
+            let next = plain_line + line_count;
+            if cursor.line >= plain_line && cursor.line < next {
+                return matches!(block, Block::Table { .. });
+            }
+            plain_line = next;
+        }
+        false
+    }
+
+    fn table_cell_markdown(&self, location: TableEditLocation) -> Option<String> {
+        let Block::Table { rows, .. } = self.document.blocks.get(location.block_index)? else {
+            return None;
+        };
+        let cell = rows
+            .get(location.row_index)?
+            .cells
+            .get(location.column_index)?;
+        Some(inline_markdown(&cell.content))
+    }
+
+    fn table_cell_mut(&mut self, location: TableEditLocation) -> Option<&mut TableCell> {
+        let Block::Table { rows, .. } = self.document.blocks.get_mut(location.block_index)? else {
+            return None;
+        };
+        let column_count = rows
+            .iter()
+            .map(|row| row.cells.len())
+            .max()
+            .unwrap_or(location.column_index + 1)
+            .max(location.column_index + 1);
+        let row = rows.get_mut(location.row_index)?;
+        while row.cells.len() < column_count {
+            row.cells.push(empty_table_cell());
+        }
+        row.cells.get_mut(location.column_index)
+    }
+
+    fn cursor_for_table_cell(&self, location: TableEditLocation, cell_column: usize) -> Cursor {
+        let line = (location.block_start + table_source_line_for_row(location.row_index))
+            .min(self.line_count().saturating_sub(1));
+        let column = table_cell_ranges(&self.line(line))
+            .get(location.column_index)
+            .map(|(start, end)| start + cell_column.min(end.saturating_sub(*start)))
+            .unwrap_or_else(|| self.line_len_chars(line));
+        Cursor { line, column }
+    }
+
     fn visible_len_lines(&self) -> usize {
         let len_chars = self.text.len_chars();
         if len_chars == 0 {
@@ -777,6 +935,15 @@ struct TableCursorLocation {
     column_index: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TableEditLocation {
+    block_index: usize,
+    block_start: usize,
+    row_index: usize,
+    column_index: usize,
+    cell_column: usize,
+}
+
 fn empty_table_cell() -> TableCell {
     TableCell {
         content: vec![Inline::Text(String::new())],
@@ -796,6 +963,39 @@ fn table_row_for_source_line(local_line: usize) -> usize {
 
 fn table_source_line_for_row(row_index: usize) -> usize {
     if row_index == 0 { 0 } else { row_index + 1 }
+}
+
+fn table_column_for_source_column(
+    ranges: &[(usize, usize)],
+    column: usize,
+    cell_count: usize,
+) -> usize {
+    ranges
+        .iter()
+        .position(|(start, end)| column >= *start && column <= *end)
+        .or_else(|| ranges.iter().position(|(start, _)| column < *start))
+        .unwrap_or_else(|| ranges.len().saturating_sub(1))
+        .min(cell_count.saturating_sub(1))
+}
+
+fn insert_char_at_column(text: &mut String, column: usize, ch: char) {
+    let byte_index = byte_index_for_char_column(text, column);
+    text.insert(byte_index, ch);
+}
+
+fn remove_char_at_column(text: &mut String, column: usize) {
+    let start = byte_index_for_char_column(text, column);
+    let end = byte_index_for_char_column(text, column + 1);
+    if start < end {
+        text.replace_range(start..end, "");
+    }
+}
+
+fn byte_index_for_char_column(text: &str, column: usize) -> usize {
+    text.char_indices()
+        .nth(column)
+        .map(|(index, _)| index)
+        .unwrap_or(text.len())
 }
 
 fn reconcile_facade_document(old: &Document, parsed: Document) -> Document {

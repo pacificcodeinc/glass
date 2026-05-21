@@ -17,6 +17,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Drag selection now copies once on mouse release instead of copying repeatedly while dragging.
 - Visual selection yanking now supports `y` and the clipboard register form `"+y`.
 - Copied full-block selections no longer insert extra blank lines between serialized Markdown blocks.
+- Rendered table cells now stay editable after being cleared, and typing at table edges updates the nearest model cell instead of corrupting table source text.
+- Table cell editing now escapes typed pipe characters so they remain cell content instead of splitting the row.
+- Large document jumps now reuse wrap calculations and keep the viewport responsive when moving to distant lines.
 
 ## [0.1.8] - 2026-05-21
 

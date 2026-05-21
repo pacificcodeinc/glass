@@ -1,4 +1,5 @@
 use std::{
+    cell::RefCell,
     path::{Path, PathBuf},
     process::Command as ProcessCommand,
     time::{Duration, Instant},
@@ -189,6 +190,48 @@ pub struct App {
     pending_register: Option<char>,
     mouse_anchor: Option<Cursor>,
     last_copied_selection: Option<String>,
+    wrap_cache: RefCell<WrapCache>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct WrapCacheKey {
+    line: usize,
+    width: usize,
+    cursor_line: usize,
+    cursor_column: usize,
+    surface_column: Option<usize>,
+}
+
+#[derive(Debug, Clone)]
+struct WrapCacheEntry {
+    key: WrapCacheKey,
+    value: (Vec<(usize, usize)>, usize),
+}
+
+#[derive(Debug, Default)]
+struct WrapCache {
+    entries: Vec<WrapCacheEntry>,
+}
+
+impl WrapCache {
+    fn get(&self, key: WrapCacheKey) -> Option<(Vec<(usize, usize)>, usize)> {
+        self.entries
+            .iter()
+            .rev()
+            .find(|entry| entry.key == key)
+            .map(|entry| entry.value.clone())
+    }
+
+    fn insert(&mut self, key: WrapCacheKey, value: (Vec<(usize, usize)>, usize)) {
+        if self.entries.len() >= 256 {
+            self.entries.remove(0);
+        }
+        self.entries.push(WrapCacheEntry { key, value });
+    }
+
+    fn clear(&mut self) {
+        self.entries.clear();
+    }
 }
 
 impl App {
@@ -229,16 +272,19 @@ impl App {
             pending_register: None,
             mouse_anchor: None,
             last_copied_selection: None,
+            wrap_cache: RefCell::new(WrapCache::default()),
         })
     }
 
     pub fn handle_event(&mut self, event: Event) -> Result<()> {
+        self.clear_wrap_cache();
         match event {
             Event::Key(key) => self.handle_key_event(key)?,
             Event::Mouse(mouse) => self.handle_mouse_event(mouse)?,
             _ => {}
         }
 
+        self.clear_wrap_cache();
         self.keep_cursor_visible();
         Ok(())
     }
@@ -294,14 +340,20 @@ impl App {
     }
 
     pub fn resize_viewport(&mut self, visible_height: usize, visible_width: usize) {
+        self.clear_wrap_cache();
         self.viewport.visible_height = visible_height.max(1);
         self.viewport.visible_width = visible_width.max(1);
         self.keep_cursor_visible();
     }
 
     pub fn move_viewport_to(&mut self, x: u16, y: u16) {
+        self.clear_wrap_cache();
         self.viewport.x = x;
         self.viewport.y = y;
+    }
+
+    fn clear_wrap_cache(&self) {
+        self.wrap_cache.borrow_mut().clear();
     }
 
     fn handle_mouse_event(&mut self, mouse: MouseEvent) -> Result<()> {
@@ -631,7 +683,9 @@ impl App {
             KeyCode::Char('N') => self.jump_search_match(-1),
             KeyCode::Char('u') => self.undo(),
             KeyCode::Char('x') | KeyCode::Delete => {
-                if self
+                if self.buffer.delete_table_char(&mut self.cursor, false) {
+                    self.surface_cursor = None;
+                } else if self
                     .buffer
                     .delete_structural_list_marker_at_cursor(&mut self.cursor, false)
                 {
@@ -662,6 +716,8 @@ impl App {
                     self.delete_to_line_start();
                 } else if key.modifiers.contains(KeyModifiers::ALT) {
                     self.delete_word_backward();
+                } else if self.buffer.delete_table_char(&mut self.cursor, true) {
+                    self.surface_cursor = None;
                 } else if self
                     .buffer
                     .delete_structural_list_marker_at_cursor(&mut self.cursor, true)
@@ -676,6 +732,8 @@ impl App {
             KeyCode::Delete => {
                 if key.modifiers.contains(KeyModifiers::SUPER) {
                     self.delete_to_line_end();
+                } else if self.buffer.delete_table_char(&mut self.cursor, false) {
+                    self.surface_cursor = None;
                 } else if self
                     .buffer
                     .delete_structural_list_marker_at_cursor(&mut self.cursor, false)
@@ -706,7 +764,9 @@ impl App {
                 self.reset_preferred_column();
             }
             KeyCode::Char(ch) if is_text_input_key(key) => {
-                if !self.edit_active_surface(SurfaceEdit::Insert(ch)) {
+                if self.buffer.insert_table_char(&mut self.cursor, ch) {
+                    self.surface_cursor = None;
+                } else if !self.edit_active_surface(SurfaceEdit::Insert(ch)) {
                     self.surface_cursor = None;
                     self.buffer.insert_char(&mut self.cursor, ch);
                 }
@@ -2193,6 +2253,17 @@ impl App {
             return;
         }
 
+        if self.cursor.line > self.viewport.top_line
+            && self.cursor.line.saturating_sub(self.viewport.top_line)
+                >= self.viewport.visible_height
+        {
+            let (line, wrap_index) = self.visual_position_for_cursor_bottom(cursor_wrap, width);
+            self.viewport.top_line = line;
+            self.viewport.top_wrap_index = wrap_index;
+            self.normalize_viewport(width);
+            return;
+        }
+
         let offset = self
             .visual_offset_from_viewport(self.cursor.line, cursor_wrap, width)
             .unwrap_or(usize::MAX);
@@ -2446,10 +2517,26 @@ impl App {
     }
 
     fn line_wrap_segments(&self, line: usize, width: usize) -> (Vec<(usize, usize)>, usize) {
+        let surface_column = self
+            .surface_cursor
+            .and_then(|(cursor_line, source, column)| {
+                (cursor_line == line && source == self.cursor.column).then_some(column)
+            });
+        let key = WrapCacheKey {
+            line,
+            width,
+            cursor_line: self.cursor.line,
+            cursor_column: self.cursor.column,
+            surface_column,
+        };
+        if let Some(value) = self.wrap_cache.borrow().get(key) {
+            return value;
+        }
+
         let line_text = self.buffer.line(line);
         let trimmed = line_text.trim_end_matches(['\r', '\n']);
         let table_layout = TableLayout::new(&self.buffer);
-        if table_layout.is_table_row(line) {
+        let value = if table_layout.is_table_row(line) {
             table_layout.wrap_line(line, trimmed, width)
         } else {
             let mode = if line == self.cursor.line {
@@ -2460,7 +2547,9 @@ impl App {
                 SurfaceMode::Inactive
             };
             wrap_surface_or_facade_line(self.buffer.block_for_line(line), trimmed, width, mode)
-        }
+        };
+        self.wrap_cache.borrow_mut().insert(key, value.clone());
+        value
     }
 
     fn wrap_index_for_column(&self, line: usize, column: usize, width: usize) -> usize {
@@ -3477,6 +3566,7 @@ mod tests {
             pending_register: None,
             mouse_anchor: None,
             last_copied_selection: None,
+            wrap_cache: RefCell::new(WrapCache::default()),
         }
     }
 
@@ -4371,6 +4461,101 @@ mod tests {
             app.table_visual_position(app.cursor.line, app.cursor.column, width),
             Some((0, 9))
         );
+    }
+
+    #[test]
+    fn insert_mode_types_into_empty_table_cell() {
+        let mut app = test_app("| A | B |\n| --- | --- |\n|   | y |");
+        app.mode = Mode::Insert;
+        app.cursor = Cursor { line: 2, column: 6 };
+
+        press(&mut app, KeyCode::Char('x'));
+
+        assert_eq!(
+            app.buffer.markdown_string(),
+            "| A   | B   |\n| --- | --- |\n| x   | y   |"
+        );
+        assert_eq!(app.cursor, Cursor { line: 2, column: 3 });
+    }
+
+    #[test]
+    fn cleared_table_cell_stays_editable() {
+        let mut app = test_app("| A | B |\n| --- | --- |\n| x | y |");
+        app.mode = Mode::Insert;
+        app.cursor = Cursor { line: 2, column: 3 };
+
+        press(&mut app, KeyCode::Backspace);
+        assert_eq!(
+            app.buffer.markdown_string(),
+            "| A   | B   |\n| --- | --- |\n|     | y   |"
+        );
+        assert_eq!(app.cursor, Cursor { line: 2, column: 6 });
+
+        press(&mut app, KeyCode::Char('z'));
+
+        assert_eq!(
+            app.buffer.markdown_string(),
+            "| A   | B   |\n| --- | --- |\n| z   | y   |"
+        );
+        assert_eq!(app.cursor, Cursor { line: 2, column: 3 });
+    }
+
+    #[test]
+    fn typing_at_table_row_edge_updates_nearest_cell() {
+        let mut app = test_app("| A | B |\n| --- | --- |\n| x | y |");
+        app.mode = Mode::Insert;
+        app.cursor = Cursor {
+            line: 2,
+            column: app.buffer.line_len_chars(2),
+        };
+
+        press(&mut app, KeyCode::Char('z'));
+
+        assert_eq!(
+            app.buffer.markdown_string(),
+            "| A   | B   |\n| --- | --- |\n| x   | yz  |"
+        );
+        assert!(!app.buffer.line(2).ends_with("|z"));
+    }
+
+    #[test]
+    fn typing_pipe_inside_table_cell_escapes_it() {
+        let mut app = test_app("| A | B |\n| --- | --- |\n| x | y |");
+        app.mode = Mode::Insert;
+        app.cursor = Cursor { line: 2, column: 3 };
+
+        press(&mut app, KeyCode::Char('|'));
+
+        assert_eq!(
+            app.buffer.markdown_string(),
+            "| A   | B   |\n| --- | --- |\n| x\\| | y   |"
+        );
+        assert_eq!(app.buffer.line_count(), 3);
+    }
+
+    #[test]
+    fn typing_on_table_delimiter_does_not_edit_raw_source() {
+        let mut app = test_app("| A | B |\n| --- | --- |\n| x | y |");
+        let original = app.buffer.markdown_string();
+        app.mode = Mode::Insert;
+        app.cursor = Cursor { line: 1, column: 2 };
+
+        press(&mut app, KeyCode::Char('z'));
+        press(&mut app, KeyCode::Backspace);
+        press(&mut app, KeyCode::Delete);
+
+        assert_eq!(app.buffer.markdown_string(), original);
+        assert_eq!(app.buffer.line_count(), 3);
+    }
+
+    #[test]
+    fn empty_table_cells_have_visual_cursor_targets() {
+        let mut app = test_app("| A | B |\n| --- | --- |\n|   |   |");
+        app.resize_viewport(5, 40);
+        let width = app.wrap_width();
+
+        assert!(app.table_visual_position(2, 6, width).is_some());
+        assert!(app.table_visual_position(2, 12, width).is_some());
     }
 
     #[test]
